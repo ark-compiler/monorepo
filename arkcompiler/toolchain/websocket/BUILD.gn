@@ -1,0 +1,134 @@
+# Copyright (c) 2022 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//arkcompiler/toolchain/toolchain.gni")
+
+config("hiviewdfx_config") {
+  defines = []
+  if (enable_dump_in_faultlog) {
+    defines += [ "ENABLE_DUMP_IN_FAULTLOG" ]
+  }
+  if (enable_bytrace) {
+    defines += [ "ENABLE_BYTRACE" ]
+    cflags_cc = [ "-Wno-gnu-zero-variadic-macro-arguments" ]
+  }
+  if (enable_hitrace) {
+    defines += [ "ENABLE_HITRACE" ]
+  }
+  if (enable_hilog) {
+    defines += [ "ENABLE_HILOG" ]
+  }
+
+  include_dirs = [ "$hilog_root/include" ]
+}
+
+config("websocket_platform_config") {
+  configs = [ ":hiviewdfx_config" ]
+  defines = []
+  if (is_ohos) {
+    defines += [
+      "OHOS_PLATFORM",
+      "UNIX_PLATFORM",
+    ]
+  } else if (is_mingw) {
+    defines += [ "WINDOWS_PLATFORM" ]
+  } else if (is_mac) {
+    defines += [
+      "MAC_PLATFORM",
+      "UNIX_PLATFORM",
+    ]
+  } else if (target_os == "android") {
+    if (!ark_standalone_build) {
+      defines += [
+        "ANDROID_PLATFORM",
+        "UNIX_PLATFORM",
+      ]
+    } else {
+      defines += [ "UNIX_PLATFORM" ]
+    }
+  } else if (target_os == "ios") {
+    defines += [
+      "UNIX_PLATFORM",
+      "IOS_PLATFORM",
+    ]
+  } else {
+    defines += [ "UNIX_PLATFORM" ]
+  }
+
+  if (current_cpu == "arm") {
+    defines += [
+      "PANDA_TARGET_ARM32_ABI_SOFT=1",
+      "PANDA_TARGET_ARM32",
+      "PANDA_TARGET_32",
+    ]
+  } else if (current_cpu == "arm64") {
+    defines += [
+      "PANDA_TARGET_ARM64",
+      "PANDA_TARGET_64",
+      "PANDA_ENABLE_GLOBAL_REGISTER_VARIABLES",
+      "PANDA_USE_32_BIT_POINTER",
+    ]
+  } else if (current_cpu == "x86") {
+    defines += [ "PANDA_TARGET_X86" ]
+  } else if (current_cpu == "amd64" || current_cpu == "x64" ||
+             current_cpu == "x86_64") {
+    defines += [
+      "PANDA_TARGET_64",
+      "PANDA_TARGET_AMD64",
+      "PANDA_USE_32_BIT_POINTER",
+    ]
+  }
+}
+
+ohos_source_set("websocket") {
+  stack_protector_ret = false
+  defines = []
+  deps = []
+
+  configs = [ sdk_libc_secshared_config ]
+  if (is_mingw || is_mac) {
+    cflags = [ "-std=c++17" ]
+  }
+
+  # hiviewdfx libraries
+  external_deps = hiviewdfx_ext_deps
+  deps += hiviewdfx_deps
+
+  if (target_os == "android" && !ark_standalone_build) {
+    libs = [ "log" ]
+  }
+
+  include_dirs = []
+
+  include_dirs += [
+    "$toolchain_root/inspector",
+    "//utils/native/base/include",
+    "//third_party/openssl/include",
+  ]
+
+  sources = [ "websocket.cpp" ]
+
+  deps += [ sdk_libc_secshared_dep ]
+  if (is_cross_platform_build && target_os == "ios") {
+    deps += [ "$ark_third_party_root/openssl:libcrypto_static" ]
+  } else if (is_mingw) {
+    deps += [ "$ark_third_party_root/openssl:libcrypto_restool" ]
+  } else {
+    deps += [ "$ark_third_party_root/openssl:libcrypto_shared" ]
+  }
+
+  configs += [ ":websocket_platform_config" ]
+
+  subsystem_name = "arkcompiler"
+  part_name = "toolchain"
+}
