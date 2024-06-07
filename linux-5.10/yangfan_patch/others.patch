@@ -1,0 +1,948 @@
+diff --git a/Makefile b/Makefile
+index 50696cff4..b49495d39 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1236,9 +1236,15 @@ include/config/kernel.release: FORCE
+ # Carefully list dependencies so we do not try to build scripts twice
+ # in parallel
+ PHONY += scripts
+-scripts: scripts_basic scripts_dtc
++scripts: scripts_basic scripts_dtc vendor_scripts
+ 	$(Q)$(MAKE) $(build)=$(@)
+ 
++ifdef CONFIG_ARCH_ROCKCHIP
++PHONY += vendor_scripts
++vendor_scripts:
++	$(Q)$(MAKE) $(build)=$(KERNEL_SOURCE_PATH)/scripts
++endif
++
+ # Things we need to do before we recursively start building the kernel
+ # or the modules are listed in "prepare".
+ # A multi level approach is used. prepareN is processed before prepareN-1.
+@@ -1388,12 +1394,18 @@ kselftest-merge:
+ 
+ ifneq ($(wildcard $(srctree)/arch/$(SRCARCH)/boot/dts/),)
+ dtstree := arch/$(SRCARCH)/boot/dts
++vendortree := $(KERNEL_SOURCE_PATH)/arch/arm64/boot/dts
++objdtstree := $(KBUILD_OUTPUT)/arch/arm64/boot/dts/rockchip
+ endif
+ 
+ ifneq ($(dtstree),)
+ 
++ifneq ($(objdtstree),)
++$(shell mkdir -p $(objdtstree))
++
+ %.dtb: include/config/kernel.release scripts_dtc
+-	$(Q)$(MAKE) $(build)=$(dtstree) $(dtstree)/$@
++	$(Q)$(MAKE) $(build)=$(vendortree) $(vendortree)/$@
++endif
+ 
+ PHONY += dtbs dtbs_install dtbs_check
+ dtbs: include/config/kernel.release scripts_dtc
+diff --git a/fs/ubifs/recovery.c b/fs/ubifs/recovery.c
+index f0d51dd21..c81fbe355 100644
+--- a/fs/ubifs/recovery.c
++++ b/fs/ubifs/recovery.c
+@@ -662,10 +662,43 @@ struct ubifs_scan_leb *ubifs_recover_leb(struct ubifs_info *c, int lnum,
+ 			offs += ret;
+ 			buf += ret;
+ 			len -= ret;
+-		} else if (ret == SCANNED_EMPTY_SPACE ||
+-			   ret == SCANNED_GARBAGE     ||
+-			   ret == SCANNED_A_BAD_PAD_NODE ||
+-			   ret == SCANNED_A_CORRUPT_NODE) {
++		} else if (ret == SCANNED_A_CORRUPT_NODE) {
++			dbg_rcvry("found corruption (%d) at %d:%d",
++				  ret, lnum, offs);
++			if (ubifs_check_node(c, buf, len, lnum, offs, 1, 1) == -EUCLEAN &&
++			    !no_more_nodes(c, buf, len, lnum, offs)) {
++				int skip;
++				struct ubifs_ch *ch = buf;
++
++				/*
++				 * If the flash voltage power down suddenly in the programming
++				 * process, it may lead to abnormal data written by the flash
++				 * in the low-voltage operation process, and the last data
++				 * should be discarded.
++				 */
++				ubifs_msg(c, "recovery corrupt node\n");
++				skip = ALIGN(offs + le32_to_cpu(ch->len), c->max_write_size) - offs;
++				memset(buf + skip, 0xff, len - skip);
++			}
++
++			break;
++		} else if (ret == SCANNED_EMPTY_SPACE) {
++			dbg_rcvry("found corruption (%d) at %d:%d",
++				  ret, lnum, offs);
++			if (!is_empty(buf, len) && !is_last_write(c, buf, offs)) {
++				/*
++				 * If the flash voltage power down suddenly in the programming
++				 * process, it may lead to the data was programmed to the wroge
++				 * page written by the flash in the low-voltage operation process,
++				 * and the data should be discarded.
++				 */
++				ubifs_msg(c, "recovery empty space\n");
++				memset(buf, 0xff, len);
++			}
++
++			break;
++		} else if (ret == SCANNED_GARBAGE     ||
++			   ret == SCANNED_A_BAD_PAD_NODE) {
+ 			dbg_rcvry("found corruption (%d) at %d:%d",
+ 				  ret, lnum, offs);
+ 			break;
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 511c9363e..2bfbcf28b 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -802,7 +802,6 @@ xfs_ialloc(
+ 	xfs_buf_t	**ialloc_context,
+ 	xfs_inode_t	**ipp)
+ {
+-	struct inode *dir = pip ? VFS_I(pip) : NULL;
+ 	struct xfs_mount *mp = tp->t_mountp;
+ 	xfs_ino_t	ino;
+ 	xfs_inode_t	*ip;
+@@ -848,17 +847,18 @@ xfs_ialloc(
+ 		return error;
+ 	ASSERT(ip != NULL);
+ 	inode = VFS_I(ip);
++	inode->i_mode = mode;
+ 	set_nlink(inode, nlink);
++	inode->i_uid = current_fsuid();
+ 	inode->i_rdev = rdev;
+ 	ip->i_d.di_projid = prid;
+ 
+-	if (dir && !(dir->i_mode & S_ISGID) &&
+-			(mp->m_flags & XFS_MOUNT_GRPID)) {
+-		inode->i_uid = current_fsuid();
+-		inode->i_gid = dir->i_gid;
+-		inode->i_mode = mode;
++	if (pip && XFS_INHERIT_GID(pip)) {
++		inode->i_gid = VFS_I(pip)->i_gid;
++		if ((VFS_I(pip)->i_mode & S_ISGID) && S_ISDIR(mode))
++			inode->i_mode |= S_ISGID;
+ 	} else {
+-		inode_init_owner(inode, dir, mode);
++		inode->i_gid = current_fsgid();
+ 	}
+ 
+ 	/*
+diff --git a/init/Kconfig b/init/Kconfig
+index 7acf079f9..17d0151bb 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1348,6 +1348,12 @@ if BLK_DEV_INITRD
+ 
+ source "usr/Kconfig"
+ 
++config INITRD_ASYNC
++	bool "Initrd async"
++	depends on NO_GKI
++	help
++	  Init ramdisk async, can reduce kernel init time.
++
+ endif
+ 
+ config BOOT_CONFIG
+diff --git a/init/initramfs.c b/init/initramfs.c
+index 55b74d7e5..f4c4e2404 100644
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -12,6 +12,7 @@
+ #include <linux/file.h>
+ #include <linux/memblock.h>
+ #include <linux/namei.h>
++#include <linux/initramfs.h>
+ #include <linux/init_syscalls.h>
+ 
+ static ssize_t __init xwrite(struct file *file, const char *p, size_t count,
+@@ -465,6 +466,9 @@ static char * __init unpack_to_rootfs(char *buf, unsigned long len)
+ 	state = Start;
+ 	this_header = 0;
+ 	message = NULL;
++#if defined(CONFIG_ROCKCHIP_THUNDER_BOOT) && defined(CONFIG_ROCKCHIP_HW_DECOMPRESS) && defined(CONFIG_INITRD_ASYNC)
++	wait_initrd_hw_decom_done();
++#endif
+ 	while (!message && len) {
+ 		loff_t saved_offset = this_header;
+ 		if (*buf == '0' && !(this_header & 3)) {
+@@ -639,4 +643,23 @@ static int __init populate_rootfs(void)
+ 	flush_delayed_fput();
+ 	return 0;
+ }
++
++#if IS_BUILTIN(CONFIG_INITRD_ASYNC)
++#include <linux/kthread.h>
++#include <linux/async.h>
++
++static void __init unpack_rootfs_async(void *unused, async_cookie_t cookie)
++{
++	populate_rootfs();
++}
++
++static int __init populate_rootfs_async(void)
++{
++	async_schedule(unpack_rootfs_async, NULL);
++	return 0;
++}
++
++pure_initcall(populate_rootfs_async);
++#else
+ rootfs_initcall(populate_rootfs);
++#endif
+diff --git a/init/main.c b/init/main.c
+index e8d5c6477..885ce026d 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1533,6 +1533,10 @@ static noinline void __init kernel_init_freeable(void)
+ 	smp_init();
+ 	sched_init_smp();
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	kthread_run(defer_free_memblock, NULL, "defer_mem");
++#endif
++
+ 	padata_init();
+ 	page_alloc_init_late();
+ 	/* Initialize page ext after all struct pages are initialized. */
+@@ -1542,6 +1546,10 @@ static noinline void __init kernel_init_freeable(void)
+ 
+ 	kunit_run_all_tests();
+ 
++#if IS_BUILTIN(CONFIG_INITRD_ASYNC)
++	async_synchronize_full();
++#endif
++
+ 	console_on_rootfs();
+ 
+ 	/*
+diff --git a/ipc/msg.c b/ipc/msg.c
+index 8ded6b8f1..6e6c8e0c9 100644
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@ -147,7 +147,7 @@ static int newque(struct ipc_namespace *ns, struct ipc_params *params)
+ 	key_t key = params->key;
+ 	int msgflg = params->flg;
+ 
+-	msq = kvmalloc(sizeof(*msq), GFP_KERNEL_ACCOUNT);
++	msq = kvmalloc(sizeof(*msq), GFP_KERNEL);
+ 	if (unlikely(!msq))
+ 		return -ENOMEM;
+ 
+diff --git a/ipc/sem.c b/ipc/sem.c
+index d3b9b73cd..7d9c06b0a 100644
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@ -511,7 +511,7 @@ static struct sem_array *sem_alloc(size_t nsems)
+ 	if (nsems > (INT_MAX - sizeof(*sma)) / sizeof(sma->sems[0]))
+ 		return NULL;
+ 
+-	sma = kvzalloc(struct_size(sma, sems, nsems), GFP_KERNEL_ACCOUNT);
++	sma = kvzalloc(struct_size(sma, sems, nsems), GFP_KERNEL);
+ 	if (unlikely(!sma))
+ 		return NULL;
+ 
+@@ -1852,7 +1852,7 @@ static inline int get_undo_list(struct sem_undo_list **undo_listp)
+ 
+ 	undo_list = current->sysvsem.undo_list;
+ 	if (!undo_list) {
+-		undo_list = kzalloc(sizeof(*undo_list), GFP_KERNEL_ACCOUNT);
++		undo_list = kzalloc(sizeof(*undo_list), GFP_KERNEL);
+ 		if (undo_list == NULL)
+ 			return -ENOMEM;
+ 		spin_lock_init(&undo_list->lock);
+@@ -1937,7 +1937,7 @@ static struct sem_undo *find_alloc_undo(struct ipc_namespace *ns, int semid)
+ 	rcu_read_unlock();
+ 
+ 	/* step 2: allocate new undo structure */
+-	new = kzalloc(sizeof(struct sem_undo) + sizeof(short)*nsems, GFP_KERNEL_ACCOUNT);
++	new = kzalloc(sizeof(struct sem_undo) + sizeof(short)*nsems, GFP_KERNEL);
+ 	if (!new) {
+ 		ipc_rcu_putref(&sma->sem_perm, sem_rcu_free);
+ 		return ERR_PTR(-ENOMEM);
+diff --git a/ipc/shm.c b/ipc/shm.c
+index b418731d6..471ac3e74 100644
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@ -711,7 +711,7 @@ static int newseg(struct ipc_namespace *ns, struct ipc_params *params)
+ 			ns->shm_tot + numpages > ns->shm_ctlall)
+ 		return -ENOSPC;
+ 
+-	shp = kvmalloc(sizeof(*shp), GFP_KERNEL_ACCOUNT);
++	shp = kvmalloc(sizeof(*shp), GFP_KERNEL);
+ 	if (unlikely(!shp))
+ 		return -ENOMEM;
+ 
+diff --git a/ipc/util.c b/ipc/util.c
+index 7c3601dad..bbb5190af 100644
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@ -754,13 +754,21 @@ struct pid_namespace *ipc_seq_pid_ns(struct seq_file *s)
+ static struct kern_ipc_perm *sysvipc_find_ipc(struct ipc_ids *ids, loff_t pos,
+ 					      loff_t *new_pos)
+ {
+-	struct kern_ipc_perm *ipc = NULL;
+-	int max_idx = ipc_get_maxidx(ids);
++	struct kern_ipc_perm *ipc;
++	int total, id;
++
++	total = 0;
++	for (id = 0; id < pos && total < ids->in_use; id++) {
++		ipc = idr_find(&ids->ipcs_idr, id);
++		if (ipc != NULL)
++			total++;
++	}
+ 
+-	if (max_idx == -1 || pos > max_idx)
++	ipc = NULL;
++	if (total >= ids->in_use)
+ 		goto out;
+ 
+-	for (; pos <= max_idx; pos++) {
++	for (; pos < ipc_mni; pos++) {
+ 		ipc = idr_find(&ids->ipcs_idr, pos);
+ 		if (ipc != NULL) {
+ 			rcu_read_lock();
+diff --git a/make-boot.sh b/make-boot.sh
+new file mode 100755
+index 000000000..d512e8a88
+--- /dev/null
++++ b/make-boot.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++
++set -e
++
++root_path=$(cd $(dirname $0); pwd)
++root_out_dir=${root_path%kernel*}
++BOOT_LINUX=${root_out_dir}/kernel/src_tmp/linux-5.10
++OUT_IMAGE=${root_out_dir}/yangfan/packages/phone/images/
++IMAGE_SIZE=64  # 64M
++IMAGE_BLOCKS=4096
++
++BUILD_PATH=boot_linux
++EXTLINUX_PATH=${BUILD_PATH}/extlinux
++EXTLINUX_CONF=${EXTLINUX_PATH}/extlinux.conf
++
++function make_boot_image()
++{
++        blocks=${IMAGE_BLOCKS}
++        block_size=$((${IMAGE_SIZE} * 1024 * 1024 / ${blocks}))
++        echo "blocks = ${blocks}  block_size ${block_size}"
++        if [ "`uname -m`" == "aarch64" ]; then
++                echo y | sudo mke2fs -b ${block_size} -d boot_linux -i 8192 -t ext2 boot_linux.img ${blocks}
++        else
++                genext2fs -B ${blocks} -b ${block_size} -d boot_linux -i 8192 -U boot_linux.img
++        fi
++
++        return $?
++}
++
++cd ${BOOT_LINUX}
++make_boot_image
++cd -
++cp ${BOOT_LINUX}/boot_linux.img ${OUT_IMAGE}
+diff --git a/make-ohos.sh b/make-ohos.sh
+new file mode 100755
+index 000000000..8f4a4e4d7
+--- /dev/null
++++ b/make-ohos.sh
+@@ -0,0 +1,139 @@
++#!/bin/bash
++
++set -e
++
++real_path=$(cd $(dirname $0); pwd)
++
++export PRODUCT_PATH=vendor/isoftstone/yangfan
++export KERNEL_SOURCE_PATH=${real_path%out*}${PRODUCT_PATH}/kernel_core
++export PATH=${real_path%out*}prebuilts/clang/ohos/linux-x86_64/llvm/bin/:$PATH
++export KBUILD_OUTPUT=${real_path%out*}/out/kernel/OBJ/linux-5.10
++IMAGE_SIZE=64  # 64M
++IMAGE_BLOCKS=4096
++
++CPUs=`sed -n "N;/processor/p" /proc/cpuinfo|wc -l`
++MAKE="make LLVM=1 LLVM_IAS=1 CROSS_COMPILE=../../../../prebuilts/gcc/linux-x86/aarch64/gcc-linaro-7.5.0-2019.12-x86_64_aarch64-linux-gnu/bin/aarch64-linux-gnu-"
++BUILD_PATH=boot_linux
++EXTLINUX_PATH=${BUILD_PATH}/extlinux
++EXTLINUX_CONF=${EXTLINUX_PATH}/extlinux.conf
++SAPPHIRE_DTB=sapphire.dtb
++
++MCU_LIB_FILE=${real_path%out*}device/board/isoftstone/yangfan/kernel/src/mcu/*.o
++MCU_OBJ_PATCH=drivers/char
++if [ ${KBUILD_OUTPUT} ]; then
++	OBJ_PATH=${KBUILD_OUTPUT}/
++fi
++
++ID_MODEL=1
++ID_ARCH=2
++ID_UART=3
++ID_DTB=4
++ID_IMAGE=5
++ID_CONF=6
++model_list=(
++	"TB-RK3568X0   arm64 0xfe660000 rk3568-toybrick-x0-linux  Image rockchip_linux_defconfig"
++	"sapphire-rk3399 arm64 0xff1a0000 rk3399-sapphire-excavator-linux  Image rockchip_linux_defconfig"
++	"sapphire-rk3399T arm64 0xff1a0000 rk3399-sapphire-excavator-linux-3399t  Image rockchip_linux_defconfig"
++)
++
++
++function help()
++{
++	echo "Usage: ./make-ohos.sh {BOARD_NAME} KBUILD_OUTPUT=../../OBJ/linux-5.10"
++	echo "e.g."
++	for i in "${model_list[@]}"; do
++		echo "  ./make-ohos.sh $(echo $i | awk '{print $1}') KBUILD_OUTPUT=../../OBJ/linux-5.10"
++	done
++}
++
++
++function make_extlinux_conf()
++{
++	dtb_path=$1
++	uart=$2
++	image=$3
++
++	echo "label rockchip-kernel-5.10" > ${EXTLINUX_CONF}
++	echo "	kernel /extlinux/${image}" >> ${EXTLINUX_CONF}
++	echo "	fdt /extlinux/${SAPPHIRE_DTB}" >> ${EXTLINUX_CONF}
++	cmdline="append earlycon=uart8250,mmio32,${uart} root=PARTUUID=614e0000-0000-4b53-8000-1d28000054a9 rw rootwait rootfstype=ext4"
++	echo "  ${cmdline}" >> ${EXTLINUX_CONF}
++}
++
++function make_kernel_image()
++{
++	arch=$1
++	conf=$2
++	dtb=$3
++
++	${MAKE} ARCH=${arch} ${conf}
++	if [ $? -ne 0 ]; then
++		echo "FAIL: ${MAKE} ARCH=${arch} ${conf}"
++		return -1
++	fi
++
++	${MAKE} ARCH=${arch} ${dtb}.img -j${CPUs}
++	if [ $? -ne 0 ]; then
++		echo "FAIL: ${MAKE} ARCH=${arch} ${dtb}.img"
++		return -2
++	fi
++
++	return 0
++}
++
++function make_ext2_image()
++{
++	blocks=${IMAGE_BLOCKS}
++	block_size=$((${IMAGE_SIZE} * 1024 * 1024 / ${blocks}))
++
++	if [ "`uname -m`" == "aarch64" ]; then
++		echo y | sudo mke2fs -b ${block_size} -d boot_linux -i 8192 -t ext2 boot_linux.img ${blocks}
++	else
++		genext2fs -B ${blocks} -b ${block_size} -d boot_linux -i 8192 -U boot_linux.img
++	fi
++
++	return $?
++}
++
++function make_boot_linux()
++{
++	arch=${!ID_ARCH}
++	uart=${!ID_UART}
++	dtb=${!ID_DTB}
++	image=${!ID_IMAGE}
++	conf=${!ID_CONF}
++	if [ ${arch} == "arm" ]; then
++		dtb_path=arch/arm/boot/dts
++	else
++		dtb_path=arch/arm64/boot/dts/rockchip
++	fi
++
++	rm -rf ${BUILD_PATH}
++	mkdir -p ${EXTLINUX_PATH}
++
++	make_kernel_image ${arch} ${conf} ${dtb}
++	if [ $? -ne 0 ]; then
++		exit 1
++	fi
++	make_extlinux_conf ${dtb_path} ${uart} ${image}
++	cp -f ${OBJ_PATH}arch/${arch}/boot/${image} ${EXTLINUX_PATH}/
++	cp -f ${OBJ_PATH}${dtb_path}/${dtb}.dtb ${EXTLINUX_PATH}/${SAPPHIRE_DTB}
++	cp -f logo*.bmp ${BUILD_PATH}/
++	if [ "enable_ramdisk" != "${ramdisk_flag}" ]; then
++		make_ext2_image
++	fi
++}
++
++ramdisk_flag=$2
++found=0
++cp -arf ${MCU_LIB_FILE} ${MCU_OBJ_PATCH}/
++for i in "${model_list[@]}"; do
++	if [ "$(echo $i | awk '{print $1}')" == "$1" ]; then
++		make_boot_linux $i
++		found=1
++	fi
++done
++
++if [ ${found} -eq 0 ]; then
++	help
++fi
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 4ecf9a062..20277864c 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3932,7 +3932,6 @@ void __unmap_hugepage_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 	struct hstate *h = hstate_vma(vma);
+ 	unsigned long sz = huge_page_size(h);
+ 	struct mmu_notifier_range range;
+-	bool force_flush = false;
+ 
+ 	WARN_ON(!is_vm_hugetlb_page(vma));
+ 	BUG_ON(start & ~huge_page_mask(h));
+@@ -3961,8 +3960,10 @@ void __unmap_hugepage_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 		ptl = huge_pte_lock(h, mm, ptep);
+ 		if (huge_pmd_unshare(mm, vma, &address, ptep)) {
+ 			spin_unlock(ptl);
+-			tlb_flush_pmd_range(tlb, address & PUD_MASK, PUD_SIZE);
+-			force_flush = true;
++			/*
++			 * We just unmapped a page of PMDs by clearing a PUD.
++			 * The caller's TLB flush range should cover this area.
++			 */
+ 			continue;
+ 		}
+ 
+@@ -4019,22 +4020,6 @@ void __unmap_hugepage_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 	}
+ 	mmu_notifier_invalidate_range_end(&range);
+ 	tlb_end_vma(tlb, vma);
+-
+-	/*
+-	 * If we unshared PMDs, the TLB flush was not recorded in mmu_gather. We
+-	 * could defer the flush until now, since by holding i_mmap_rwsem we
+-	 * guaranteed that the last refernece would not be dropped. But we must
+-	 * do the flushing before we return, as otherwise i_mmap_rwsem will be
+-	 * dropped and the last reference to the shared PMDs page might be
+-	 * dropped as well.
+-	 *
+-	 * In theory we could defer the freeing of the PMD pages as well, but
+-	 * huge_pmd_unshare() relies on the exact page_count for the PMD page to
+-	 * detect sharing, so we cannot defer the release of the page either.
+-	 * Instead, do flush now.
+-	 */
+-	if (force_flush)
+-		tlb_flush_mmu_tlbonly(tlb);
+ }
+ 
+ void __unmap_hugepage_range_final(struct mmu_gather *tlb,
+diff --git a/mm/memblock.c b/mm/memblock.c
+index faa4de579..3f3254627 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -97,6 +97,26 @@ struct pglist_data __refdata contig_page_data;
+ EXPORT_SYMBOL(contig_page_data);
+ #endif
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++static unsigned long defer_start __initdata;
++static unsigned long defer_end __initdata;
++
++#define DEFAULT_DEFER_FREE_BLOCK_SIZE SZ_256M
++static unsigned long defer_free_block_size __initdata =
++	DEFAULT_DEFER_FREE_BLOCK_SIZE;
++
++static int __init early_defer_free_block_size(char *p)
++{
++	defer_free_block_size = memparse(p, &p);
++
++	pr_debug("defer_free_block_size = 0x%lx\n", defer_free_block_size);
++
++	return 0;
++}
++
++early_param("defer_free_block_size", early_defer_free_block_size);
++#endif
++
+ unsigned long max_low_pfn;
+ unsigned long min_low_pfn;
+ unsigned long max_pfn;
+@@ -1907,6 +1927,28 @@ static void __init __free_pages_memory(unsigned long start, unsigned long end)
+ 	}
+ }
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++int __init defer_free_memblock(void *unused)
++{
++	if (defer_start == 0)
++		return 0;
++
++	pr_debug("start = %ld, end = %ld\n", defer_start, defer_end);
++
++	__free_pages_memory(defer_start, defer_end);
++
++	totalram_pages_add(defer_end - defer_start);
++
++	pr_info("%s: size %luM free %luM [%luM - %luM] total %luM\n", __func__,
++		defer_free_block_size >> 20,
++		(defer_end - defer_start) >> (20 - PAGE_SHIFT),
++		defer_end >> (20 - PAGE_SHIFT),
++		defer_start >> (20 - PAGE_SHIFT),
++		totalram_pages() >> (20 - PAGE_SHIFT));
++	return 0;
++}
++#endif
++
+ static unsigned long __init __free_memory_core(phys_addr_t start,
+ 				 phys_addr_t end)
+ {
+@@ -1917,6 +1959,15 @@ static unsigned long __init __free_memory_core(phys_addr_t start,
+ 	if (start_pfn >= end_pfn)
+ 		return 0;
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	if ((end - start) > defer_free_block_size) {
++		defer_start = start_pfn;
++		defer_end = end_pfn;
++
++		return 0;
++	}
++#endif
++
+ 	__free_pages_memory(start_pfn, end_pfn);
+ 
+ 	return end_pfn - start_pfn;
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 85e48479c..dbfb65fb7 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1445,9 +1445,15 @@ static void free_one_page(struct zone *zone,
+ }
+ 
+ static void __meminit __init_single_page(struct page *page, unsigned long pfn,
+-				unsigned long zone, int nid)
++				unsigned long zone, int nid,
++				bool zero_page_struct __maybe_unused)
+ {
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	if (zero_page_struct)
++		mm_zero_struct_page(page);
++#else
+ 	mm_zero_struct_page(page);
++#endif
+ 	set_page_links(page, zone, nid, pfn);
+ 	init_page_count(page);
+ 	page_mapcount_reset(page);
+@@ -1480,7 +1486,7 @@ static void __meminit init_reserved_page(unsigned long pfn)
+ 		if (pfn >= zone->zone_start_pfn && pfn < zone_end_pfn(zone))
+ 			break;
+ 	}
+-	__init_single_page(pfn_to_page(pfn), pfn, zid, nid);
++	__init_single_page(pfn_to_page(pfn), pfn, zid, nid, true);
+ }
+ #else
+ static inline void init_reserved_page(unsigned long pfn)
+@@ -1794,7 +1800,7 @@ static unsigned long  __init deferred_init_pages(struct zone *zone,
+ 		} else {
+ 			page++;
+ 		}
+-		__init_single_page(page, pfn, zid, nid);
++		__init_single_page(page, pfn, zid, nid, true);
+ 		nr_pages++;
+ 	}
+ 	return (nr_pages);
+@@ -6169,6 +6175,11 @@ void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+ 	}
+ #endif
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++	/* Zero all page struct in advance */
++	memset(pfn_to_page(start_pfn), 0, sizeof(struct page) * size);
++#endif
++
+ 	for (pfn = start_pfn; pfn < end_pfn; ) {
+ 		/*
+ 		 * There can be holes in boot-time mem_map[]s handed to this
+@@ -6182,7 +6193,7 @@ void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
+ 		}
+ 
+ 		page = pfn_to_page(pfn);
+-		__init_single_page(page, pfn, zone, nid);
++		__init_single_page(page, pfn, zone, nid, false);
+ 		if (context == MEMINIT_HOTPLUG)
+ 			__SetPageReserved(page);
+ 
+@@ -6228,7 +6239,7 @@ void __ref memmap_init_zone_device(struct zone *zone,
+ 	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
+ 		struct page *page = pfn_to_page(pfn);
+ 
+-		__init_single_page(page, pfn, zone_idx, nid);
++		__init_single_page(page, pfn, zone_idx, nid, true);
+ 
+ 		/*
+ 		 * Mark page reserved as it will need to wait for onlining
+@@ -6313,7 +6324,7 @@ static void __init init_unavailable_range(unsigned long spfn,
+ 				+ pageblock_nr_pages - 1;
+ 			continue;
+ 		}
+-		__init_single_page(pfn_to_page(pfn), pfn, zone, node);
++		__init_single_page(pfn_to_page(pfn), pfn, zone, node, true);
+ 		__SetPageReserved(pfn_to_page(pfn));
+ 		pgcnt++;
+ 	}
+diff --git a/scripts/Makefile.lib b/scripts/Makefile.lib
+index 53aa3e18c..7ca0ddfa6 100644
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -318,8 +318,9 @@ $(obj)/%.dtb.S: $(obj)/%.dtb FORCE
+ 	$(call if_changed,dt_S_dtb)
+ 
+ quiet_cmd_dtc = DTC     $@
+-cmd_dtc = $(HOSTCC) -E $(dtc_cpp_flags) -x assembler-with-cpp -o $(dtc-tmp) $< ; \
+-	$(DTC) -O $(patsubst .%,%,$(suffix $@)) -o $@ -b 0 \
++cmd_dtc = mkdir -p $(dir ${dtc-tmp}) ; \
++      $(CPP) $(dtc_cpp_flags) -x assembler-with-cpp -o $(dtc-tmp) $< ; \
++      $(DTC) -O dtb -o $@ -b 0 \
+ 		$(addprefix -i,$(dir $<) $(DTC_INCLUDE)) $(DTC_FLAGS) \
+ 		-d $(depfile).dtc.tmp $(dtc-tmp) ; \
+ 	cat $(depfile).pre.tmp $(depfile).dtc.tmp > $(depfile)
+diff --git a/scripts/dtc/checks.c b/scripts/dtc/checks.c
+index 17cb6890d..913fb08af 100644
+--- a/scripts/dtc/checks.c
++++ b/scripts/dtc/checks.c
+@@ -649,6 +649,24 @@ static void fixup_omit_unused_nodes(struct check *c, struct dt_info *dti,
+ 		return;
+ 	if (node->omit_if_unused && !node->is_referenced)
+ 		delete_node(node);
++
++	if (node->deleted) {
++		struct node *parent = node->parent;
++		struct node *child;
++		struct label *label;
++		struct property *prop;
++
++		for_each_label(parent->labels, label)
++			return;
++
++		for_each_property(parent, prop)
++			return;
++
++		for_each_child(parent, child)
++			return;
++
++		delete_node(parent);
++	}
+ }
+ ERROR(omit_unused_nodes, fixup_omit_unused_nodes, NULL, &phandle_references, &path_references);
+ 
+diff --git a/security/Kconfig.hardening b/security/Kconfig.hardening
+index 269967c4f..9eb73dc1b 100644
+--- a/security/Kconfig.hardening
++++ b/security/Kconfig.hardening
+@@ -39,7 +39,7 @@ choice
+ 	default GCC_PLUGIN_STRUCTLEAK_BYREF_ALL if COMPILE_TEST && GCC_PLUGINS
+ 	default INIT_STACK_ALL_PATTERN if COMPILE_TEST && CC_HAS_AUTO_VAR_INIT_PATTERN
+ 	default INIT_STACK_ALL_ZERO if CC_HAS_AUTO_VAR_INIT_ZERO
+-	default INIT_STACK_NONE
++	default INIT_STACK_ALL_ZERO
+ 	help
+ 	  This option enables initialization of stack variables at
+ 	  function entry time. This has the possibility to have the
+@@ -211,6 +211,7 @@ config STACKLEAK_RUNTIME_DISABLE
+ 
+ config INIT_ON_ALLOC_DEFAULT_ON
+ 	bool "Enable heap memory zeroing on allocation by default"
++	default y
+ 	help
+ 	  This has the effect of setting "init_on_alloc=1" on the kernel
+ 	  command line. This can be disabled with "init_on_alloc=0".
+diff --git a/tools/usb/ffs-aio-example/multibuff/device_app/aio_multibuff.c b/tools/usb/ffs-aio-example/multibuff/device_app/aio_multibuff.c
+index aaca1f44e..8643beaf2 100644
+--- a/tools/usb/ffs-aio-example/multibuff/device_app/aio_multibuff.c
++++ b/tools/usb/ffs-aio-example/multibuff/device_app/aio_multibuff.c
+@@ -57,16 +57,30 @@ static const struct {
+ 	struct usb_functionfs_descs_head_v2 header;
+ 	__le32 fs_count;
+ 	__le32 hs_count;
++	__le32 ss_count;
++	__le32 os_count;
+ 	struct {
+ 		struct usb_interface_descriptor intf;
+ 		struct usb_endpoint_descriptor_no_audio bulk_sink;
+ 		struct usb_endpoint_descriptor_no_audio bulk_source;
+ 	} __attribute__ ((__packed__)) fs_descs, hs_descs;
++	struct {
++		struct usb_interface_descriptor intf;
++		struct usb_endpoint_descriptor_no_audio sink;
++		struct usb_ss_ep_comp_descriptor sink_comp;
++		struct usb_endpoint_descriptor_no_audio source;
++		struct usb_ss_ep_comp_descriptor source_comp;
++	} __attribute__ ((__packed__)) ss_descs;
++	struct usb_os_desc_header os_header;
++	struct usb_ext_compat_desc os_desc;
++
+ } __attribute__ ((__packed__)) descriptors = {
+ 	.header = {
+ 		.magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
+ 		.flags = htole32(FUNCTIONFS_HAS_FS_DESC |
+-				     FUNCTIONFS_HAS_HS_DESC),
++				 FUNCTIONFS_HAS_HS_DESC |
++				 FUNCTIONFS_HAS_SS_DESC |
++				 FUNCTIONFS_HAS_MS_OS_DESC),
+ 		.length = htole32(sizeof(descriptors)),
+ 	},
+ 	.fs_count = htole32(3),
+@@ -115,6 +129,58 @@ static const struct {
+ 			.wMaxPacketSize = htole16(512),
+ 		},
+ 	},
++	.ss_count = htole32(5),
++	.ss_descs = {
++		.intf = {
++			.bLength = sizeof(descriptors.ss_descs.intf),
++			.bDescriptorType = USB_DT_INTERFACE,
++			.bInterfaceNumber = 0,
++			.bNumEndpoints = 2,
++			.bInterfaceClass = USB_CLASS_VENDOR_SPEC,
++			.iInterface = 1,
++		},
++		.sink = {
++			.bLength = sizeof(descriptors.ss_descs.sink),
++			.bDescriptorType = USB_DT_ENDPOINT,
++			.bEndpointAddress = 1 | USB_DIR_IN,
++			.bmAttributes = USB_ENDPOINT_XFER_BULK,
++			.wMaxPacketSize = htole16(1024),
++		},
++		.sink_comp = {
++			.bLength = sizeof(descriptors.ss_descs.sink_comp),
++			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
++			.bMaxBurst = 4,
++		},
++		.source = {
++			.bLength = sizeof(descriptors.ss_descs.source),
++			.bDescriptorType = USB_DT_ENDPOINT,
++			.bEndpointAddress = 2 | USB_DIR_OUT,
++			.bmAttributes = USB_ENDPOINT_XFER_BULK,
++			.wMaxPacketSize = htole16(1024),
++		},
++		.source_comp = {
++			.bLength = sizeof(descriptors.ss_descs.source_comp),
++			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
++			.bMaxBurst = 4,
++		},
++	},
++	.os_count = htole32(1),
++	.os_header = {
++		.interface = htole32(1),
++		.dwLength = htole32(sizeof(descriptors.os_header) +
++			    sizeof(descriptors.os_desc)),
++		.bcdVersion = htole32(1),
++		.wIndex = htole32(4),
++		.bCount = htole32(1),
++		.Reserved = htole32(0),
++	},
++	.os_desc = {
++		.bFirstInterfaceNumber = 0,
++		.Reserved1 = htole32(1),
++		.CompatibleID = {0},
++		.SubCompatibleID = {0},
++		.Reserved2 = {0},
++	},
+ };
+ 
+ #define STR_INTERFACE "AIO Test"
+diff --git a/tools/usb/ffs-aio-example/simple/device_app/aio_simple.c b/tools/usb/ffs-aio-example/simple/device_app/aio_simple.c
+index 1f44a2981..51574379f 100644
+--- a/tools/usb/ffs-aio-example/simple/device_app/aio_simple.c
++++ b/tools/usb/ffs-aio-example/simple/device_app/aio_simple.c
+@@ -55,16 +55,30 @@ static const struct {
+ 	struct usb_functionfs_descs_head_v2 header;
+ 	__le32 fs_count;
+ 	__le32 hs_count;
++	__le32 ss_count;
++	__le32 os_count;
+ 	struct {
+ 		struct usb_interface_descriptor intf;
+ 		struct usb_endpoint_descriptor_no_audio bulk_sink;
+ 		struct usb_endpoint_descriptor_no_audio bulk_source;
+ 	} __attribute__ ((__packed__)) fs_descs, hs_descs;
++	struct {
++		struct usb_interface_descriptor intf;
++		struct usb_endpoint_descriptor_no_audio sink;
++		struct usb_ss_ep_comp_descriptor sink_comp;
++		struct usb_endpoint_descriptor_no_audio source;
++		struct usb_ss_ep_comp_descriptor source_comp;
++	} __attribute__ ((__packed__)) ss_descs;
++	struct usb_os_desc_header os_header;
++	struct usb_ext_compat_desc os_desc;
++
+ } __attribute__ ((__packed__)) descriptors = {
+ 	.header = {
+ 		.magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
+ 		.flags = htole32(FUNCTIONFS_HAS_FS_DESC |
+-				     FUNCTIONFS_HAS_HS_DESC),
++				 FUNCTIONFS_HAS_HS_DESC |
++				 FUNCTIONFS_HAS_SS_DESC |
++				 FUNCTIONFS_HAS_MS_OS_DESC),
+ 		.length = htole32(sizeof(descriptors)),
+ 	},
+ 	.fs_count = htole32(3),
+@@ -113,6 +127,58 @@ static const struct {
+ 			.wMaxPacketSize = htole16(512),
+ 		},
+ 	},
++	.ss_count = htole32(5),
++	.ss_descs = {
++		.intf = {
++			.bLength = sizeof(descriptors.ss_descs.intf),
++			.bDescriptorType = USB_DT_INTERFACE,
++			.bInterfaceNumber = 0,
++			.bNumEndpoints = 2,
++			.bInterfaceClass = USB_CLASS_VENDOR_SPEC,
++			.iInterface = 1,
++		},
++		.sink = {
++			.bLength = sizeof(descriptors.ss_descs.sink),
++			.bDescriptorType = USB_DT_ENDPOINT,
++			.bEndpointAddress = 1 | USB_DIR_IN,
++			.bmAttributes = USB_ENDPOINT_XFER_BULK,
++			.wMaxPacketSize = htole16(1024),
++		},
++		.sink_comp = {
++			.bLength = sizeof(descriptors.ss_descs.sink_comp),
++			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
++			.bMaxBurst = 4,
++		},
++		.source = {
++			.bLength = sizeof(descriptors.ss_descs.source),
++			.bDescriptorType = USB_DT_ENDPOINT,
++			.bEndpointAddress = 2 | USB_DIR_OUT,
++			.bmAttributes = USB_ENDPOINT_XFER_BULK,
++			.wMaxPacketSize = htole16(1024),
++		},
++		.source_comp = {
++			.bLength = sizeof(descriptors.ss_descs.source_comp),
++			.bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
++			.bMaxBurst = 4,
++		},
++	},
++	.os_count = htole32(1),
++	.os_header = {
++		.interface = htole32(1),
++		.dwLength = htole32(sizeof(descriptors.os_header) +
++			    sizeof(descriptors.os_desc)),
++		.bcdVersion = htole32(1),
++		.wIndex = htole32(4),
++		.bCount = htole32(1),
++		.Reserved = htole32(0),
++	},
++	.os_desc = {
++		.bFirstInterfaceNumber = 0,
++		.Reserved1 = htole32(1),
++		.CompatibleID = {0},
++		.SubCompatibleID = {0},
++		.Reserved2 = {0},
++	},
+ };
+ 
+ #define STR_INTERFACE "AIO Test"

@@ -1,0 +1,192 @@
+commit 706027ba60649c8023582d805d5d789b7cffb7fe
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Thu Jun 16 17:17:03 2022 +0800
+
+    linux_drivers_base
+    
+    Change-Id: Id94037ba2fca19e9bb74bced3a69c41ce9723e91
+
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 2bc4db5ff..8952f231f 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -2055,6 +2055,34 @@ static ssize_t online_store(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RW(online);
+ 
++static ssize_t suppliers_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct device_link *link;
++	size_t count = 0;
++
++	list_for_each_entry(link, &dev->links.suppliers, c_node)
++		count += scnprintf(buf + count, PAGE_SIZE - count, "%s\n",
++				   dev_name(link->supplier));
++
++	return count;
++}
++static DEVICE_ATTR_RO(suppliers);
++
++static ssize_t consumers_show(struct device *dev, struct device_attribute *attr,
++			      char *buf)
++{
++	struct device_link *link;
++	size_t count = 0;
++
++	list_for_each_entry(link, &dev->links.consumers, s_node)
++		count += scnprintf(buf + count, PAGE_SIZE - count, "%s\n",
++				   dev_name(link->consumer));
++
++	return count;
++}
++static DEVICE_ATTR_RO(consumers);
++
+ int device_add_groups(struct device *dev, const struct attribute_group **groups)
+ {
+ 	return sysfs_create_groups(&dev->kobj, groups);
+@@ -2226,14 +2254,26 @@ static int device_add_attrs(struct device *dev)
+ 			goto err_remove_dev_groups;
+ 	}
+ 
++	error = device_create_file(dev, &dev_attr_suppliers);
++	if (error)
++		goto err_remove_dev_online;
++
++	error = device_create_file(dev, &dev_attr_consumers);
++	if (error)
++		goto err_remove_dev_suppliers;
++
+ 	if (fw_devlink_flags && !fw_devlink_is_permissive()) {
+ 		error = device_create_file(dev, &dev_attr_waiting_for_supplier);
+ 		if (error)
+-			goto err_remove_dev_online;
++			goto err_remove_dev_consumers;
+ 	}
+ 
+ 	return 0;
+ 
++ err_remove_dev_consumers:
++	device_remove_file(dev, &dev_attr_consumers);
++ err_remove_dev_suppliers:
++	device_remove_file(dev, &dev_attr_suppliers);
+  err_remove_dev_online:
+ 	device_remove_file(dev, &dev_attr_online);
+  err_remove_dev_groups:
+@@ -2254,6 +2294,8 @@ static void device_remove_attrs(struct device *dev)
+ 	const struct device_type *type = dev->type;
+ 
+ 	device_remove_file(dev, &dev_attr_waiting_for_supplier);
++	device_remove_file(dev, &dev_attr_consumers);
++	device_remove_file(dev, &dev_attr_suppliers);
+ 	device_remove_file(dev, &dev_attr_online);
+ 	device_remove_groups(dev, dev->groups);
+ 
+@@ -4354,6 +4396,13 @@ void device_set_of_node_from_dev(struct device *dev, const struct device *dev2)
+ }
+ EXPORT_SYMBOL_GPL(device_set_of_node_from_dev);
+ 
++void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
++{
++	dev->fwnode = fwnode;
++	dev->of_node = to_of_node(fwnode);
++}
++EXPORT_SYMBOL_GPL(device_set_node);
++
+ int device_match_name(struct device *dev, const void *name)
+ {
+ 	return sysfs_streq(dev_name(dev), name);
+diff --git a/drivers/base/firmware_loader/main.c b/drivers/base/firmware_loader/main.c
+index f41e4e499..81ee92fec 100644
+--- a/drivers/base/firmware_loader/main.c
++++ b/drivers/base/firmware_loader/main.c
+@@ -464,11 +464,13 @@ static int fw_decompress_xz(struct device *dev, struct fw_priv *fw_priv,
+ /* direct firmware loading support */
+ static char fw_path_para[256];
+ static const char * const fw_path[] = {
+-	fw_path_para,
+-	"/lib/firmware/updates/" UTS_RELEASE,
+-	"/lib/firmware/updates",
+-	"/lib/firmware/" UTS_RELEASE,
+-	"/lib/firmware"
++    fw_path_para,
++    "/lib/firmware/updates/" UTS_RELEASE,
++    "/lib/firmware/updates",
++    "/lib/firmware/" UTS_RELEASE,
++    "/lib/firmware",
++    "/system/etc/imx_sdma/" UTS_RELEASE,
++    "/system/etc/imx_sdma"
+ };
+ 
+ /*
+diff --git a/drivers/base/power/domain.c b/drivers/base/power/domain.c
+index 743268996..e91bbd75f 100644
+--- a/drivers/base/power/domain.c
++++ b/drivers/base/power/domain.c
+@@ -475,6 +475,9 @@ static int _genpd_power_off(struct generic_pm_domain *genpd, bool timed)
+ 	if (!genpd->power_off)
+ 		goto out;
+ 
++	if (atomic_read(&genpd->sd_count) > 0)
++		return -EBUSY;
++
+ 	if (!timed) {
+ 		ret = genpd->power_off(genpd);
+ 		if (ret)
+@@ -583,9 +586,9 @@ static int genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
+ 	if (!genpd->gov)
+ 		genpd->state_idx = 0;
+ 
+-	/* Don't power off, if a child domain is waiting to power on. */
+-	if (atomic_read(&genpd->sd_count) > 0)
+-		return -EBUSY;
++	/* Choose the deepest state if no devices using this domain */
++	if (!genpd->device_count)
++		genpd->state_idx = genpd->state_count - 1;
+ 
+ 	ret = _genpd_power_off(genpd, true);
+ 	if (ret) {
+@@ -980,11 +983,20 @@ static void genpd_sync_power_off(struct generic_pm_domain *genpd, bool use_lock,
+ {
+ 	struct gpd_link *link;
+ 
+-	if (!genpd_status_on(genpd) || genpd_is_always_on(genpd))
++	/*
++	 * Give the power domain a chance to switch to the deepest state in
++	 * case it's already off but in an intermediate low power state.
++	 */
++	genpd->state_idx_saved = genpd->state_idx;
++
++	if (genpd_is_always_on(genpd))
++		return;
++
++	if (!genpd_status_on(genpd) &&
++	    genpd->state_idx == (genpd->state_count - 1))
+ 		return;
+ 
+-	if (genpd->suspended_count != genpd->device_count
+-	    || atomic_read(&genpd->sd_count) > 0)
++	if (genpd->suspended_count != genpd->device_count)
+ 		return;
+ 
+ 	/* Choose the deepest state when suspending */
+@@ -992,6 +1004,9 @@ static void genpd_sync_power_off(struct generic_pm_domain *genpd, bool use_lock,
+ 	if (_genpd_power_off(genpd, false))
+ 		return;
+ 
++	if (genpd->status == GENPD_STATE_OFF)
++		return;
++
+ 	genpd->status = GENPD_STATE_OFF;
+ 
+ 	list_for_each_entry(link, &genpd->child_links, child_node) {
+@@ -1038,6 +1053,9 @@ static void genpd_sync_power_on(struct generic_pm_domain *genpd, bool use_lock,
+ 	}
+ 
+ 	_genpd_power_on(genpd, false);
++	/* restore save power domain state after resume */
++	genpd->state_idx = genpd->state_idx_saved;
++
+ 	genpd->status = GENPD_STATE_ON;
+ }
+ 

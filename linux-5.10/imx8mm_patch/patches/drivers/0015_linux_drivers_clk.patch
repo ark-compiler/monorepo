@@ -1,0 +1,5534 @@
+commit d3211978913e7ee651bf47cfb393daccb8be4fdb
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Wed Aug 10 11:43:26 2022 +0800
+
+    drivers_clk
+    
+    Change-Id: Iad3fba6c51f290df25555d1136fd2cc4761d3324
+
+diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+index c715d4681..3853ce51b 100644
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -374,6 +374,7 @@ source "drivers/clk/mvebu/Kconfig"
+ source "drivers/clk/qcom/Kconfig"
+ source "drivers/clk/renesas/Kconfig"
+ source "drivers/clk/rockchip/Kconfig"
++source "drivers/clk/s32/Kconfig"
+ source "drivers/clk/samsung/Kconfig"
+ source "drivers/clk/sifive/Kconfig"
+ source "drivers/clk/sprd/Kconfig"
+diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+index da8fcf147..8a52da49c 100644
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -102,6 +102,7 @@ obj-$(CONFIG_COMMON_CLK_PXA)		+= pxa/
+ obj-$(CONFIG_COMMON_CLK_QCOM)		+= qcom/
+ obj-y					+= renesas/
+ obj-$(CONFIG_ARCH_ROCKCHIP)		+= rockchip/
++obj-$(CONFIG_ARCH_S32)			+= s32/
+ obj-$(CONFIG_COMMON_CLK_SAMSUNG)	+= samsung/
+ obj-$(CONFIG_CLK_SIFIVE)		+= sifive/
+ obj-$(CONFIG_ARCH_SIRF)			+= sirf/
+diff --git a/drivers/clk/clk.c b/drivers/clk/clk.c
+index 61c78714c..18cfdbaab 100644
+--- a/drivers/clk/clk.c
++++ b/drivers/clk/clk.c
+@@ -807,8 +807,7 @@ static void clk_core_unprepare(struct clk_core *core)
+ 	if (!core)
+ 		return;
+ 
+-	if (WARN(core->prepare_count == 0,
+-	    "%s already unprepared\n", core->name))
++	if (core->prepare_count == 0)
+ 		return;
+ 
+ 	if (WARN(core->prepare_count == 1 && core->flags & CLK_IS_CRITICAL,
+@@ -949,7 +948,7 @@ static void clk_core_disable(struct clk_core *core)
+ 	if (!core)
+ 		return;
+ 
+-	if (WARN(core->enable_count == 0, "%s already disabled\n", core->name))
++	if (core->enable_count == 0)
+ 		return;
+ 
+ 	if (WARN(core->enable_count == 1 && core->flags & CLK_IS_CRITICAL,
+@@ -1008,8 +1007,7 @@ static int clk_core_enable(struct clk_core *core)
+ 	if (!core)
+ 		return 0;
+ 
+-	if (WARN(core->prepare_count == 0,
+-	    "Enabling unprepared %s\n", core->name))
++	if (core->prepare_count == 0)
+ 		return -ESHUTDOWN;
+ 
+ 	if (core->enable_count == 0) {
+@@ -2495,7 +2493,8 @@ static int clk_core_set_parent_nolock(struct clk_core *core,
+ 	if (!core)
+ 		return 0;
+ 
+-	if (core->parent == parent)
++	if ((core->parent == parent) &&
++		!(core->flags & CLK_SET_PARENT_NOCACHE))
+ 		return 0;
+ 
+ 	/* verify ops for multi-parent clks */
+diff --git a/drivers/clk/imx/Makefile b/drivers/clk/imx/Makefile
+index dd6a737d0..c4a188768 100644
+--- a/drivers/clk/imx/Makefile
++++ b/drivers/clk/imx/Makefile
+@@ -23,12 +23,17 @@ obj-$(CONFIG_MXC_CLK) += mxc-clk.o
+ 
+ obj-$(CONFIG_CLK_IMX8MM) += clk-imx8mm.o
+ obj-$(CONFIG_CLK_IMX8MN) += clk-imx8mn.o
+-obj-$(CONFIG_CLK_IMX8MP) += clk-imx8mp.o
++obj-$(CONFIG_CLK_IMX8MP) += clk-imx8mp.o clk-blk-ctrl.o
+ obj-$(CONFIG_CLK_IMX8MQ) += clk-imx8mq.o
+ 
+ obj-$(CONFIG_MXC_CLK_SCU) += clk-imx-scu.o clk-imx-lpcg-scu.o
+-clk-imx-scu-$(CONFIG_CLK_IMX8QXP) += clk-scu.o clk-imx8qxp.o
++clk-imx-scu-$(CONFIG_CLK_IMX8QXP) += clk-scu.o clk-imx8qxp.o \
++				     clk-imx8qxp-rsrc.o clk-imx8qm-rsrc.o \
++				     clk-imx8dxl-rsrc.o
+ clk-imx-lpcg-scu-$(CONFIG_CLK_IMX8QXP) += clk-lpcg-scu.o clk-imx8qxp-lpcg.o
++obj-$(CONFIG_CLK_IMX8QXP) += clk-imx8qxp-acm.o clk-imx8qm-acm.o clk-imx8dxl-acm.o clk-imx-acm-utils.o
++
++obj-$(CONFIG_CLK_IMX8ULP) += clk-imx8ulp.o
+ 
+ obj-$(CONFIG_CLK_IMX1)   += clk-imx1.o
+ obj-$(CONFIG_CLK_IMX25)  += clk-imx25.o
+diff --git a/drivers/clk/imx/clk-composite-7ulp.c b/drivers/clk/imx/clk-composite-7ulp.c
+index 7c4f31b31..6cc1b8bb8 100644
+--- a/drivers/clk/imx/clk-composite-7ulp.c
++++ b/drivers/clk/imx/clk-composite-7ulp.c
+@@ -8,6 +8,7 @@
+ #include <linux/bits.h>
+ #include <linux/clk-provider.h>
+ #include <linux/err.h>
++#include <linux/io.h>
+ #include <linux/slab.h>
+ 
+ #include "clk.h"
+@@ -22,17 +23,61 @@
+ #define PCG_PCD_WIDTH	3
+ #define PCG_PCD_MASK	0x7
+ 
+-struct clk_hw *imx7ulp_clk_hw_composite(const char *name,
++#define SW_RST		BIT(28)
++
++static int pcc_gate_enable(struct clk_hw *hw)
++{
++	struct clk_gate *gate = to_clk_gate(hw);
++	unsigned long flags;
++	u32 val;
++	int ret;
++
++	ret = clk_gate_ops.enable(hw);
++	if (ret)
++		return ret;
++
++	spin_lock_irqsave(gate->lock, flags);
++	/*
++	 * release the sw reset for peripherals associated with
++	 * with this pcc clock.
++	 */
++	val = readl(gate->reg);
++	val |= SW_RST;
++	writel(val, gate->reg);
++
++	spin_unlock_irqrestore(gate->lock, flags);
++
++	return 0;
++}
++
++static void pcc_gate_disable(struct clk_hw *hw)
++{
++	clk_gate_ops.disable(hw);
++}
++
++static int pcc_gate_is_enabled(struct clk_hw *hw)
++{
++	return clk_gate_ops.is_enabled(hw);
++}
++
++static const struct clk_ops pcc_gate_ops = {
++	.enable = pcc_gate_enable,
++	.disable = pcc_gate_disable,
++	.is_enabled = pcc_gate_is_enabled,
++};
++
++static struct clk_hw *imx_ulp_clk_hw_composite(const char *name,
+ 				     const char * const *parent_names,
+ 				     int num_parents, bool mux_present,
+ 				     bool rate_present, bool gate_present,
+-				     void __iomem *reg)
++				     void __iomem *reg, bool has_swrst)
+ {
+ 	struct clk_hw *mux_hw = NULL, *fd_hw = NULL, *gate_hw = NULL;
+ 	struct clk_fractional_divider *fd = NULL;
+ 	struct clk_gate *gate = NULL;
+ 	struct clk_mux *mux = NULL;
+ 	struct clk_hw *hw;
++	u32 val;
+ 
+ 	if (mux_present) {
+ 		mux = kzalloc(sizeof(*mux), GFP_KERNEL);
+@@ -42,6 +87,8 @@ struct clk_hw *imx7ulp_clk_hw_composite(const char *name,
+ 		mux->reg = reg;
+ 		mux->shift = PCG_PCS_SHIFT;
+ 		mux->mask = PCG_PCS_MASK;
++		if (has_swrst)
++			mux->lock = &imx_ccm_lock;
+ 	}
+ 
+ 	if (rate_present) {
+@@ -59,6 +106,8 @@ struct clk_hw *imx7ulp_clk_hw_composite(const char *name,
+ 		fd->nwidth = PCG_PCD_WIDTH;
+ 		fd->nmask = PCG_PCD_MASK;
+ 		fd->flags = CLK_FRAC_DIVIDER_ZERO_BASED;
++		if (has_swrst)
++			fd->lock = &imx_ccm_lock;
+ 	}
+ 
+ 	if (gate_present) {
+@@ -71,13 +120,27 @@ struct clk_hw *imx7ulp_clk_hw_composite(const char *name,
+ 		gate_hw = &gate->hw;
+ 		gate->reg = reg;
+ 		gate->bit_idx = PCG_CGC_SHIFT;
++		if (has_swrst)
++			gate->lock = &imx_ccm_lock;
++		/*
++		 * make sure clock is gated during clock tree initialization,
++		 * the HW ONLY allow clock parent/rate changed with clock gated,
++		 * during clock tree initialization, clocks could be enabled
++		 * by bootloader, so the HW status will mismatch with clock tree
++		 * prepare count, then clock core driver will allow parent/rate
++		 * change since the prepare count is zero, but HW actually
++		 * prevent the parent/rate change due to the clock is enabled.
++		 */
++		val = readl_relaxed(reg);
++		val &= ~(1 << PCG_CGC_SHIFT);
++		writel_relaxed(val, reg);
+ 	}
+ 
+ 	hw = clk_hw_register_composite(NULL, name, parent_names, num_parents,
+ 				       mux_hw, &clk_mux_ops, fd_hw,
+ 				       &clk_fractional_divider_ops, gate_hw,
+-				       &clk_gate_ops, CLK_SET_RATE_GATE |
+-				       CLK_SET_PARENT_GATE);
++				       has_swrst ? &pcc_gate_ops : &clk_gate_ops, CLK_SET_RATE_GATE |
++				       CLK_SET_PARENT_GATE | CLK_SET_RATE_NO_REPARENT);
+ 	if (IS_ERR(hw)) {
+ 		kfree(mux);
+ 		kfree(fd);
+@@ -86,3 +149,19 @@ struct clk_hw *imx7ulp_clk_hw_composite(const char *name,
+ 
+ 	return hw;
+ }
++
++struct clk_hw *imx7ulp_clk_hw_composite(const char *name, const char * const *parent_names,
++				int num_parents, bool mux_present, bool rate_present,
++				bool gate_present, void __iomem *reg)
++{
++	return imx_ulp_clk_hw_composite(name, parent_names, num_parents, mux_present, rate_present,
++					gate_present, reg, false);
++}
++
++struct clk_hw *imx8ulp_clk_hw_composite(const char *name, const char * const *parent_names,
++				int num_parents, bool mux_present, bool rate_present,
++				bool gate_present, void __iomem *reg, bool has_swrst)
++{
++	return imx_ulp_clk_hw_composite(name, parent_names, num_parents, mux_present, rate_present,
++					gate_present, reg, has_swrst);
++}
+diff --git a/drivers/clk/imx/clk-composite-8m.c b/drivers/clk/imx/clk-composite-8m.c
+index 04e728538..fec34169a 100644
+--- a/drivers/clk/imx/clk-composite-8m.c
++++ b/drivers/clk/imx/clk-composite-8m.c
+@@ -223,14 +223,19 @@ struct clk_hw *imx8m_clk_hw_composite_flags(const char *name,
+ 	div->lock = &imx_ccm_lock;
+ 	div->flags = CLK_DIVIDER_ROUND_CLOSEST;
+ 
+-	gate = kzalloc(sizeof(*gate), GFP_KERNEL);
+-	if (!gate)
+-		goto fail;
+-
+-	gate_hw = &gate->hw;
+-	gate->reg = reg;
+-	gate->bit_idx = PCG_CGC_SHIFT;
+-	gate->lock = &imx_ccm_lock;
++	/* skip registering the gate ops if M4 is enabled */
++	if (imx_src_is_m4_enabled()) {
++		gate_hw = NULL;
++	} else {
++		gate = kzalloc(sizeof(*gate), GFP_KERNEL);
++		if (!gate)
++			goto fail;
++
++		gate_hw = &gate->hw;
++		gate->reg = reg;
++		gate->bit_idx = PCG_CGC_SHIFT;
++		gate->lock = &imx_ccm_lock;
++	}
+ 
+ 	hw = clk_hw_register_composite(NULL, name, parent_names, num_parents,
+ 			mux_hw, mux_ops, div_hw,
+diff --git a/drivers/clk/imx/clk-gate2.c b/drivers/clk/imx/clk-gate2.c
+index 7eed7083f..0f8fb0341 100644
+--- a/drivers/clk/imx/clk-gate2.c
++++ b/drivers/clk/imx/clk-gate2.c
+@@ -8,11 +8,13 @@
+ 
+ #include <linux/clk-provider.h>
+ #include <linux/export.h>
++#include <linux/imx_sema4.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/io.h>
+ #include <linux/err.h>
+ #include <linux/string.h>
++#include <soc/imx/src.h>
+ #include "clk.h"
+ 
+ /**
+@@ -37,10 +39,54 @@ struct clk_gate2 {
+ 
+ #define to_clk_gate2(_hw) container_of(_hw, struct clk_gate2, hw)
+ 
++static void clk_gate2_do_hardware(struct clk_gate2 *gate, bool enable)
++{
++	u32 reg;
++
++	reg = readl(gate->reg);
++	if (enable)
++		reg |= gate->cgr_val << gate->bit_idx;
++	else
++		reg &= ~(gate->cgr_val << gate->bit_idx);
++	writel(reg, gate->reg);
++}
++
++static void clk_gate2_do_shared_clks(struct clk_hw *hw, bool enable)
++{
++	struct clk_gate2 *gate = to_clk_gate2(hw);
++
++	if (imx_src_is_m4_enabled() && clk_on_imx6sx()) {
++#ifdef CONFIG_SOC_IMX6SX
++		if (!amp_power_mutex || !shared_mem) {
++			if (enable)
++				clk_gate2_do_hardware(gate, enable);
++			return;
++		}
++
++		imx_sema4_mutex_lock(amp_power_mutex);
++		if (shared_mem->ca9_valid != SHARED_MEM_MAGIC_NUMBER ||
++			shared_mem->cm4_valid != SHARED_MEM_MAGIC_NUMBER) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		if (!imx_update_shared_mem(hw, enable)) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		clk_gate2_do_hardware(gate, enable);
++
++		imx_sema4_mutex_unlock(amp_power_mutex);
++#endif
++	} else {
++		clk_gate2_do_hardware(gate, enable);
++	}
++}
++
+ static int clk_gate2_enable(struct clk_hw *hw)
+ {
+ 	struct clk_gate2 *gate = to_clk_gate2(hw);
+-	u32 reg;
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
+@@ -49,15 +95,7 @@ static int clk_gate2_enable(struct clk_hw *hw)
+ 	if (gate->share_count && (*gate->share_count)++ > 0)
+ 		goto out;
+ 
+-	if (gate->flags & IMX_CLK_GATE2_SINGLE_BIT) {
+-		ret = clk_gate_ops.enable(hw);
+-	} else {
+-		reg = readl(gate->reg);
+-		reg &= ~(3 << gate->bit_idx);
+-		reg |= gate->cgr_val << gate->bit_idx;
+-		writel(reg, gate->reg);
+-	}
+-
++	clk_gate2_do_shared_clks(hw, true);
+ out:
+ 	spin_unlock_irqrestore(gate->lock, flags);
+ 
+@@ -67,7 +105,6 @@ static int clk_gate2_enable(struct clk_hw *hw)
+ static void clk_gate2_disable(struct clk_hw *hw)
+ {
+ 	struct clk_gate2 *gate = to_clk_gate2(hw);
+-	u32 reg;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(gate->lock, flags);
+@@ -79,23 +116,16 @@ static void clk_gate2_disable(struct clk_hw *hw)
+ 			goto out;
+ 	}
+ 
+-	if (gate->flags & IMX_CLK_GATE2_SINGLE_BIT) {
+-		clk_gate_ops.disable(hw);
+-	} else {
+-		reg = readl(gate->reg);
+-		reg &= ~(3 << gate->bit_idx);
+-		writel(reg, gate->reg);
+-	}
+-
++	clk_gate2_do_shared_clks(hw, false);
+ out:
+ 	spin_unlock_irqrestore(gate->lock, flags);
+ }
+ 
+-static int clk_gate2_reg_is_enabled(void __iomem *reg, u8 bit_idx)
++static int clk_gate2_reg_is_enabled(void __iomem *reg, u8 bit_idx, u8 cgr_val)
+ {
+ 	u32 val = readl(reg);
+ 
+-	if (((val >> bit_idx) & 1) == 1)
++	if (((val >> bit_idx) & cgr_val) == 1)
+ 		return 1;
+ 
+ 	return 0;
+@@ -104,29 +134,27 @@ static int clk_gate2_reg_is_enabled(void __iomem *reg, u8 bit_idx)
+ static int clk_gate2_is_enabled(struct clk_hw *hw)
+ {
+ 	struct clk_gate2 *gate = to_clk_gate2(hw);
++	unsigned long flags;
++	int ret;
+ 
+-	if (gate->flags & IMX_CLK_GATE2_SINGLE_BIT)
+-		return clk_gate_ops.is_enabled(hw);
++	spin_lock_irqsave(gate->lock, flags);
++
++	ret = clk_gate2_reg_is_enabled(gate->reg, gate->bit_idx, gate->cgr_val);
++
++	spin_unlock_irqrestore(gate->lock, flags);
+ 
+-	return clk_gate2_reg_is_enabled(gate->reg, gate->bit_idx);
++	return ret;
+ }
+ 
+ static void clk_gate2_disable_unused(struct clk_hw *hw)
+ {
+ 	struct clk_gate2 *gate = to_clk_gate2(hw);
+ 	unsigned long flags;
+-	u32 reg;
+-
+-	if (gate->flags & IMX_CLK_GATE2_SINGLE_BIT)
+-		return;
+ 
+ 	spin_lock_irqsave(gate->lock, flags);
+ 
+-	if (!gate->share_count || *gate->share_count == 0) {
+-		reg = readl(gate->reg);
+-		reg &= ~(3 << gate->bit_idx);
+-		writel(reg, gate->reg);
+-	}
++	if (!gate->share_count || *gate->share_count == 0)
++		clk_gate2_do_shared_clks(hw, false);
+ 
+ 	spin_unlock_irqrestore(gate->lock, flags);
+ }
+diff --git a/drivers/clk/imx/clk-imx-acm-utils.c b/drivers/clk/imx/clk-imx-acm-utils.c
+new file mode 100644
+index 000000000..b923e117d
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx-acm-utils.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Copyright 2020 NXP
++
++#include <linux/pm_runtime.h>
++#include <linux/pm_domain.h>
++#include "clk-imx-acm-utils.h"
++
++/**
++ * clk_imx_acm_attach_pm_domains
++ */
++int clk_imx_acm_attach_pm_domains(struct device *dev,
++				  struct clk_imx_acm_pm_domains *dev_pm)
++{
++	int ret;
++	int i;
++
++	dev_pm->num_domains = of_count_phandle_with_args(dev->of_node, "power-domains",
++							 "#power-domain-cells");
++	if (dev_pm->num_domains <= 1)
++		return 0;
++
++	dev_pm->pd_dev = devm_kmalloc_array(dev, dev_pm->num_domains,
++					    sizeof(*dev_pm->pd_dev),
++					    GFP_KERNEL);
++	if (!dev_pm->pd_dev)
++		return -ENOMEM;
++
++	dev_pm->pd_dev_link = devm_kmalloc_array(dev,
++						 dev_pm->num_domains,
++						 sizeof(*dev_pm->pd_dev_link),
++						 GFP_KERNEL);
++	if (!dev_pm->pd_dev_link)
++		return -ENOMEM;
++
++	for (i = 0; i < dev_pm->num_domains; i++) {
++		dev_pm->pd_dev[i] = dev_pm_domain_attach_by_id(dev, i);
++		if (IS_ERR(dev_pm->pd_dev[i]))
++			return PTR_ERR(dev_pm->pd_dev[i]);
++
++		dev_pm->pd_dev_link[i] = device_link_add(dev,
++							 dev_pm->pd_dev[i],
++							 DL_FLAG_STATELESS |
++							 DL_FLAG_PM_RUNTIME |
++							 DL_FLAG_RPM_ACTIVE);
++		if (IS_ERR(dev_pm->pd_dev_link[i])) {
++			dev_pm_domain_detach(dev_pm->pd_dev[i], false);
++			ret = PTR_ERR(dev_pm->pd_dev_link[i]);
++			goto detach_pm;
++		}
++	}
++	return 0;
++
++detach_pm:
++	while (--i >= 0) {
++		device_link_del(dev_pm->pd_dev_link[i]);
++		dev_pm_domain_detach(dev_pm->pd_dev[i], false);
++	}
++	return ret;
++}
++
++/**
++ * fsl_dev_detach_pm_domains
++ */
++int clk_imx_acm_detach_pm_domains(struct device *dev,
++				  struct clk_imx_acm_pm_domains *dev_pm)
++{
++	int i;
++
++	if (dev_pm->num_domains <= 1)
++		return 0;
++
++	for (i = 0; i < dev_pm->num_domains; i++) {
++		device_link_del(dev_pm->pd_dev_link[i]);
++		dev_pm_domain_detach(dev_pm->pd_dev[i], false);
++	}
++
++	return 0;
++}
+diff --git a/drivers/clk/imx/clk-imx-acm-utils.h b/drivers/clk/imx/clk-imx-acm-utils.h
+new file mode 100644
+index 000000000..662e0d123
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx-acm-utils.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright 2020 NXP */
++
++#ifndef _CLK_IMX_ACM_UTILS_H
++#define _CLK_IMX_ACM_UTILS_H
++
++#include <linux/device.h>
++
++struct clk_imx_acm_pm_domains {
++	struct device **pd_dev;
++	struct device_link **pd_dev_link;
++	int    num_domains;
++};
++
++int clk_imx_acm_attach_pm_domains(struct device *dev,
++				  struct clk_imx_acm_pm_domains *dev_pm);
++int clk_imx_acm_detach_pm_domains(struct device *dev,
++				  struct clk_imx_acm_pm_domains *dev_pm);
++#endif /* _CLK_IMX_ACM_UTILS_H */
+diff --git a/drivers/clk/imx/clk-imx8dxl-acm.c b/drivers/clk/imx/clk-imx8dxl-acm.c
+new file mode 100644
+index 000000000..b11254522
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx8dxl-acm.c
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2019~2020 NXP
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++
++#include "clk.h"
++#include "clk-scu.h"
++#include "clk-imx-acm-utils.h"
++
++#include <dt-bindings/clock/imx8-clock.h>
++
++struct imx8dxl_acm_priv {
++	struct clk_imx_acm_pm_domains dev_pm;
++	void __iomem *reg;
++	u32 regs[0x20];
++};
++
++static const char *aud_clk_sels[] = {
++	"aud_rec_clk0_lpcg_clk",
++	"aud_rec_clk1_lpcg_clk",
++	"ext_aud_mclk0",
++	"ext_aud_mclk1",
++	"dummy",
++	"dummy",
++	"dummy",
++	"dummy",
++	"spdif0_rx",
++	"sai0_rx_bclk",
++	"sai0_tx_bclk",
++	"sai1_rx_bclk",
++	"sai1_tx_bclk",
++	"sai2_rx_bclk",
++	"sai3_rx_bclk",
++};
++
++static const char *mclk_out_sels[] = {
++	"aud_rec_clk0_lpcg_clk",
++	"aud_rec_clk1_lpcg_clk",
++	"dummy",
++	"dummy",
++	"spdif0_rx",
++	"dummy",
++	"dummy",
++	"dummy",
++};
++
++static const char *sai_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *spdif_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *mqs_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static int imx8dxl_acm_clk_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct clk_onecell_data *clk_data;
++	struct imx8dxl_acm_priv *priv;
++	struct resource *res;
++	struct clk **clks;
++	void __iomem *base;
++	int ret;
++	int i;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!base)
++		return -ENOMEM;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->reg = base;
++
++	platform_set_drvdata(pdev, priv);
++
++	clk_data = devm_kzalloc(&pdev->dev, sizeof(*clk_data), GFP_KERNEL);
++	if (!clk_data)
++		return -ENOMEM;
++
++	clk_data->clks = devm_kcalloc(&pdev->dev, IMX_ADMA_ACM_CLK_END,
++					sizeof(*clk_data->clks), GFP_KERNEL);
++	if (!clk_data->clks)
++		return -ENOMEM;
++
++	clk_data->clk_num = IMX_ADMA_ACM_CLK_END;
++
++	clks = clk_data->clks;
++
++	ret = clk_imx_acm_attach_pm_domains(&pdev->dev, &priv->dev_pm);
++	if (ret)
++		return ret;
++
++	pm_runtime_enable(&pdev->dev);
++	pm_runtime_get_sync(&pdev->dev);
++
++	clks[IMX_ADMA_EXT_AUD_MCLK0]     = imx_clk_fixed("ext_aud_mclk0", 0);
++	clks[IMX_ADMA_EXT_AUD_MCLK1]     = imx_clk_fixed("ext_aud_mclk1", 0);
++	clks[IMX_ADMA_SPDIF0_RX]         = imx_clk_fixed("spdif0_rx", 0);
++	clks[IMX_ADMA_SAI0_RX_BCLK]      = imx_clk_fixed("sai0_rx_bclk", 0);
++	clks[IMX_ADMA_SAI0_TX_BCLK]      = imx_clk_fixed("sai0_tx_bclk", 0);
++	clks[IMX_ADMA_SAI1_RX_BCLK]      = imx_clk_fixed("sai1_rx_bclk", 0);
++	clks[IMX_ADMA_SAI1_TX_BCLK]      = imx_clk_fixed("sai1_tx_bclk", 0);
++	clks[IMX_ADMA_SAI2_RX_BCLK]      = imx_clk_fixed("sai2_rx_bclk", 0);
++	clks[IMX_ADMA_SAI3_RX_BCLK]      = imx_clk_fixed("sai3_rx_bclk", 0);
++
++	clks[IMX_ADMA_ACM_AUD_CLK0_SEL] = imx_dev_clk_mux(dev, "acm_aud_clk0_sel", base+0x000000, 0, 5, aud_clk_sels, ARRAY_SIZE(aud_clk_sels));
++	clks[IMX_ADMA_ACM_AUD_CLK1_SEL]	= imx_dev_clk_mux(dev, "acm_aud_clk1_sel", base+0x010000, 0, 5, aud_clk_sels, ARRAY_SIZE(aud_clk_sels));
++
++	clks[IMX_ADMA_ACM_MCLKOUT0_SEL]	= imx_dev_clk_mux(dev, "acm_mclkout0_sel", base+0x020000, 0, 3, mclk_out_sels, ARRAY_SIZE(mclk_out_sels));
++	clks[IMX_ADMA_ACM_MCLKOUT1_SEL]	= imx_dev_clk_mux(dev, "acm_mclkout1_sel", base+0x030000, 0, 3, mclk_out_sels, ARRAY_SIZE(mclk_out_sels));
++
++	clks[IMX_ADMA_ACM_SAI0_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai0_mclk_sel", base+0x0E0000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI1_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai1_mclk_sel", base+0x0F0000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI2_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai2_mclk_sel", base+0x100000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI3_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai3_mclk_sel", base+0x110000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++
++	clks[IMX_ADMA_ACM_SPDIF0_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_spdif0_mclk_sel", base+0x1A0000, 0, 2, spdif_mclk_sels, ARRAY_SIZE(spdif_mclk_sels));
++	clks[IMX_ADMA_ACM_MQS_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_mqs_mclk_sel", base+0x1C0000, 0, 2, mqs_mclk_sels, ARRAY_SIZE(mqs_mclk_sels));
++
++	for (i = 0; i < clk_data->clk_num; i++) {
++		if (IS_ERR(clks[i]))
++			pr_warn("i.MX clk %u: register failed with %ld\n",
++				i, PTR_ERR(clks[i]));
++	}
++
++	ret = of_clk_add_provider(np, of_clk_src_onecell_get, clk_data);
++
++	pm_runtime_put_sync(&pdev->dev);
++
++	return ret;
++}
++
++static int imx8dxl_acm_clk_remove(struct platform_device *pdev)
++{
++	struct imx8dxl_acm_priv *priv = dev_get_drvdata(&pdev->dev);
++
++	pm_runtime_disable(&pdev->dev);
++
++	clk_imx_acm_detach_pm_domains(&pdev->dev, &priv->dev_pm);
++
++	return 0;
++}
++
++static const struct of_device_id imx8dxl_acm_match[] = {
++	{ .compatible = "nxp,imx8dxl-acm", },
++	{ /* sentinel */ }
++};
++
++static int __maybe_unused imx8dxl_acm_runtime_suspend(struct device *dev)
++{
++	struct imx8dxl_acm_priv *priv = dev_get_drvdata(dev);
++
++	priv->regs[0]  = readl_relaxed(priv->reg + 0x000000);
++	priv->regs[1]  = readl_relaxed(priv->reg + 0x010000);
++	priv->regs[2]  = readl_relaxed(priv->reg + 0x020000);
++	priv->regs[3]  = readl_relaxed(priv->reg + 0x030000);
++	priv->regs[14] = readl_relaxed(priv->reg + 0x0E0000);
++	priv->regs[15] = readl_relaxed(priv->reg + 0x0F0000);
++	priv->regs[16] = readl_relaxed(priv->reg + 0x100000);
++	priv->regs[17] = readl_relaxed(priv->reg + 0x110000);
++	priv->regs[26] = readl_relaxed(priv->reg + 0x1A0000);
++	priv->regs[28] = readl_relaxed(priv->reg + 0x1C0000);
++
++	return 0;
++}
++
++static int __maybe_unused imx8dxl_acm_runtime_resume(struct device *dev)
++{
++	struct imx8dxl_acm_priv *priv = dev_get_drvdata(dev);
++
++	writel_relaxed(priv->regs[0],  priv->reg + 0x000000);
++	writel_relaxed(priv->regs[1],  priv->reg + 0x010000);
++	writel_relaxed(priv->regs[2],  priv->reg + 0x020000);
++	writel_relaxed(priv->regs[3],  priv->reg + 0x030000);
++	writel_relaxed(priv->regs[14], priv->reg + 0x0E0000);
++	writel_relaxed(priv->regs[15], priv->reg + 0x0F0000);
++	writel_relaxed(priv->regs[16], priv->reg + 0x100000);
++	writel_relaxed(priv->regs[17], priv->reg + 0x110000);
++	writel_relaxed(priv->regs[26], priv->reg + 0x1A0000);
++	writel_relaxed(priv->regs[28], priv->reg + 0x1C0000);
++
++	return 0;
++}
++
++const struct dev_pm_ops imx8dxl_acm_pm_ops = {
++	SET_RUNTIME_PM_OPS(imx8dxl_acm_runtime_suspend,
++			   imx8dxl_acm_runtime_resume, NULL)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				      pm_runtime_force_resume)
++};
++
++static struct platform_driver imx8dxl_acm_clk_driver = {
++	.driver = {
++		.name = "imx8dxl-acm",
++		.of_match_table = imx8dxl_acm_match,
++		.pm = &imx8dxl_acm_pm_ops,
++		.suppress_bind_attrs = true,
++	},
++	.probe = imx8dxl_acm_clk_probe,
++	.remove = imx8dxl_acm_clk_remove,
++};
++
++static int __init imx8dxl_acm_init(void)
++{
++	return platform_driver_register(&imx8dxl_acm_clk_driver);
++}
++fs_initcall(imx8dxl_acm_init);
+diff --git a/drivers/clk/imx/clk-imx8dxl-rsrc.c b/drivers/clk/imx/clk-imx8dxl-rsrc.c
+new file mode 100644
+index 000000000..084bad519
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx8dxl-rsrc.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2019~2020 NXP
++ */
++
++#include <dt-bindings/firmware/imx/rsrc.h>
++
++#include "clk-scu.h"
++
++/* Keep sorted in the ascending order */
++static u32 imx8dxl_clk_scu_rsrc_table[] = {
++	IMX_SC_R_SPI_0,
++	IMX_SC_R_SPI_1,
++	IMX_SC_R_SPI_2,
++	IMX_SC_R_SPI_3,
++	IMX_SC_R_UART_0,
++	IMX_SC_R_UART_1,
++	IMX_SC_R_UART_2,
++	IMX_SC_R_UART_3,
++	IMX_SC_R_I2C_0,
++	IMX_SC_R_I2C_1,
++	IMX_SC_R_I2C_2,
++	IMX_SC_R_I2C_3,
++	IMX_SC_R_ADC_0,
++	IMX_SC_R_FTM_0,
++	IMX_SC_R_FTM_1,
++	IMX_SC_R_CAN_0,
++	IMX_SC_R_LCD_0,
++	IMX_SC_R_LCD_0_PWM_0,
++	IMX_SC_R_PWM_0,
++	IMX_SC_R_PWM_1,
++	IMX_SC_R_PWM_2,
++	IMX_SC_R_PWM_3,
++	IMX_SC_R_PWM_4,
++	IMX_SC_R_PWM_5,
++	IMX_SC_R_PWM_6,
++	IMX_SC_R_PWM_7,
++	IMX_SC_R_GPT_0,
++	IMX_SC_R_GPT_1,
++	IMX_SC_R_GPT_2,
++	IMX_SC_R_GPT_3,
++	IMX_SC_R_GPT_4,
++	IMX_SC_R_FSPI_0,
++	IMX_SC_R_FSPI_1,
++	IMX_SC_R_SDHC_0,
++	IMX_SC_R_SDHC_1,
++	IMX_SC_R_SDHC_2,
++	IMX_SC_R_ENET_0,
++	IMX_SC_R_ENET_1,
++	IMX_SC_R_USB_1,
++	IMX_SC_R_NAND,
++	IMX_SC_R_M4_0_I2C,
++	IMX_SC_R_M4_0_UART,
++	IMX_SC_R_ELCDIF_PLL,
++	IMX_SC_R_AUDIO_PLL_0,
++	IMX_SC_R_AUDIO_PLL_1,
++	IMX_SC_R_AUDIO_CLK_0,
++	IMX_SC_R_AUDIO_CLK_1,
++	IMX_SC_R_A35
++};
++
++const struct imx_clk_scu_rsrc_table imx_clk_scu_rsrc_imx8dxl = {
++	.rsrc = imx8dxl_clk_scu_rsrc_table,
++	.num = ARRAY_SIZE(imx8dxl_clk_scu_rsrc_table),
++};
+diff --git a/drivers/clk/imx/clk-imx8mm.c b/drivers/clk/imx/clk-imx8mm.c
+index 711bd2294..61db2de25 100644
+--- a/drivers/clk/imx/clk-imx8mm.c
++++ b/drivers/clk/imx/clk-imx8mm.c
+@@ -4,7 +4,9 @@
+  */
+ 
+ #include <dt-bindings/clock/imx8mm-clock.h>
++#include <linux/clk.h>
+ #include <linux/clk-provider.h>
++#include <linux/debugfs.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+@@ -12,6 +14,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
++#include <soc/imx/soc.h>
+ 
+ #include "clk.h"
+ 
+@@ -291,6 +294,34 @@ static const char *imx8mm_clko2_sels[] = {"osc_24m", "sys_pll2_200m", "sys_pll1_
+ static struct clk_hw_onecell_data *clk_hw_data;
+ static struct clk_hw **hws;
+ 
++static int imx_clk_init_on(struct device_node *np,
++				  struct clk_hw * const clks[])
++{
++	u32 *array;
++	int i, ret, elems;
++
++	elems = of_property_count_u32_elems(np, "init-on-array");
++	if (elems < 0)
++		return elems;
++	array = kcalloc(elems, sizeof(elems), GFP_KERNEL);
++	if (!array)
++		return -ENOMEM;
++
++	ret = of_property_read_u32_array(np, "init-on-array", array, elems);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < elems; i++) {
++		ret = clk_prepare_enable(clks[array[i]]->clk);
++		if (ret)
++			pr_err("clk_prepare_enable failed %d\n", array[i]);
++	}
++
++	kfree(array);
++
++	return 0;
++}
++
+ static int imx8mm_clocks_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -298,6 +329,8 @@ static int imx8mm_clocks_probe(struct platform_device *pdev)
+ 	void __iomem *base;
+ 	int ret;
+ 
++	check_m4_enabled();
++
+ 	clk_hw_data = kzalloc(struct_size(clk_hw_data, hws,
+ 					  IMX8MM_CLK_END), GFP_KERNEL);
+ 	if (WARN_ON(!clk_hw_data))
+@@ -361,45 +394,29 @@ static int imx8mm_clocks_probe(struct platform_device *pdev)
+ 	hws[IMX8MM_SYS_PLL3_OUT] = imx_clk_hw_gate("sys_pll3_out", "sys_pll3_bypass", base + 0x114, 11);
+ 
+ 	/* SYS PLL1 fixed output */
+-	hws[IMX8MM_SYS_PLL1_40M_CG] = imx_clk_hw_gate("sys_pll1_40m_cg", "sys_pll1", base + 0x94, 27);
+-	hws[IMX8MM_SYS_PLL1_80M_CG] = imx_clk_hw_gate("sys_pll1_80m_cg", "sys_pll1", base + 0x94, 25);
+-	hws[IMX8MM_SYS_PLL1_100M_CG] = imx_clk_hw_gate("sys_pll1_100m_cg", "sys_pll1", base + 0x94, 23);
+-	hws[IMX8MM_SYS_PLL1_133M_CG] = imx_clk_hw_gate("sys_pll1_133m_cg", "sys_pll1", base + 0x94, 21);
+-	hws[IMX8MM_SYS_PLL1_160M_CG] = imx_clk_hw_gate("sys_pll1_160m_cg", "sys_pll1", base + 0x94, 19);
+-	hws[IMX8MM_SYS_PLL1_200M_CG] = imx_clk_hw_gate("sys_pll1_200m_cg", "sys_pll1", base + 0x94, 17);
+-	hws[IMX8MM_SYS_PLL1_266M_CG] = imx_clk_hw_gate("sys_pll1_266m_cg", "sys_pll1", base + 0x94, 15);
+-	hws[IMX8MM_SYS_PLL1_400M_CG] = imx_clk_hw_gate("sys_pll1_400m_cg", "sys_pll1", base + 0x94, 13);
+ 	hws[IMX8MM_SYS_PLL1_OUT] = imx_clk_hw_gate("sys_pll1_out", "sys_pll1", base + 0x94, 11);
+ 
+-	hws[IMX8MM_SYS_PLL1_40M] = imx_clk_hw_fixed_factor("sys_pll1_40m", "sys_pll1_40m_cg", 1, 20);
+-	hws[IMX8MM_SYS_PLL1_80M] = imx_clk_hw_fixed_factor("sys_pll1_80m", "sys_pll1_80m_cg", 1, 10);
+-	hws[IMX8MM_SYS_PLL1_100M] = imx_clk_hw_fixed_factor("sys_pll1_100m", "sys_pll1_100m_cg", 1, 8);
+-	hws[IMX8MM_SYS_PLL1_133M] = imx_clk_hw_fixed_factor("sys_pll1_133m", "sys_pll1_133m_cg", 1, 6);
+-	hws[IMX8MM_SYS_PLL1_160M] = imx_clk_hw_fixed_factor("sys_pll1_160m", "sys_pll1_160m_cg", 1, 5);
+-	hws[IMX8MM_SYS_PLL1_200M] = imx_clk_hw_fixed_factor("sys_pll1_200m", "sys_pll1_200m_cg", 1, 4);
+-	hws[IMX8MM_SYS_PLL1_266M] = imx_clk_hw_fixed_factor("sys_pll1_266m", "sys_pll1_266m_cg", 1, 3);
+-	hws[IMX8MM_SYS_PLL1_400M] = imx_clk_hw_fixed_factor("sys_pll1_400m", "sys_pll1_400m_cg", 1, 2);
++	hws[IMX8MM_SYS_PLL1_40M] = imx_clk_hw_fixed_factor("sys_pll1_40m", "sys_pll1_out", 1, 20);
++	hws[IMX8MM_SYS_PLL1_80M] = imx_clk_hw_fixed_factor("sys_pll1_80m", "sys_pll1_out", 1, 10);
++	hws[IMX8MM_SYS_PLL1_100M] = imx_clk_hw_fixed_factor("sys_pll1_100m", "sys_pll1_out", 1, 8);
++	hws[IMX8MM_SYS_PLL1_133M] = imx_clk_hw_fixed_factor("sys_pll1_133m", "sys_pll1_out", 1, 6);
++	hws[IMX8MM_SYS_PLL1_160M] = imx_clk_hw_fixed_factor("sys_pll1_160m", "sys_pll1_out", 1, 5);
++	hws[IMX8MM_SYS_PLL1_200M] = imx_clk_hw_fixed_factor("sys_pll1_200m", "sys_pll1_out", 1, 4);
++	hws[IMX8MM_SYS_PLL1_266M] = imx_clk_hw_fixed_factor("sys_pll1_266m", "sys_pll1_out", 1, 3);
++	hws[IMX8MM_SYS_PLL1_400M] = imx_clk_hw_fixed_factor("sys_pll1_400m", "sys_pll1_out", 1, 2);
+ 	hws[IMX8MM_SYS_PLL1_800M] = imx_clk_hw_fixed_factor("sys_pll1_800m", "sys_pll1_out", 1, 1);
+ 
+ 	/* SYS PLL2 fixed output */
+-	hws[IMX8MM_SYS_PLL2_50M_CG] = imx_clk_hw_gate("sys_pll2_50m_cg", "sys_pll2", base + 0x104, 27);
+-	hws[IMX8MM_SYS_PLL2_100M_CG] = imx_clk_hw_gate("sys_pll2_100m_cg", "sys_pll2", base + 0x104, 25);
+-	hws[IMX8MM_SYS_PLL2_125M_CG] = imx_clk_hw_gate("sys_pll2_125m_cg", "sys_pll2", base + 0x104, 23);
+-	hws[IMX8MM_SYS_PLL2_166M_CG] = imx_clk_hw_gate("sys_pll2_166m_cg", "sys_pll2", base + 0x104, 21);
+-	hws[IMX8MM_SYS_PLL2_200M_CG] = imx_clk_hw_gate("sys_pll2_200m_cg", "sys_pll2", base + 0x104, 19);
+-	hws[IMX8MM_SYS_PLL2_250M_CG] = imx_clk_hw_gate("sys_pll2_250m_cg", "sys_pll2", base + 0x104, 17);
+-	hws[IMX8MM_SYS_PLL2_333M_CG] = imx_clk_hw_gate("sys_pll2_333m_cg", "sys_pll2", base + 0x104, 15);
+-	hws[IMX8MM_SYS_PLL2_500M_CG] = imx_clk_hw_gate("sys_pll2_500m_cg", "sys_pll2", base + 0x104, 13);
+ 	hws[IMX8MM_SYS_PLL2_OUT] = imx_clk_hw_gate("sys_pll2_out", "sys_pll2", base + 0x104, 11);
+ 
+-	hws[IMX8MM_SYS_PLL2_50M] = imx_clk_hw_fixed_factor("sys_pll2_50m", "sys_pll2_50m_cg", 1, 20);
+-	hws[IMX8MM_SYS_PLL2_100M] = imx_clk_hw_fixed_factor("sys_pll2_100m", "sys_pll2_100m_cg", 1, 10);
+-	hws[IMX8MM_SYS_PLL2_125M] = imx_clk_hw_fixed_factor("sys_pll2_125m", "sys_pll2_125m_cg", 1, 8);
+-	hws[IMX8MM_SYS_PLL2_166M] = imx_clk_hw_fixed_factor("sys_pll2_166m", "sys_pll2_166m_cg", 1, 6);
+-	hws[IMX8MM_SYS_PLL2_200M] = imx_clk_hw_fixed_factor("sys_pll2_200m", "sys_pll2_200m_cg", 1, 5);
+-	hws[IMX8MM_SYS_PLL2_250M] = imx_clk_hw_fixed_factor("sys_pll2_250m", "sys_pll2_250m_cg", 1, 4);
+-	hws[IMX8MM_SYS_PLL2_333M] = imx_clk_hw_fixed_factor("sys_pll2_333m", "sys_pll2_333m_cg", 1, 3);
+-	hws[IMX8MM_SYS_PLL2_500M] = imx_clk_hw_fixed_factor("sys_pll2_500m", "sys_pll2_500m_cg", 1, 2);
++	hws[IMX8MM_SYS_PLL2_50M] = imx_clk_hw_fixed_factor("sys_pll2_50m", "sys_pll2_out", 1, 20);
++	hws[IMX8MM_SYS_PLL2_100M] = imx_clk_hw_fixed_factor("sys_pll2_100m", "sys_pll2_out", 1, 10);
++	hws[IMX8MM_SYS_PLL2_125M] = imx_clk_hw_fixed_factor("sys_pll2_125m", "sys_pll2_out", 1, 8);
++	hws[IMX8MM_SYS_PLL2_166M] = imx_clk_hw_fixed_factor("sys_pll2_166m", "sys_pll2_out", 1, 6);
++	hws[IMX8MM_SYS_PLL2_200M] = imx_clk_hw_fixed_factor("sys_pll2_200m", "sys_pll2_out", 1, 5);
++	hws[IMX8MM_SYS_PLL2_250M] = imx_clk_hw_fixed_factor("sys_pll2_250m", "sys_pll2_out", 1, 4);
++	hws[IMX8MM_SYS_PLL2_333M] = imx_clk_hw_fixed_factor("sys_pll2_333m", "sys_pll2_out", 1, 3);
++	hws[IMX8MM_SYS_PLL2_500M] = imx_clk_hw_fixed_factor("sys_pll2_500m", "sys_pll2_out", 1, 2);
+ 	hws[IMX8MM_SYS_PLL2_1000M] = imx_clk_hw_fixed_factor("sys_pll2_1000m", "sys_pll2_out", 1, 1);
+ 
+ 	np = dev->of_node;
+@@ -437,7 +454,7 @@ static int imx8mm_clocks_probe(struct platform_device *pdev)
+ 	/* BUS */
+ 	hws[IMX8MM_CLK_MAIN_AXI] = imx8m_clk_hw_composite_bus_critical("main_axi",  imx8mm_main_axi_sels, base + 0x8800);
+ 	hws[IMX8MM_CLK_ENET_AXI] = imx8m_clk_hw_composite_bus("enet_axi", imx8mm_enet_axi_sels, base + 0x8880);
+-	hws[IMX8MM_CLK_NAND_USDHC_BUS] = imx8m_clk_hw_composite_bus_critical("nand_usdhc_bus", imx8mm_nand_usdhc_sels, base + 0x8900);
++	hws[IMX8MM_CLK_NAND_USDHC_BUS] = imx8m_clk_hw_composite("nand_usdhc_bus", imx8mm_nand_usdhc_sels, base + 0x8900);
+ 	hws[IMX8MM_CLK_VPU_BUS] = imx8m_clk_hw_composite_bus("vpu_bus", imx8mm_vpu_bus_sels, base + 0x8980);
+ 	hws[IMX8MM_CLK_DISP_AXI] = imx8m_clk_hw_composite_bus("disp_axi", imx8mm_disp_axi_sels, base + 0x8a00);
+ 	hws[IMX8MM_CLK_DISP_APB] = imx8m_clk_hw_composite_bus("disp_apb", imx8mm_disp_apb_sels, base + 0x8a80);
+@@ -565,7 +582,7 @@ static int imx8mm_clocks_probe(struct platform_device *pdev)
+ 	hws[IMX8MM_CLK_SAI5_IPG] = imx_clk_hw_gate2_shared2("sai5_ipg_clk", "ipg_audio_root", base + 0x4370, 0, &share_count_sai5);
+ 	hws[IMX8MM_CLK_SAI6_ROOT] = imx_clk_hw_gate2_shared2("sai6_root_clk", "sai6", base + 0x4380, 0, &share_count_sai6);
+ 	hws[IMX8MM_CLK_SAI6_IPG] = imx_clk_hw_gate2_shared2("sai6_ipg_clk", "ipg_audio_root", base + 0x4380, 0, &share_count_sai6);
+-	hws[IMX8MM_CLK_SNVS_ROOT] = imx_clk_hw_gate4("snvs_root_clk", "ipg_root", base + 0x4470, 0);
++	hws[IMX8MM_CLK_SNVS_ROOT] = imx_clk_hw_gate2_flags("snvs_root_clk", "ipg_root", base + 0x4470, 0, CLK_IS_CRITICAL);
+ 	hws[IMX8MM_CLK_UART1_ROOT] = imx_clk_hw_gate4("uart1_root_clk", "uart1", base + 0x4490, 0);
+ 	hws[IMX8MM_CLK_UART2_ROOT] = imx_clk_hw_gate4("uart2_root_clk", "uart2", base + 0x44a0, 0);
+ 	hws[IMX8MM_CLK_UART3_ROOT] = imx_clk_hw_gate4("uart3_root_clk", "uart3", base + 0x44b0, 0);
+@@ -615,6 +632,12 @@ static int imx8mm_clocks_probe(struct platform_device *pdev)
+ 		goto unregister_hws;
+ 	}
+ 
++	imx_clk_init_on(np, hws);
++
++	clk_set_parent(hws[IMX8MM_CLK_CSI1_CORE]->clk, hws[IMX8MM_SYS_PLL2_1000M]->clk);
++	clk_set_parent(hws[IMX8MM_CLK_CSI1_PHY_REF]->clk, hws[IMX8MM_SYS_PLL2_1000M]->clk);
++	clk_set_parent(hws[IMX8MM_CLK_CSI1_ESC]->clk, hws[IMX8MM_SYS_PLL1_800M]->clk);
++
+ 	imx_register_uart_clocks(4);
+ 
+ 	return 0;
+@@ -645,6 +668,81 @@ static struct platform_driver imx8mm_clk_driver = {
+ };
+ module_platform_driver(imx8mm_clk_driver);
+ 
++/*
++ * Debugfs interface for audio PLL K divider change dynamically.
++ * Monitor control for the Audio PLL K-Divider
++ */
++#ifdef CONFIG_DEBUG_FS
++
++#define KDIV_MASK	GENMASK(15, 0)
++#define MDIV_SHIFT	12
++#define MDIV_MASK	GENMASK(21, 12)
++#define PDIV_SHIFT	4
++#define PDIV_MASK	GENMASK(9, 4)
++#define SDIV_SHIFT	0
++#define SDIV_MASK	GENMASK(2, 0)
++
++static int pll_delta_k_set(void *data, u64 val)
++{
++	struct clk_hw *hw;
++	short int delta_k;
++
++	hw = data;
++	delta_k = (short int) (val & KDIV_MASK);
++
++	clk_set_delta_k(hw, val);
++
++	pr_debug("the delta k is %d\n", delta_k);
++	return 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(delta_k_fops, NULL, pll_delta_k_set, "%lld\n");
++
++static int pll_setting_show(struct seq_file *s, void *data)
++{
++	struct clk_hw *hw;
++	u32 pll_div_ctrl0, pll_div_ctrl1;
++	u32 mdiv, pdiv, sdiv, kdiv;
++
++	hw = s->private;;
++
++	clk_get_pll_setting(hw, &pll_div_ctrl0, &pll_div_ctrl1);
++	mdiv = (pll_div_ctrl0 & MDIV_MASK) >> MDIV_SHIFT;
++	pdiv = (pll_div_ctrl0 & PDIV_MASK) >> PDIV_SHIFT;
++	sdiv = (pll_div_ctrl0 & SDIV_MASK) >> SDIV_SHIFT;
++	kdiv = (pll_div_ctrl1 & KDIV_MASK);
++
++	seq_printf(s, "Mdiv: 0x%x; Pdiv: 0x%x; Sdiv: 0x%x; Kdiv: 0x%x\n",
++		mdiv, pdiv, sdiv, kdiv);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(pll_setting);
++
++static int __init pll_debug_init(void)
++{
++	struct dentry *root, *audio_pll1, *audio_pll2;
++
++	if (of_machine_is_compatible("fsl,imx8mm") && hws) {
++		/* create a root dir for audio pll monitor */
++		root = debugfs_create_dir("audio_pll_monitor", NULL);
++		audio_pll1 = debugfs_create_dir("audio_pll1", root);
++		audio_pll2 = debugfs_create_dir("audio_pll2", root);
++
++		debugfs_create_file_unsafe("delta_k", 0444, audio_pll1,
++			hws[IMX8MM_AUDIO_PLL1], &delta_k_fops);
++		debugfs_create_file("pll_parameter", 0x444, audio_pll1,
++			hws[IMX8MM_AUDIO_PLL1], &pll_setting_fops);
++		debugfs_create_file_unsafe("delta_k", 0444, audio_pll2,
++			hws[IMX8MM_AUDIO_PLL2], &delta_k_fops);
++		debugfs_create_file("pll_parameter", 0x444, audio_pll2,
++			hws[IMX8MM_AUDIO_PLL2], &pll_setting_fops);
++	}
++
++	return 0;
++}
++late_initcall(pll_debug_init);
++#endif /* CONFIG_DEBUG_FS */
++
+ MODULE_AUTHOR("Bai Ping <ping.bai@nxp.com>");
+ MODULE_DESCRIPTION("NXP i.MX8MM clock driver");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/clk/imx/clk-imx8qm-acm.c b/drivers/clk/imx/clk-imx8qm-acm.c
+new file mode 100644
+index 000000000..d531294e7
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx8qm-acm.c
+@@ -0,0 +1,297 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2018 NXP
++ *	Dong Aisheng <aisheng.dong@nxp.com>
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++
++#include "clk.h"
++#include "clk-scu.h"
++#include "clk-imx-acm-utils.h"
++
++#include <dt-bindings/clock/imx8-clock.h>
++
++struct imx8qm_acm_priv {
++	struct clk_imx_acm_pm_domains dev_pm;
++	void __iomem *reg;
++	u32 regs[32];
++};
++
++static const char *aud_clk_sels[] = {
++	"aud_rec_clk0_lpcg_clk",
++	"aud_rec_clk1_lpcg_clk",
++	"dummy",
++	"hdmi_rx_mclk",
++	"ext_aud_mclk0",
++	"ext_aud_mclk1",
++	"esai0_rx_clk",
++	"esai0_rx_hf_clk",
++	"esai0_tx_clk",
++	"esai0_tx_hf_clk",
++	"esai1_rx_clk",
++	"esai1_rx_hf_clk",
++	"esai1_tx_clk",
++	"esai1_tx_hf_clk",
++	"spdif0_rx",
++	"spdif1_rx",
++	"sai0_rx_bclk",
++	"sai0_tx_bclk",
++	"sai1_rx_bclk",
++	"sai1_tx_bclk",
++	"sai2_rx_bclk",
++	"sai3_rx_bclk",
++	"sai4_rx_bclk",
++};
++
++static const char *mclk_out_sels[] = {
++	"aud_rec_clk0_lpcg_clk",
++	"aud_rec_clk1_lpcg_clk",
++	"dummy",
++	"hdmi_rx_mclk",
++	"spdif0_rx",
++	"spdif1_rx",
++	"sai4_rx_bclk",
++	"sai6_rx_bclk",
++};
++
++static const char *sai_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *asrc_mux_clk_sels[] = {
++	"sai4_rx_bclk",
++	"sai5_tx_bclk",
++	"dummy",
++	"dummy",
++};
++
++static const char *esai_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *spdif_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *mqs_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static int imx8qm_acm_clk_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct clk_onecell_data *clk_data;
++	struct imx8qm_acm_priv *priv;
++	struct resource *res;
++	struct clk **clks;
++	void __iomem *base;
++	int ret;
++	int i;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!base)
++		return -ENOMEM;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->reg = base;
++
++	platform_set_drvdata(pdev, priv);
++
++	clk_data = devm_kzalloc(&pdev->dev, sizeof(*clk_data), GFP_KERNEL);
++	if (!clk_data)
++		return -ENOMEM;
++
++	clk_data->clks = devm_kcalloc(&pdev->dev, IMX_ADMA_ACM_CLK_END,
++					sizeof(*clk_data->clks), GFP_KERNEL);
++	if (!clk_data->clks)
++		return -ENOMEM;
++
++	clk_data->clk_num = IMX_ADMA_ACM_CLK_END;
++
++	clks = clk_data->clks;
++
++	ret = clk_imx_acm_attach_pm_domains(&pdev->dev, &priv->dev_pm);
++	if (ret)
++		return ret;
++
++	pm_runtime_enable(&pdev->dev);
++	pm_runtime_get_sync(&pdev->dev);
++
++	clks[IMX_ADMA_EXT_AUD_MCLK0]     = imx_clk_fixed("ext_aud_mclk0", 0);
++	clks[IMX_ADMA_EXT_AUD_MCLK1]     = imx_clk_fixed("ext_aud_mclk1", 0);
++	clks[IMX_ADMA_ESAI0_RX_CLK]      = imx_clk_fixed("esai0_rx_clk", 0);
++	clks[IMX_ADMA_ESAI0_RX_HF_CLK]   = imx_clk_fixed("esai0_rx_hf_clk", 0);
++	clks[IMX_ADMA_ESAI0_TX_CLK]      = imx_clk_fixed("esai0_tx_clk", 0);
++	clks[IMX_ADMA_ESAI0_TX_HF_CLK]   = imx_clk_fixed("esai0_tx_hf_clk", 0);
++	clks[IMX_ADMA_ESAI1_RX_CLK]      = imx_clk_fixed("esai1_rx_clk", 0);
++	clks[IMX_ADMA_ESAI1_RX_HF_CLK]   = imx_clk_fixed("esai1_rx_hf_clk", 0);
++	clks[IMX_ADMA_ESAI1_TX_CLK]      = imx_clk_fixed("esai1_tx_clk", 0);
++	clks[IMX_ADMA_ESAI1_TX_HF_CLK]   = imx_clk_fixed("esai1_tx_hf_clk", 0);
++	clks[IMX_ADMA_SPDIF0_RX]         = imx_clk_fixed("spdif0_rx", 0);
++	clks[IMX_ADMA_SPDIF1_RX]         = imx_clk_fixed("spdif1_rx", 0);
++	clks[IMX_ADMA_SAI0_RX_BCLK]      = imx_clk_fixed("sai0_rx_bclk", 0);
++	clks[IMX_ADMA_SAI0_TX_BCLK]      = imx_clk_fixed("sai0_tx_bclk", 0);
++	clks[IMX_ADMA_SAI1_RX_BCLK]      = imx_clk_fixed("sai1_rx_bclk", 0);
++	clks[IMX_ADMA_SAI1_TX_BCLK]      = imx_clk_fixed("sai1_tx_bclk", 0);
++	clks[IMX_ADMA_SAI2_RX_BCLK]      = imx_clk_fixed("sai2_rx_bclk", 0);
++	clks[IMX_ADMA_SAI3_RX_BCLK]      = imx_clk_fixed("sai3_rx_bclk", 0);
++	clks[IMX_ADMA_SAI4_RX_BCLK]      = imx_clk_fixed("sai4_rx_bclk", 0);
++	clks[IMX_ADMA_SAI5_TX_BCLK]      = imx_clk_fixed("sai5_tx_bclk", 0);
++	clks[IMX_ADMA_SAI6_RX_BCLK]      = imx_clk_fixed("sai6_rx_bclk", 0);
++	clks[IMX_ADMA_HDMI_RX_MCLK]      = imx_clk_fixed("hdmi_rx_mclk", 0);
++
++
++	clks[IMX_ADMA_ACM_AUD_CLK0_SEL] = imx_dev_clk_mux(dev, "acm_aud_clk0_sel", base+0x000000, 0, 5, aud_clk_sels, ARRAY_SIZE(aud_clk_sels));
++	clks[IMX_ADMA_ACM_AUD_CLK1_SEL]	= imx_dev_clk_mux(dev, "acm_aud_clk1_sel", base+0x010000, 0, 5, aud_clk_sels, ARRAY_SIZE(aud_clk_sels));
++
++	clks[IMX_ADMA_ACM_MCLKOUT0_SEL]	= imx_dev_clk_mux(dev, "acm_mclkout0_sel", base+0x020000, 0, 3, mclk_out_sels, ARRAY_SIZE(mclk_out_sels));
++	clks[IMX_ADMA_ACM_MCLKOUT1_SEL]	= imx_dev_clk_mux(dev, "acm_mclkout1_sel", base+0x030000, 0, 3, mclk_out_sels, ARRAY_SIZE(mclk_out_sels));
++
++	clks[IMX_ADMA_ACM_ASRC0_MUX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_asrc0_mclk_sel", base+0x040000, 0, 2, asrc_mux_clk_sels, ARRAY_SIZE(asrc_mux_clk_sels));
++
++	clks[IMX_ADMA_ACM_ESAI0_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_esai0_mclk_sel", base+0x060000, 0, 2, esai_mclk_sels, ARRAY_SIZE(esai_mclk_sels));
++	clks[IMX_ADMA_ACM_ESAI1_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_esai1_mclk_sel", base+0x070000, 0, 2, esai_mclk_sels, ARRAY_SIZE(esai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI0_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai0_mclk_sel", base+0x0E0000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI1_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai1_mclk_sel", base+0x0F0000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI2_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai2_mclk_sel", base+0x100000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI3_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai3_mclk_sel", base+0x110000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI4_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai4_mclk_sel", base+0x120000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI5_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai5_mclk_sel", base+0x130000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI6_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai6_mclk_sel", base+0x140000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI7_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai7_mclk_sel", base+0x150000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++
++	clks[IMX_ADMA_ACM_SPDIF0_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_spdif0_mclk_sel", base+0x1A0000, 0, 2, spdif_mclk_sels, ARRAY_SIZE(spdif_mclk_sels));
++	clks[IMX_ADMA_ACM_SPDIF1_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_spdif1_mclk_sel", base+0x1B0000, 0, 2, spdif_mclk_sels, ARRAY_SIZE(spdif_mclk_sels));
++	clks[IMX_ADMA_ACM_MQS_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_mqs_mclk_sel", base+0x1C0000, 0, 2, mqs_mclk_sels, ARRAY_SIZE(mqs_mclk_sels));
++
++	for (i = 0; i < clk_data->clk_num; i++) {
++		if (IS_ERR(clks[i]))
++			pr_warn("i.MX clk %u: register failed with %ld\n",
++				i, PTR_ERR(clks[i]));
++	}
++
++	ret = of_clk_add_provider(np, of_clk_src_onecell_get, clk_data);
++
++	pm_runtime_put_sync(&pdev->dev);
++
++	return ret;
++}
++
++static int imx8qm_acm_clk_remove(struct platform_device *pdev)
++{
++	struct imx8qm_acm_priv *priv = dev_get_drvdata(&pdev->dev);
++
++	pm_runtime_disable(&pdev->dev);
++
++	clk_imx_acm_detach_pm_domains(&pdev->dev, &priv->dev_pm);
++
++	return 0;
++}
++
++static const struct of_device_id imx8qm_acm_match[] = {
++	{ .compatible = "nxp,imx8qm-acm", },
++	{ /* sentinel */ }
++};
++
++static int __maybe_unused imx8qm_acm_runtime_suspend(struct device *dev)
++{
++	struct imx8qm_acm_priv *priv = dev_get_drvdata(dev);
++
++	priv->regs[0]  = readl_relaxed(priv->reg + 0x000000);
++	priv->regs[1]  = readl_relaxed(priv->reg + 0x010000);
++	priv->regs[2]  = readl_relaxed(priv->reg + 0x020000);
++	priv->regs[3]  = readl_relaxed(priv->reg + 0x030000);
++	priv->regs[4]  = readl_relaxed(priv->reg + 0x040000);
++	priv->regs[6]  = readl_relaxed(priv->reg + 0x060000);
++	priv->regs[7]  = readl_relaxed(priv->reg + 0x070000);
++	priv->regs[14] = readl_relaxed(priv->reg + 0x0E0000);
++	priv->regs[15] = readl_relaxed(priv->reg + 0x0F0000);
++	priv->regs[16] = readl_relaxed(priv->reg + 0x100000);
++	priv->regs[17] = readl_relaxed(priv->reg + 0x110000);
++	priv->regs[18] = readl_relaxed(priv->reg + 0x120000);
++	priv->regs[19] = readl_relaxed(priv->reg + 0x130000);
++	priv->regs[20] = readl_relaxed(priv->reg + 0x140000);
++	priv->regs[21] = readl_relaxed(priv->reg + 0x150000);
++	priv->regs[26] = readl_relaxed(priv->reg + 0x1A0000);
++	priv->regs[27] = readl_relaxed(priv->reg + 0x1B0000);
++	priv->regs[28] = readl_relaxed(priv->reg + 0x1C0000);
++
++	return 0;
++}
++
++static int __maybe_unused imx8qm_acm_runtime_resume(struct device *dev)
++{
++	struct imx8qm_acm_priv *priv = dev_get_drvdata(dev);
++
++	writel_relaxed(priv->regs[0],  priv->reg + 0x000000);
++	writel_relaxed(priv->regs[1],  priv->reg + 0x010000);
++	writel_relaxed(priv->regs[2],  priv->reg + 0x020000);
++	writel_relaxed(priv->regs[3],  priv->reg + 0x030000);
++	writel_relaxed(priv->regs[4],  priv->reg + 0x040000);
++	writel_relaxed(priv->regs[6],  priv->reg + 0x060000);
++	writel_relaxed(priv->regs[7],  priv->reg + 0x070000);
++	writel_relaxed(priv->regs[14], priv->reg + 0x0E0000);
++	writel_relaxed(priv->regs[15], priv->reg + 0x0F0000);
++	writel_relaxed(priv->regs[16], priv->reg + 0x100000);
++	writel_relaxed(priv->regs[17], priv->reg + 0x110000);
++	writel_relaxed(priv->regs[18], priv->reg + 0x120000);
++	writel_relaxed(priv->regs[19], priv->reg + 0x130000);
++	writel_relaxed(priv->regs[20], priv->reg + 0x140000);
++	writel_relaxed(priv->regs[21], priv->reg + 0x150000);
++	writel_relaxed(priv->regs[26], priv->reg + 0x1A0000);
++	writel_relaxed(priv->regs[27], priv->reg + 0x1B0000);
++	writel_relaxed(priv->regs[28], priv->reg + 0x1C0000);
++
++	return 0;
++}
++
++static const struct dev_pm_ops imx8qm_acm_pm_ops = {
++	SET_RUNTIME_PM_OPS(imx8qm_acm_runtime_suspend,
++			   imx8qm_acm_runtime_resume, NULL)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				      pm_runtime_force_resume)
++};
++
++static struct platform_driver imx8qm_acm_clk_driver = {
++	.driver = {
++		.name = "imx8qm-acm",
++		.of_match_table = imx8qm_acm_match,
++		.pm = &imx8qm_acm_pm_ops,
++		.suppress_bind_attrs = true,
++	},
++	.probe = imx8qm_acm_clk_probe,
++	.remove = imx8qm_acm_clk_remove,
++};
++
++static int __init imx8qm_acm_init(void)
++{
++	return platform_driver_register(&imx8qm_acm_clk_driver);
++}
++fs_initcall(imx8qm_acm_init);
+diff --git a/drivers/clk/imx/clk-imx8qm-rsrc.c b/drivers/clk/imx/clk-imx8qm-rsrc.c
+new file mode 100644
+index 000000000..5943f51c4
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx8qm-rsrc.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2019 NXP
++ *	Dong Aisheng <aisheng.dong@nxp.com>
++ */
++
++#include <dt-bindings/firmware/imx/rsrc.h>
++
++#include "clk-scu.h"
++
++/* Keep sorted in the ascending order */
++static u32 imx8qm_clk_scu_rsrc_table[] = {
++	IMX_SC_R_A53,
++	IMX_SC_R_A72,
++	IMX_SC_R_DC_0_VIDEO0,
++	IMX_SC_R_DC_0_VIDEO1,
++	IMX_SC_R_DC_0,
++	IMX_SC_R_DC_0_PLL_0,
++	IMX_SC_R_DC_0_PLL_1,
++	IMX_SC_R_DC_1_VIDEO0,
++	IMX_SC_R_DC_1_VIDEO1,
++	IMX_SC_R_DC_1,
++	IMX_SC_R_DC_1_PLL_0,
++	IMX_SC_R_DC_1_PLL_1,
++	IMX_SC_R_SPI_0,
++	IMX_SC_R_SPI_1,
++	IMX_SC_R_SPI_2,
++	IMX_SC_R_SPI_3,
++	IMX_SC_R_UART_0,
++	IMX_SC_R_UART_1,
++	IMX_SC_R_UART_2,
++	IMX_SC_R_UART_3,
++	IMX_SC_R_UART_4,
++	IMX_SC_R_EMVSIM_0,
++	IMX_SC_R_EMVSIM_1,
++	IMX_SC_R_I2C_0,
++	IMX_SC_R_I2C_1,
++	IMX_SC_R_I2C_2,
++	IMX_SC_R_I2C_3,
++	IMX_SC_R_I2C_4,
++	IMX_SC_R_ADC_0,
++	IMX_SC_R_ADC_1,
++	IMX_SC_R_FTM_0,
++	IMX_SC_R_FTM_1,
++	IMX_SC_R_CAN_0,
++	IMX_SC_R_CAN_1,
++	IMX_SC_R_CAN_2,
++	IMX_SC_R_GPU_0_PID0,
++	IMX_SC_R_GPU_1_PID0,
++	IMX_SC_R_PWM_0,
++	IMX_SC_R_PWM_1,
++	IMX_SC_R_PWM_2,
++	IMX_SC_R_PWM_3,
++	IMX_SC_R_PWM_4,
++	IMX_SC_R_PWM_5,
++	IMX_SC_R_PWM_6,
++	IMX_SC_R_PWM_7,
++	IMX_SC_R_GPT_0,
++	IMX_SC_R_GPT_1,
++	IMX_SC_R_GPT_2,
++	IMX_SC_R_GPT_3,
++	IMX_SC_R_GPT_4,
++	IMX_SC_R_FSPI_0,
++	IMX_SC_R_FSPI_1,
++	IMX_SC_R_SDHC_0,
++	IMX_SC_R_SDHC_1,
++	IMX_SC_R_SDHC_2,
++	IMX_SC_R_ENET_0,
++	IMX_SC_R_ENET_1,
++	IMX_SC_R_USB_2,
++	IMX_SC_R_NAND,
++	IMX_SC_R_LVDS_0,
++	IMX_SC_R_LVDS_0_PWM_0,
++	IMX_SC_R_LVDS_0_I2C_0,
++	IMX_SC_R_LVDS_0_I2C_1,
++	IMX_SC_R_LVDS_1,
++	IMX_SC_R_LVDS_1_PWM_0,
++	IMX_SC_R_LVDS_1_I2C_0,
++	IMX_SC_R_LVDS_1_I2C_1,
++	IMX_SC_R_M4_0_I2C,
++	IMX_SC_R_M4_1_I2C,
++	IMX_SC_R_AUDIO_PLL_0,
++	IMX_SC_R_VPU_UART,
++	IMX_SC_R_VPUCORE,
++	IMX_SC_R_MIPI_0,
++	IMX_SC_R_MIPI_0_PWM_0,
++	IMX_SC_R_MIPI_0_I2C_0,
++	IMX_SC_R_MIPI_0_I2C_1,
++	IMX_SC_R_MIPI_1,
++	IMX_SC_R_MIPI_1_PWM_0,
++	IMX_SC_R_MIPI_1_I2C_0,
++	IMX_SC_R_MIPI_1_I2C_1,
++	IMX_SC_R_CSI_0,
++	IMX_SC_R_CSI_0_PWM_0,
++	IMX_SC_R_CSI_0_I2C_0,
++	IMX_SC_R_CSI_1,
++	IMX_SC_R_CSI_1_PWM_0,
++	IMX_SC_R_CSI_1_I2C_0,
++	IMX_SC_R_HDMI,
++	IMX_SC_R_HDMI_I2S,
++	IMX_SC_R_HDMI_I2C_0,
++	IMX_SC_R_HDMI_PLL_0,
++	IMX_SC_R_HDMI_RX,
++	IMX_SC_R_HDMI_RX_BYPASS,
++	IMX_SC_R_HDMI_RX_I2C_0,
++	IMX_SC_R_AUDIO_PLL_1,
++	IMX_SC_R_AUDIO_CLK_0,
++	IMX_SC_R_AUDIO_CLK_1,
++	IMX_SC_R_HDMI_RX_PWM_0,
++	IMX_SC_R_HDMI_PLL_1,
++	IMX_SC_R_VPU,
++};
++
++const struct imx_clk_scu_rsrc_table imx_clk_scu_rsrc_imx8qm = {
++	.rsrc = imx8qm_clk_scu_rsrc_table,
++	.num = ARRAY_SIZE(imx8qm_clk_scu_rsrc_table),
++};
+diff --git a/drivers/clk/imx/clk-imx8qxp-acm.c b/drivers/clk/imx/clk-imx8qxp-acm.c
+new file mode 100644
+index 000000000..8968061cf
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx8qxp-acm.c
+@@ -0,0 +1,258 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2018 NXP
++ *	Dong Aisheng <aisheng.dong@nxp.com>
++ */
++
++#include <linux/clk-provider.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++
++#include "clk.h"
++#include "clk-scu.h"
++#include "clk-imx-acm-utils.h"
++
++#include <dt-bindings/clock/imx8-clock.h>
++
++struct imx8qxp_acm_priv {
++	struct clk_imx_acm_pm_domains dev_pm;
++	void __iomem *reg;
++	u32 regs[0x20];
++};
++
++static const char *aud_clk_sels[] = {
++	"aud_rec_clk0_lpcg_clk",
++	"aud_rec_clk1_lpcg_clk",
++	"ext_aud_mclk0",
++	"ext_aud_mclk1",
++	"esai0_rx_clk",
++	"esai0_rx_hf_clk",
++	"esai0_tx_clk",
++	"esai0_tx_hf_clk",
++	"spdif0_rx",
++	"sai0_rx_bclk",
++	"sai0_tx_bclk",
++	"sai1_rx_bclk",
++	"sai1_tx_bclk",
++	"sai2_rx_bclk",
++	"sai3_rx_bclk",
++};
++
++static const char *mclk_out_sels[] = {
++	"aud_rec_clk0_lpcg_clk",
++	"aud_rec_clk1_lpcg_clk",
++	"dummy",
++	"dummy",
++	"spdif0_rx",
++	"dummy",
++	"dummy",
++	"sai4_rx_bclk",
++};
++
++static const char *sai_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *esai_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *spdif_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static const char *mqs_mclk_sels[] = {
++	"aud_pll_div_clk0_lpcg_clk",
++	"aud_pll_div_clk1_lpcg_clk",
++	"acm_aud_clk0_sel",
++	"acm_aud_clk1_sel",
++};
++
++static int imx8qxp_acm_clk_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct clk_onecell_data *clk_data;
++	struct imx8qxp_acm_priv *priv;
++	struct resource *res;
++	struct clk **clks;
++	void __iomem *base;
++	int ret;
++	int i;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!base)
++		return -ENOMEM;
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->reg = base;
++
++	platform_set_drvdata(pdev, priv);
++
++	clk_data = devm_kzalloc(&pdev->dev, sizeof(*clk_data), GFP_KERNEL);
++	if (!clk_data)
++		return -ENOMEM;
++
++	clk_data->clks = devm_kcalloc(&pdev->dev, IMX_ADMA_ACM_CLK_END,
++					sizeof(*clk_data->clks), GFP_KERNEL);
++	if (!clk_data->clks)
++		return -ENOMEM;
++
++	clk_data->clk_num = IMX_ADMA_ACM_CLK_END;
++
++	clks = clk_data->clks;
++
++	ret = clk_imx_acm_attach_pm_domains(&pdev->dev, &priv->dev_pm);
++	if (ret)
++		return ret;
++
++	pm_runtime_enable(&pdev->dev);
++	pm_runtime_get_sync(&pdev->dev);
++
++	clks[IMX_ADMA_EXT_AUD_MCLK0]     = imx_clk_fixed("ext_aud_mclk0", 0);
++	clks[IMX_ADMA_EXT_AUD_MCLK1]     = imx_clk_fixed("ext_aud_mclk1", 0);
++	clks[IMX_ADMA_ESAI0_RX_CLK]      = imx_clk_fixed("esai0_rx_clk", 0);
++	clks[IMX_ADMA_ESAI0_RX_HF_CLK]   = imx_clk_fixed("esai0_rx_hf_clk", 0);
++	clks[IMX_ADMA_ESAI0_TX_CLK]      = imx_clk_fixed("esai0_tx_clk", 0);
++	clks[IMX_ADMA_ESAI0_TX_HF_CLK]   = imx_clk_fixed("esai0_tx_hf_clk", 0);
++	clks[IMX_ADMA_SPDIF0_RX]         = imx_clk_fixed("spdif0_rx", 0);
++	clks[IMX_ADMA_SAI0_RX_BCLK]      = imx_clk_fixed("sai0_rx_bclk", 0);
++	clks[IMX_ADMA_SAI0_TX_BCLK]      = imx_clk_fixed("sai0_tx_bclk", 0);
++	clks[IMX_ADMA_SAI1_RX_BCLK]      = imx_clk_fixed("sai1_rx_bclk", 0);
++	clks[IMX_ADMA_SAI1_TX_BCLK]      = imx_clk_fixed("sai1_tx_bclk", 0);
++	clks[IMX_ADMA_SAI2_RX_BCLK]      = imx_clk_fixed("sai2_rx_bclk", 0);
++	clks[IMX_ADMA_SAI3_RX_BCLK]      = imx_clk_fixed("sai3_rx_bclk", 0);
++	clks[IMX_ADMA_SAI4_RX_BCLK]      = imx_clk_fixed("sai4_rx_bclk", 0);
++
++
++	clks[IMX_ADMA_ACM_AUD_CLK0_SEL] = imx_dev_clk_mux(dev, "acm_aud_clk0_sel", base+0x000000, 0, 5, aud_clk_sels, ARRAY_SIZE(aud_clk_sels));
++	clks[IMX_ADMA_ACM_AUD_CLK1_SEL]	= imx_dev_clk_mux(dev, "acm_aud_clk1_sel", base+0x010000, 0, 5, aud_clk_sels, ARRAY_SIZE(aud_clk_sels));
++
++	clks[IMX_ADMA_ACM_MCLKOUT0_SEL]	= imx_dev_clk_mux(dev, "acm_mclkout0_sel", base+0x020000, 0, 3, mclk_out_sels, ARRAY_SIZE(mclk_out_sels));
++	clks[IMX_ADMA_ACM_MCLKOUT1_SEL]	= imx_dev_clk_mux(dev, "acm_mclkout1_sel", base+0x030000, 0, 3, mclk_out_sels, ARRAY_SIZE(mclk_out_sels));
++
++	clks[IMX_ADMA_ACM_ESAI0_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_esai0_mclk_sel", base+0x060000, 0, 2, esai_mclk_sels, ARRAY_SIZE(esai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI0_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai0_mclk_sel", base+0x0E0000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI1_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai1_mclk_sel", base+0x0F0000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI2_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai2_mclk_sel", base+0x100000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI3_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai3_mclk_sel", base+0x110000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI4_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai4_mclk_sel", base+0x140000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++	clks[IMX_ADMA_ACM_SAI5_MCLK_SEL] = imx_dev_clk_mux(dev, "acm_sai5_mclk_sel", base+0x150000, 0, 2, sai_mclk_sels, ARRAY_SIZE(sai_mclk_sels));
++
++	clks[IMX_ADMA_ACM_SPDIF0_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_spdif0_mclk_sel", base+0x1A0000, 0, 2, spdif_mclk_sels, ARRAY_SIZE(spdif_mclk_sels));
++	clks[IMX_ADMA_ACM_MQS_TX_CLK_SEL] = imx_dev_clk_mux(dev, "acm_mqs_mclk_sel", base+0x1C0000, 0, 2, mqs_mclk_sels, ARRAY_SIZE(mqs_mclk_sels));
++
++	for (i = 0; i < clk_data->clk_num; i++) {
++		if (IS_ERR(clks[i]))
++			pr_warn("i.MX clk %u: register failed with %ld\n",
++				i, PTR_ERR(clks[i]));
++	}
++
++	ret = of_clk_add_provider(np, of_clk_src_onecell_get, clk_data);
++
++	pm_runtime_put_sync(&pdev->dev);
++
++	return ret;
++}
++
++static int imx8qxp_acm_clk_remove(struct platform_device *pdev)
++{
++	struct imx8qxp_acm_priv *priv = dev_get_drvdata(&pdev->dev);
++
++	pm_runtime_disable(&pdev->dev);
++
++	clk_imx_acm_detach_pm_domains(&pdev->dev, &priv->dev_pm);
++
++	return 0;
++}
++
++static const struct of_device_id imx8qxp_acm_match[] = {
++	{ .compatible = "nxp,imx8qxp-acm", },
++	{ /* sentinel */ }
++};
++
++static int __maybe_unused imx8qxp_acm_runtime_suspend(struct device *dev)
++{
++	struct imx8qxp_acm_priv *priv = dev_get_drvdata(dev);
++
++	priv->regs[0]  = readl_relaxed(priv->reg + 0x000000);
++	priv->regs[1]  = readl_relaxed(priv->reg + 0x010000);
++	priv->regs[2]  = readl_relaxed(priv->reg + 0x020000);
++	priv->regs[3]  = readl_relaxed(priv->reg + 0x030000);
++	priv->regs[6]  = readl_relaxed(priv->reg + 0x060000);
++	priv->regs[14] = readl_relaxed(priv->reg + 0x0E0000);
++	priv->regs[15] = readl_relaxed(priv->reg + 0x0F0000);
++	priv->regs[16] = readl_relaxed(priv->reg + 0x100000);
++	priv->regs[17] = readl_relaxed(priv->reg + 0x110000);
++	priv->regs[20] = readl_relaxed(priv->reg + 0x140000);
++	priv->regs[21] = readl_relaxed(priv->reg + 0x150000);
++	priv->regs[26] = readl_relaxed(priv->reg + 0x1A0000);
++	priv->regs[28] = readl_relaxed(priv->reg + 0x1C0000);
++
++	return 0;
++}
++
++static int __maybe_unused imx8qxp_acm_runtime_resume(struct device *dev)
++{
++	struct imx8qxp_acm_priv *priv = dev_get_drvdata(dev);
++
++	writel_relaxed(priv->regs[0],  priv->reg + 0x000000);
++	writel_relaxed(priv->regs[1],  priv->reg + 0x010000);
++	writel_relaxed(priv->regs[2],  priv->reg + 0x020000);
++	writel_relaxed(priv->regs[3],  priv->reg + 0x030000);
++	writel_relaxed(priv->regs[6],  priv->reg + 0x060000);
++	writel_relaxed(priv->regs[14], priv->reg + 0x0E0000);
++	writel_relaxed(priv->regs[15], priv->reg + 0x0F0000);
++	writel_relaxed(priv->regs[16], priv->reg + 0x100000);
++	writel_relaxed(priv->regs[17], priv->reg + 0x110000);
++	writel_relaxed(priv->regs[20], priv->reg + 0x140000);
++	writel_relaxed(priv->regs[21], priv->reg + 0x150000);
++	writel_relaxed(priv->regs[26], priv->reg + 0x1A0000);
++	writel_relaxed(priv->regs[28], priv->reg + 0x1C0000);
++
++	return 0;
++}
++
++const struct dev_pm_ops imx8qxp_acm_pm_ops = {
++	SET_RUNTIME_PM_OPS(imx8qxp_acm_runtime_suspend,
++			   imx8qxp_acm_runtime_resume, NULL)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				      pm_runtime_force_resume)
++};
++
++static struct platform_driver imx8qxp_acm_clk_driver = {
++	.driver = {
++		.name = "imx8qxp-acm",
++		.of_match_table = imx8qxp_acm_match,
++		.pm = &imx8qxp_acm_pm_ops,
++		.suppress_bind_attrs = true,
++	},
++	.probe = imx8qxp_acm_clk_probe,
++	.remove = imx8qxp_acm_clk_remove,
++};
++
++static int __init imx8qxp_acm_init(void)
++{
++	return platform_driver_register(&imx8qxp_acm_clk_driver);
++}
++fs_initcall(imx8qxp_acm_init);
+diff --git a/drivers/clk/imx/clk-imx8qxp-lpcg.c b/drivers/clk/imx/clk-imx8qxp-lpcg.c
+index 522c03a12..0b43a8345 100644
+--- a/drivers/clk/imx/clk-imx8qxp-lpcg.c
++++ b/drivers/clk/imx/clk-imx8qxp-lpcg.c
+@@ -9,216 +9,106 @@
+ #include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/slab.h>
+ 
+ #include "clk-scu.h"
+-#include "clk-imx8qxp-lpcg.h"
+ 
+-#include <dt-bindings/clock/imx8-clock.h>
+-
+-/*
+- * struct imx8qxp_lpcg_data - Description of one LPCG clock
+- * @id: clock ID
+- * @name: clock name
+- * @parent: parent clock name
+- * @flags: common clock flags
+- * @offset: offset of this LPCG clock
+- * @bit_idx: bit index of this LPCG clock
+- * @hw_gate: whether supports HW autogate
+- *
+- * This structure describes one LPCG clock
+- */
+-struct imx8qxp_lpcg_data {
+-	int id;
+-	char *name;
+-	char *parent;
+-	unsigned long flags;
+-	u32 offset;
+-	u8 bit_idx;
+-	bool hw_gate;
+-};
+-
+-/*
+- * struct imx8qxp_ss_lpcg - Description of one subsystem LPCG clocks
+- * @lpcg: LPCG clocks array of one subsystem
+- * @num_lpcg: the number of LPCG clocks
+- * @num_max: the maximum number of LPCG clocks
+- *
+- * This structure describes each subsystem LPCG clocks information
+- * which then will be used to create respective LPCGs clocks
+- */
+-struct imx8qxp_ss_lpcg {
+-	const struct imx8qxp_lpcg_data *lpcg;
+-	u8 num_lpcg;
+-	u8 num_max;
+-};
+-
+-static const struct imx8qxp_lpcg_data imx8qxp_lpcg_adma[] = {
+-	{ IMX_ADMA_LPCG_UART0_IPG_CLK, "uart0_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPUART_0_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_UART0_BAUD_CLK, "uart0_lpcg_baud_clk", "uart0_clk", 0, ADMA_LPUART_0_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_UART1_IPG_CLK, "uart1_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPUART_1_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_UART1_BAUD_CLK, "uart1_lpcg_baud_clk", "uart1_clk", 0, ADMA_LPUART_1_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_UART2_IPG_CLK, "uart2_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPUART_2_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_UART2_BAUD_CLK, "uart2_lpcg_baud_clk", "uart2_clk", 0, ADMA_LPUART_2_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_UART3_IPG_CLK, "uart3_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPUART_3_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_UART3_BAUD_CLK, "uart3_lpcg_baud_clk", "uart3_clk", 0, ADMA_LPUART_3_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_I2C0_IPG_CLK, "i2c0_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPI2C_0_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_I2C0_CLK, "i2c0_lpcg_clk", "i2c0_clk", 0, ADMA_LPI2C_0_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_I2C1_IPG_CLK, "i2c1_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPI2C_1_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_I2C1_CLK, "i2c1_lpcg_clk", "i2c1_clk", 0, ADMA_LPI2C_1_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_I2C2_IPG_CLK, "i2c2_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPI2C_2_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_I2C2_CLK, "i2c2_lpcg_clk", "i2c2_clk", 0, ADMA_LPI2C_2_LPCG, 0, 0, },
+-	{ IMX_ADMA_LPCG_I2C3_IPG_CLK, "i2c3_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_LPI2C_3_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_I2C3_CLK, "i2c3_lpcg_clk", "i2c3_clk", 0, ADMA_LPI2C_3_LPCG, 0, 0, },
+-
+-	{ IMX_ADMA_LPCG_DSP_CORE_CLK, "dsp_lpcg_core_clk", "dma_ipg_clk_root", 0, ADMA_HIFI_LPCG, 28, 0, },
+-	{ IMX_ADMA_LPCG_DSP_IPG_CLK, "dsp_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_HIFI_LPCG, 20, 0, },
+-	{ IMX_ADMA_LPCG_DSP_ADB_CLK, "dsp_lpcg_adb_clk", "dma_ipg_clk_root", 0, ADMA_HIFI_LPCG, 16, 0, },
+-	{ IMX_ADMA_LPCG_OCRAM_IPG_CLK, "ocram_lpcg_ipg_clk", "dma_ipg_clk_root", 0, ADMA_OCRAM_LPCG, 16, 0, },
+-};
+-
+-static const struct imx8qxp_ss_lpcg imx8qxp_ss_adma = {
+-	.lpcg = imx8qxp_lpcg_adma,
+-	.num_lpcg = ARRAY_SIZE(imx8qxp_lpcg_adma),
+-	.num_max = IMX_ADMA_LPCG_CLK_END,
+-};
+-
+-static const struct imx8qxp_lpcg_data imx8qxp_lpcg_conn[] = {
+-	{ IMX_CONN_LPCG_SDHC0_PER_CLK, "sdhc0_lpcg_per_clk", "sdhc0_clk", 0, CONN_USDHC_0_LPCG, 0, 0, },
+-	{ IMX_CONN_LPCG_SDHC0_IPG_CLK, "sdhc0_lpcg_ipg_clk", "conn_ipg_clk_root", 0, CONN_USDHC_0_LPCG, 16, 0, },
+-	{ IMX_CONN_LPCG_SDHC0_HCLK, "sdhc0_lpcg_ahb_clk", "conn_axi_clk_root", 0, CONN_USDHC_0_LPCG, 20, 0, },
+-	{ IMX_CONN_LPCG_SDHC1_PER_CLK, "sdhc1_lpcg_per_clk", "sdhc1_clk", 0, CONN_USDHC_1_LPCG, 0, 0, },
+-	{ IMX_CONN_LPCG_SDHC1_IPG_CLK, "sdhc1_lpcg_ipg_clk", "conn_ipg_clk_root", 0, CONN_USDHC_1_LPCG, 16, 0, },
+-	{ IMX_CONN_LPCG_SDHC1_HCLK, "sdhc1_lpcg_ahb_clk", "conn_axi_clk_root", 0, CONN_USDHC_1_LPCG, 20, 0, },
+-	{ IMX_CONN_LPCG_SDHC2_PER_CLK, "sdhc2_lpcg_per_clk", "sdhc2_clk", 0, CONN_USDHC_2_LPCG, 0, 0, },
+-	{ IMX_CONN_LPCG_SDHC2_IPG_CLK, "sdhc2_lpcg_ipg_clk", "conn_ipg_clk_root", 0, CONN_USDHC_2_LPCG, 16, 0, },
+-	{ IMX_CONN_LPCG_SDHC2_HCLK, "sdhc2_lpcg_ahb_clk", "conn_axi_clk_root", 0, CONN_USDHC_2_LPCG, 20, 0, },
+-	{ IMX_CONN_LPCG_ENET0_ROOT_CLK, "enet0_ipg_root_clk", "enet0_clk", 0, CONN_ENET_0_LPCG, 0, 0, },
+-	{ IMX_CONN_LPCG_ENET0_TX_CLK, "enet0_tx_clk", "enet0_clk", 0, CONN_ENET_0_LPCG, 4, 0, },
+-	{ IMX_CONN_LPCG_ENET0_AHB_CLK, "enet0_ahb_clk", "conn_axi_clk_root", 0, CONN_ENET_0_LPCG, 8, 0, },
+-	{ IMX_CONN_LPCG_ENET0_IPG_S_CLK, "enet0_ipg_s_clk", "conn_ipg_clk_root", 0, CONN_ENET_0_LPCG, 20, 0, },
+-	{ IMX_CONN_LPCG_ENET0_IPG_CLK, "enet0_ipg_clk", "enet0_ipg_s_clk", 0, CONN_ENET_0_LPCG, 16, 0, },
+-	{ IMX_CONN_LPCG_ENET1_ROOT_CLK, "enet1_ipg_root_clk", "enet1_clk", 0, CONN_ENET_1_LPCG, 0, 0, },
+-	{ IMX_CONN_LPCG_ENET1_TX_CLK, "enet1_tx_clk", "enet1_clk", 0, CONN_ENET_1_LPCG, 4, 0, },
+-	{ IMX_CONN_LPCG_ENET1_AHB_CLK, "enet1_ahb_clk", "conn_axi_clk_root", 0, CONN_ENET_1_LPCG, 8, 0, },
+-	{ IMX_CONN_LPCG_ENET1_IPG_S_CLK, "enet1_ipg_s_clk", "conn_ipg_clk_root", 0, CONN_ENET_1_LPCG, 20, 0, },
+-	{ IMX_CONN_LPCG_ENET1_IPG_CLK, "enet1_ipg_clk", "enet0_ipg_s_clk", 0, CONN_ENET_1_LPCG, 16, 0, },
+-};
+-
+-static const struct imx8qxp_ss_lpcg imx8qxp_ss_conn = {
+-	.lpcg = imx8qxp_lpcg_conn,
+-	.num_lpcg = ARRAY_SIZE(imx8qxp_lpcg_conn),
+-	.num_max = IMX_CONN_LPCG_CLK_END,
+-};
+-
+-static const struct imx8qxp_lpcg_data imx8qxp_lpcg_lsio[] = {
+-	{ IMX_LSIO_LPCG_PWM0_IPG_CLK, "pwm0_lpcg_ipg_clk", "pwm0_clk", 0, LSIO_PWM_0_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM0_IPG_HF_CLK, "pwm0_lpcg_ipg_hf_clk", "pwm0_clk", 0, LSIO_PWM_0_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM0_IPG_S_CLK, "pwm0_lpcg_ipg_s_clk", "pwm0_clk", 0, LSIO_PWM_0_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM0_IPG_SLV_CLK, "pwm0_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_0_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM0_IPG_MSTR_CLK, "pwm0_lpcg_ipg_mstr_clk", "pwm0_clk", 0, LSIO_PWM_0_LPCG, 24, 0, },
+-	{ IMX_LSIO_LPCG_PWM1_IPG_CLK, "pwm1_lpcg_ipg_clk", "pwm1_clk", 0, LSIO_PWM_1_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM1_IPG_HF_CLK, "pwm1_lpcg_ipg_hf_clk", "pwm1_clk", 0, LSIO_PWM_1_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM1_IPG_S_CLK, "pwm1_lpcg_ipg_s_clk", "pwm1_clk", 0, LSIO_PWM_1_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM1_IPG_SLV_CLK, "pwm1_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_1_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM1_IPG_MSTR_CLK, "pwm1_lpcg_ipg_mstr_clk", "pwm1_clk", 0, LSIO_PWM_1_LPCG, 24, 0, },
+-	{ IMX_LSIO_LPCG_PWM2_IPG_CLK, "pwm2_lpcg_ipg_clk", "pwm2_clk", 0, LSIO_PWM_2_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM2_IPG_HF_CLK, "pwm2_lpcg_ipg_hf_clk", "pwm2_clk", 0, LSIO_PWM_2_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM2_IPG_S_CLK, "pwm2_lpcg_ipg_s_clk", "pwm2_clk", 0, LSIO_PWM_2_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM2_IPG_SLV_CLK, "pwm2_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_2_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM2_IPG_MSTR_CLK, "pwm2_lpcg_ipg_mstr_clk", "pwm2_clk", 0, LSIO_PWM_2_LPCG, 24, 0, },
+-	{ IMX_LSIO_LPCG_PWM3_IPG_CLK, "pwm3_lpcg_ipg_clk", "pwm3_clk", 0, LSIO_PWM_3_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM3_IPG_HF_CLK, "pwm3_lpcg_ipg_hf_clk", "pwm3_clk", 0, LSIO_PWM_3_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM3_IPG_S_CLK, "pwm3_lpcg_ipg_s_clk", "pwm3_clk", 0, LSIO_PWM_3_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM3_IPG_SLV_CLK, "pwm3_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_3_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM3_IPG_MSTR_CLK, "pwm3_lpcg_ipg_mstr_clk", "pwm3_clk", 0, LSIO_PWM_3_LPCG, 24, 0, },
+-	{ IMX_LSIO_LPCG_PWM4_IPG_CLK, "pwm4_lpcg_ipg_clk", "pwm4_clk", 0, LSIO_PWM_4_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM4_IPG_HF_CLK, "pwm4_lpcg_ipg_hf_clk", "pwm4_clk", 0, LSIO_PWM_4_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM4_IPG_S_CLK, "pwm4_lpcg_ipg_s_clk", "pwm4_clk", 0, LSIO_PWM_4_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM4_IPG_SLV_CLK, "pwm4_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_4_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM4_IPG_MSTR_CLK, "pwm4_lpcg_ipg_mstr_clk", "pwm4_clk", 0, LSIO_PWM_4_LPCG, 24, 0, },
+-	{ IMX_LSIO_LPCG_PWM5_IPG_CLK, "pwm5_lpcg_ipg_clk", "pwm5_clk", 0, LSIO_PWM_5_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM5_IPG_HF_CLK, "pwm5_lpcg_ipg_hf_clk", "pwm5_clk", 0, LSIO_PWM_5_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM5_IPG_S_CLK, "pwm5_lpcg_ipg_s_clk", "pwm5_clk", 0, LSIO_PWM_5_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM5_IPG_SLV_CLK, "pwm5_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_5_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM5_IPG_MSTR_CLK, "pwm5_lpcg_ipg_mstr_clk", "pwm5_clk", 0, LSIO_PWM_5_LPCG, 24, 0, },
+-	{ IMX_LSIO_LPCG_PWM6_IPG_CLK, "pwm6_lpcg_ipg_clk", "pwm6_clk", 0, LSIO_PWM_6_LPCG, 0, 0, },
+-	{ IMX_LSIO_LPCG_PWM6_IPG_HF_CLK, "pwm6_lpcg_ipg_hf_clk", "pwm6_clk", 0, LSIO_PWM_6_LPCG, 4, 0, },
+-	{ IMX_LSIO_LPCG_PWM6_IPG_S_CLK, "pwm6_lpcg_ipg_s_clk", "pwm6_clk", 0, LSIO_PWM_6_LPCG, 16, 0, },
+-	{ IMX_LSIO_LPCG_PWM6_IPG_SLV_CLK, "pwm6_lpcg_ipg_slv_clk", "lsio_bus_clk_root", 0, LSIO_PWM_6_LPCG, 20, 0, },
+-	{ IMX_LSIO_LPCG_PWM6_IPG_MSTR_CLK, "pwm6_lpcg_ipg_mstr_clk", "pwm6_clk", 0, LSIO_PWM_6_LPCG, 24, 0, },
+-};
+-
+-static const struct imx8qxp_ss_lpcg imx8qxp_ss_lsio = {
+-	.lpcg = imx8qxp_lpcg_lsio,
+-	.num_lpcg = ARRAY_SIZE(imx8qxp_lpcg_lsio),
+-	.num_max = IMX_LSIO_LPCG_CLK_END,
+-};
++#define IMX_LPCG_MAX_CLKS	8
+ 
+ static int imx8qxp_lpcg_clk_probe(struct platform_device *pdev)
+ {
+-	struct device *dev = &pdev->dev;
+-	struct device_node *np = dev->of_node;
++	struct device_node *np = pdev->dev.of_node;
++	const char *output_names[IMX_LPCG_MAX_CLKS];
++	const char *parent_names[IMX_LPCG_MAX_CLKS];
++	unsigned int bit_offset[IMX_LPCG_MAX_CLKS];
+ 	struct clk_hw_onecell_data *clk_data;
+-	const struct imx8qxp_ss_lpcg *ss_lpcg;
+-	const struct imx8qxp_lpcg_data *lpcg;
++	struct clk_hw **clk_hws;
+ 	struct resource *res;
+-	struct clk_hw **clks;
+ 	void __iomem *base;
++	bool autogate;
++	int count;
++	int ret;
+ 	int i;
+ 
+-	ss_lpcg = of_device_get_match_data(dev);
+-	if (!ss_lpcg)
+-		return -ENODEV;
+-
+-	/*
+-	 * Please don't replace this with devm_platform_ioremap_resource.
+-	 *
+-	 * devm_platform_ioremap_resource calls devm_ioremap_resource which
+-	 * differs from devm_ioremap by also calling devm_request_mem_region
+-	 * and preventing other mappings in the same area.
+-	 *
+-	 * On imx8 the LPCG nodes map entire subsystems and overlap
+-	 * peripherals, this means that using devm_platform_ioremap_resource
+-	 * will cause many devices to fail to probe including serial ports.
+-	 */
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res)
++	base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	count = of_property_count_u32_elems(np, "bit-offset");
++	if (count < 0) {
++		dev_err(&pdev->dev, "failed to count clocks\n");
+ 		return -EINVAL;
+-	base = devm_ioremap(dev, res->start, resource_size(res));
+-	if (!base)
+-		return -ENOMEM;
++	}
+ 
+-	clk_data = devm_kzalloc(&pdev->dev, struct_size(clk_data, hws,
+-				ss_lpcg->num_max), GFP_KERNEL);
++	clk_data = devm_kzalloc(&pdev->dev, struct_size(clk_data, hws, count),
++				GFP_KERNEL);
+ 	if (!clk_data)
+ 		return -ENOMEM;
+ 
+-	clk_data->num = ss_lpcg->num_max;
+-	clks = clk_data->hws;
++	clk_data->num = count;
++	clk_hws = clk_data->hws;
+ 
+-	for (i = 0; i < ss_lpcg->num_lpcg; i++) {
+-		lpcg = ss_lpcg->lpcg + i;
+-		clks[lpcg->id] = imx_clk_lpcg_scu(lpcg->name, lpcg->parent,
+-						  lpcg->flags, base + lpcg->offset,
+-						  lpcg->bit_idx, lpcg->hw_gate);
++	ret = of_property_read_u32_array(np, "bit-offset", bit_offset,
++					 clk_data->num);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed to read clocks bit-offset\n");
++		return -EINVAL;
+ 	}
+ 
++	ret = of_clk_parent_fill(np, parent_names, clk_data->num);
++	if (ret != clk_data->num) {
++		dev_err(&pdev->dev, "failed to get clock parent names\n");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_string_array(np, "clock-output-names",
++					    output_names, clk_data->num);
++	if (ret != clk_data->num) {
++		dev_err(&pdev->dev, "failed to read clock-output-names\n");
++		return -EINVAL;
++	}
++
++	autogate = of_property_read_bool(np, "hw-autogate");
++
++	pm_runtime_get_noresume(&pdev->dev);
++	pm_runtime_set_active(&pdev->dev);
++	pm_runtime_set_autosuspend_delay(&pdev->dev, 500);
++	pm_runtime_use_autosuspend(&pdev->dev);
++	pm_runtime_enable(&pdev->dev);
++
+ 	for (i = 0; i < clk_data->num; i++) {
+-		if (IS_ERR(clks[i]))
+-			pr_warn("i.MX clk %u: register failed with %ld\n",
+-				i, PTR_ERR(clks[i]));
++		if (bit_offset[i] > 31) {
++			dev_warn(&pdev->dev, "invalid bit offset of clock %d\n",
++				 i);
++			return -EINVAL;
++		}
++
++		clk_hws[i] = imx_clk_lpcg_scu_dev(&pdev->dev, output_names[i],
++						  parent_names[i], 0, base,
++						  bit_offset[i], autogate);
++		if (IS_ERR(clk_hws[i])) {
++			dev_warn(&pdev->dev, "failed to register clock %d\n",
++				 i);
++			return -EINVAL;
++		}
+ 	}
+ 
+-	return of_clk_add_hw_provider(np, of_clk_hw_onecell_get, clk_data);
++	ret = devm_of_clk_add_hw_provider(&pdev->dev, of_clk_hw_onecell_get,
++					  clk_data);
++
++	pm_runtime_mark_last_busy(&pdev->dev);
++	pm_runtime_put_autosuspend(&pdev->dev);
++
++	return ret;
+ }
+ 
+ static const struct of_device_id imx8qxp_lpcg_match[] = {
+-	{ .compatible = "fsl,imx8qxp-lpcg-adma", &imx8qxp_ss_adma, },
+-	{ .compatible = "fsl,imx8qxp-lpcg-conn", &imx8qxp_ss_conn, },
+-	{ .compatible = "fsl,imx8qxp-lpcg-lsio", &imx8qxp_ss_lsio, },
++	{ .compatible = "fsl,imx8qxp-lpcg", NULL },
+ 	{ /* sentinel */ }
+ };
+ 
+@@ -226,6 +116,7 @@ static struct platform_driver imx8qxp_lpcg_clk_driver = {
+ 	.driver = {
+ 		.name = "imx8qxp-lpcg-clk",
+ 		.of_match_table = imx8qxp_lpcg_match,
++		.pm = &imx_clk_lpcg_scu_pm_ops,
+ 		.suppress_bind_attrs = true,
+ 	},
+ 	.probe = imx8qxp_lpcg_clk_probe,
+diff --git a/drivers/clk/imx/clk-imx8qxp-lpcg.h b/drivers/clk/imx/clk-imx8qxp-lpcg.h
+index 2a37ce57c..e4458780e 100644
+--- a/drivers/clk/imx/clk-imx8qxp-lpcg.h
++++ b/drivers/clk/imx/clk-imx8qxp-lpcg.h
+@@ -42,7 +42,6 @@
+ #define CONN_ENET_0_LPCG		0x30000
+ #define CONN_ENET_1_LPCG		0x40000
+ #define CONN_DTCP_LPCG			0x50000
+-#define CONN_MLB_LPCG			0x60000
+ #define CONN_USB_2_LPCG			0x70000
+ #define CONN_USB_3_LPCG			0x80000
+ #define CONN_NAND_LPCG			0x90000
+@@ -99,4 +98,49 @@
+ #define ADMA_FLEXCAN_1_LPCG		0x1ce0000
+ #define ADMA_FLEXCAN_2_LPCG		0x1cf0000
+ 
++/* CM40 SS */
++#define CM40_I2C_LPCG			0x60000
++
++/* HSIO SS */
++#define HSIO_PCIEA_LPCG			0x00000
++#define HSIO_PCIEB_LPCG			0x10000
++#define HSIO_SATA0_LPCG			0x20000
++#define HSIO_PHYX2_LPCG			0x30000
++#define HSIO_PHYX1_LPCG			0x40000
++#define HSIO_CRR_0_LPCG			0x50000
++#define HSIO_CRR_1_LPCG			0x60000
++#define HSIO_CRR_2_LPCG			0x70000
++#define HSIO_CRR_3_LPCG			0x80000
++#define HSIO_CRR_4_LPCG			0x90000
++#define HSIO_CRR_5_LPCG			0xa0000
++#define HSIO_GPIO_LPCG			0xb0000
++
++/* IMG SS */
++#define IMG_PDMA0_LPCG			0x00000
++#define IMG_PDMA1_LPCG			0x10000
++#define IMG_PDMA2_LPCG			0x20000
++#define IMG_PDMA3_LPCG			0x30000
++#define IMG_PDMA4_LPCG			0x40000
++#define IMG_PDMA5_LPCG			0x50000
++#define IMG_PDMA6_LPCG			0x60000
++#define IMG_PDMA7_LPCG			0x70000
++#define IMG_MIPI_CSI0_LPCG		0x80000
++#define IMG_MIPI_CSI1_LPCG		0x90000
++
++/* CSI SS */
++#define CSI_CSI0_CORE_LPCG		0x18
++#define CSI_CSI0_ESC_LPCG		0x1C
++#define CSI_CSI0_I2C0_LPCG		0x14
++#define CSI_CSI1_CORE_LPCG		0x18
++#define CSI_CSI1_ESC_LPCG		0x1C
++#define CSI_CSI1_I2C0_LPCG		0x14
++
++/* Parallel Interface SS */
++#define PI_PI0_PIXEL_LPCG		0x18
++#define PI_PI0_IPG_LPCG			0x04
++#define PI_PI0_MISC_LPCG		0x1C
++
++/* DC0 SS */
++/* TODO: ADD DC LPCGs */
++
+ #endif /* _IMX8QXP_LPCG_H */
+diff --git a/drivers/clk/imx/clk-imx8qxp-rsrc.c b/drivers/clk/imx/clk-imx8qxp-rsrc.c
+new file mode 100644
+index 000000000..947d5a64c
+--- /dev/null
++++ b/drivers/clk/imx/clk-imx8qxp-rsrc.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2019 NXP
++ *	Dong Aisheng <aisheng.dong@nxp.com>
++ */
++
++#include <dt-bindings/firmware/imx/rsrc.h>
++
++#include "clk-scu.h"
++
++/* Keep sorted in the ascending order */
++static u32 imx8qxp_clk_scu_rsrc_table[] = {
++	IMX_SC_R_DC_0_VIDEO0,
++	IMX_SC_R_DC_0_VIDEO1,
++	IMX_SC_R_DC_0,
++	IMX_SC_R_DC_0_PLL_0,
++	IMX_SC_R_DC_0_PLL_1,
++	IMX_SC_R_SPI_0,
++	IMX_SC_R_SPI_1,
++	IMX_SC_R_SPI_2,
++	IMX_SC_R_SPI_3,
++	IMX_SC_R_UART_0,
++	IMX_SC_R_UART_1,
++	IMX_SC_R_UART_2,
++	IMX_SC_R_UART_3,
++	IMX_SC_R_I2C_0,
++	IMX_SC_R_I2C_1,
++	IMX_SC_R_I2C_2,
++	IMX_SC_R_I2C_3,
++	IMX_SC_R_ADC_0,
++	IMX_SC_R_FTM_0,
++	IMX_SC_R_FTM_1,
++	IMX_SC_R_CAN_0,
++	IMX_SC_R_GPU_0_PID0,
++	IMX_SC_R_LCD_0,
++	IMX_SC_R_LCD_0_PWM_0,
++	IMX_SC_R_PWM_0,
++	IMX_SC_R_PWM_1,
++	IMX_SC_R_PWM_2,
++	IMX_SC_R_PWM_3,
++	IMX_SC_R_PWM_4,
++	IMX_SC_R_PWM_5,
++	IMX_SC_R_PWM_6,
++	IMX_SC_R_PWM_7,
++	IMX_SC_R_GPT_0,
++	IMX_SC_R_GPT_1,
++	IMX_SC_R_GPT_2,
++	IMX_SC_R_GPT_3,
++	IMX_SC_R_GPT_4,
++	IMX_SC_R_FSPI_0,
++	IMX_SC_R_FSPI_1,
++	IMX_SC_R_SDHC_0,
++	IMX_SC_R_SDHC_1,
++	IMX_SC_R_SDHC_2,
++	IMX_SC_R_ENET_0,
++	IMX_SC_R_ENET_1,
++	IMX_SC_R_USB_2,
++	IMX_SC_R_NAND,
++	IMX_SC_R_LVDS_0,
++	IMX_SC_R_LVDS_1,
++	IMX_SC_R_M4_0_UART,
++	IMX_SC_R_M4_0_I2C,
++	IMX_SC_R_ELCDIF_PLL,
++	IMX_SC_R_AUDIO_PLL_0,
++	IMX_SC_R_PI_0,
++	IMX_SC_R_PI_0_PWM_0,
++	IMX_SC_R_PI_0_I2C_0,
++	IMX_SC_R_PI_0_PLL,
++	IMX_SC_R_MIPI_0,
++	IMX_SC_R_MIPI_0_PWM_0,
++	IMX_SC_R_MIPI_0_I2C_0,
++	IMX_SC_R_MIPI_0_I2C_1,
++	IMX_SC_R_MIPI_1,
++	IMX_SC_R_MIPI_1_PWM_0,
++	IMX_SC_R_MIPI_1_I2C_0,
++	IMX_SC_R_MIPI_1_I2C_1,
++	IMX_SC_R_CSI_0,
++	IMX_SC_R_CSI_0_PWM_0,
++	IMX_SC_R_CSI_0_I2C_0,
++	IMX_SC_R_AUDIO_PLL_1,
++	IMX_SC_R_AUDIO_CLK_0,
++	IMX_SC_R_AUDIO_CLK_1,
++	IMX_SC_R_A35,
++	IMX_SC_R_VPU_DEC_0,
++	IMX_SC_R_VPU_ENC_0,
++};
++
++const struct imx_clk_scu_rsrc_table imx_clk_scu_rsrc_imx8qxp = {
++	.rsrc = imx8qxp_clk_scu_rsrc_table,
++	.num = ARRAY_SIZE(imx8qxp_clk_scu_rsrc_table),
++};
+diff --git a/drivers/clk/imx/clk-imx8qxp.c b/drivers/clk/imx/clk-imx8qxp.c
+index 8c14e0bbe..29a8affda 100644
+--- a/drivers/clk/imx/clk-imx8qxp.c
++++ b/drivers/clk/imx/clk-imx8qxp.c
+@@ -9,139 +9,295 @@
+ #include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+ 
++#include <dt-bindings/firmware/imx/rsrc.h>
++
+ #include "clk-scu.h"
+ 
+-#include <dt-bindings/clock/imx8-clock.h>
+-#include <dt-bindings/firmware/imx/rsrc.h>
++static const char *pll0_sels[] = {
++	"clk_dummy",
++	"pi_dpll_clk",
++	"clk_dummy",
++	"clk_dummy",
++	"clk_dummy",
++};
++
++static const char *enet0_rgmii_txc_sels[] = {
++	"enet0_ref_div",
++	"clk_dummy",
++};
++
++static const char *enet1_rgmii_txc_sels[] __maybe_unused = {
++	"enet1_ref_div",
++	"clk_dummy",
++};
++
++static const char *dc0_sels[] = {
++	"clk_dummy",
++	"clk_dummy",
++	"dc0_pll0_clk",
++	"dc0_pll1_clk",
++	"dc0_bypass0_clk",
++};
++
++static const char *dc1_sels[] = {
++	"clk_dummy",
++	"clk_dummy",
++	"dc1_pll0_clk",
++	"dc1_pll1_clk",
++	"dc1_bypass0_clk",
++};
++
++static const char *hdmi_sels[] = {
++	"clk_dummy",
++	"hdmi_dig_pll_clk",
++	"clk_dummy",
++	"clk_dummy",
++	"hdmi_av_pll_clk",
++};
++
++static const char *hdmi_rx_sels[] = {
++	"clk_dummy",
++	"hdmi_rx_dig_pll_clk",
++	"clk_dummy",
++	"clk_dummy",
++	"hdmi_rx_bypass_clk",
++};
++
++static const char *lcd_pxl_sels[] = {
++	"dummy",
++	"dummy",
++	"dummy",
++	"dummy",
++	"lcd_pxl_bypass_div_clk",
++};
++
++static const char *mipi_sels[] = {
++	"dummy",
++	"dummy",
++	"mipi_pll_div2_clk",
++	"dummy",
++	"dummy",
++};
++
++static const char *lcd_sels[] = {
++	"clk_dummy",
++	"clk_dummy",
++	"clk_dummy",
++	"clk_dummy",
++	"elcdif_pll",
++};
++
++static const struct of_device_id imx8qxp_match[] = {
++	{ .compatible = "fsl,scu-clk", },
++	{ .compatible = "fsl,imx8qxp-clk", &imx_clk_scu_rsrc_imx8qxp, },
++	{ .compatible = "fsl,imx8qm-clk", &imx_clk_scu_rsrc_imx8qm, },
++	{ .compatible = "fsl,imx8dxl-clk", &imx_clk_scu_rsrc_imx8dxl, },
++	{ /* sentinel */ }
++};
+ 
+ static int imx8qxp_clk_probe(struct platform_device *pdev)
+ {
++	const struct of_device_id *of_id =
++			of_match_device(imx8qxp_match, &pdev->dev);
+ 	struct device_node *ccm_node = pdev->dev.of_node;
+-	struct clk_hw_onecell_data *clk_data;
+-	struct clk_hw **clks;
+-	int ret, i;
++	int ret;
+ 
+-	ret = imx_clk_scu_init();
++	ret = imx_clk_scu_init(ccm_node, of_id->data);
+ 	if (ret)
+ 		return ret;
+ 
+-	clk_data = devm_kzalloc(&pdev->dev, struct_size(clk_data, hws,
+-				IMX_SCU_CLK_END), GFP_KERNEL);
+-	if (!clk_data)
+-		return -ENOMEM;
+-
+-	clk_data->num = IMX_SCU_CLK_END;
+-	clks = clk_data->hws;
+-
+-	/* Fixed clocks */
+-	clks[IMX_CLK_DUMMY]		= clk_hw_register_fixed_rate(NULL, "dummy", NULL, 0, 0);
+-	clks[IMX_ADMA_IPG_CLK_ROOT] 	= clk_hw_register_fixed_rate(NULL, "dma_ipg_clk_root", NULL, 0, 120000000);
+-	clks[IMX_CONN_AXI_CLK_ROOT]	= clk_hw_register_fixed_rate(NULL, "conn_axi_clk_root", NULL, 0, 333333333);
+-	clks[IMX_CONN_AHB_CLK_ROOT]	= clk_hw_register_fixed_rate(NULL, "conn_ahb_clk_root", NULL, 0, 166666666);
+-	clks[IMX_CONN_IPG_CLK_ROOT]	= clk_hw_register_fixed_rate(NULL, "conn_ipg_clk_root", NULL, 0, 83333333);
+-	clks[IMX_DC_AXI_EXT_CLK]	= clk_hw_register_fixed_rate(NULL, "dc_axi_ext_clk_root", NULL, 0, 800000000);
+-	clks[IMX_DC_AXI_INT_CLK]	= clk_hw_register_fixed_rate(NULL, "dc_axi_int_clk_root", NULL, 0, 400000000);
+-	clks[IMX_DC_CFG_CLK]		= clk_hw_register_fixed_rate(NULL, "dc_cfg_clk_root", NULL, 0, 100000000);
+-	clks[IMX_MIPI_IPG_CLK]		= clk_hw_register_fixed_rate(NULL, "mipi_ipg_clk_root", NULL, 0, 120000000);
+-	clks[IMX_IMG_AXI_CLK]		= clk_hw_register_fixed_rate(NULL, "img_axi_clk_root", NULL, 0, 400000000);
+-	clks[IMX_IMG_IPG_CLK]		= clk_hw_register_fixed_rate(NULL, "img_ipg_clk_root", NULL, 0, 200000000);
+-	clks[IMX_IMG_PXL_CLK]		= clk_hw_register_fixed_rate(NULL, "img_pxl_clk_root", NULL, 0, 600000000);
+-	clks[IMX_HSIO_AXI_CLK]		= clk_hw_register_fixed_rate(NULL, "hsio_axi_clk_root", NULL, 0, 400000000);
+-	clks[IMX_HSIO_PER_CLK]		= clk_hw_register_fixed_rate(NULL, "hsio_per_clk_root", NULL, 0, 133333333);
+-	clks[IMX_LSIO_MEM_CLK]		= clk_hw_register_fixed_rate(NULL, "lsio_mem_clk_root", NULL, 0, 200000000);
+-	clks[IMX_LSIO_BUS_CLK]		= clk_hw_register_fixed_rate(NULL, "lsio_bus_clk_root", NULL, 0, 100000000);
+-
+ 	/* ARM core */
+-	clks[IMX_A35_CLK]		= imx_clk_scu("a35_clk", IMX_SC_R_A35, IMX_SC_PM_CLK_CPU);
++	imx_clk_scu("a35_clk", IMX_SC_R_A35, IMX_SC_PM_CLK_CPU);
++	imx_clk_scu("a53_clk", IMX_SC_R_A53, IMX_SC_PM_CLK_CPU);
++	imx_clk_scu("a72_clk", IMX_SC_R_A72, IMX_SC_PM_CLK_CPU);
+ 
+ 	/* LSIO SS */
+-	clks[IMX_LSIO_PWM0_CLK]		= imx_clk_scu("pwm0_clk", IMX_SC_R_PWM_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM1_CLK]		= imx_clk_scu("pwm1_clk", IMX_SC_R_PWM_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM2_CLK]		= imx_clk_scu("pwm2_clk", IMX_SC_R_PWM_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM3_CLK]		= imx_clk_scu("pwm3_clk", IMX_SC_R_PWM_3, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM4_CLK]		= imx_clk_scu("pwm4_clk", IMX_SC_R_PWM_4, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM5_CLK]		= imx_clk_scu("pwm5_clk", IMX_SC_R_PWM_5, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM6_CLK]		= imx_clk_scu("pwm6_clk", IMX_SC_R_PWM_6, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_PWM7_CLK]		= imx_clk_scu("pwm7_clk", IMX_SC_R_PWM_7, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_GPT0_CLK]		= imx_clk_scu("gpt0_clk", IMX_SC_R_GPT_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_GPT1_CLK]		= imx_clk_scu("gpt1_clk", IMX_SC_R_GPT_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_GPT2_CLK]		= imx_clk_scu("gpt2_clk", IMX_SC_R_GPT_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_GPT3_CLK]		= imx_clk_scu("gpt3_clk", IMX_SC_R_GPT_3, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_GPT4_CLK]		= imx_clk_scu("gpt4_clk", IMX_SC_R_GPT_4, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_FSPI0_CLK]	= imx_clk_scu("fspi0_clk", IMX_SC_R_FSPI_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_LSIO_FSPI1_CLK]	= imx_clk_scu("fspi1_clk", IMX_SC_R_FSPI_1, IMX_SC_PM_CLK_PER);
+-
+-	/* ADMA SS */
+-	clks[IMX_ADMA_UART0_CLK]	= imx_clk_scu("uart0_clk", IMX_SC_R_UART_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_UART1_CLK]	= imx_clk_scu("uart1_clk", IMX_SC_R_UART_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_UART2_CLK]	= imx_clk_scu("uart2_clk", IMX_SC_R_UART_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_UART3_CLK]	= imx_clk_scu("uart3_clk", IMX_SC_R_UART_3, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_SPI0_CLK]		= imx_clk_scu("spi0_clk",  IMX_SC_R_SPI_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_SPI1_CLK]		= imx_clk_scu("spi1_clk",  IMX_SC_R_SPI_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_SPI2_CLK]		= imx_clk_scu("spi2_clk",  IMX_SC_R_SPI_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_SPI3_CLK]		= imx_clk_scu("spi3_clk",  IMX_SC_R_SPI_3, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_CAN0_CLK]		= imx_clk_scu("can0_clk",  IMX_SC_R_CAN_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_I2C0_CLK]		= imx_clk_scu("i2c0_clk",  IMX_SC_R_I2C_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_I2C1_CLK]		= imx_clk_scu("i2c1_clk",  IMX_SC_R_I2C_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_I2C2_CLK]		= imx_clk_scu("i2c2_clk",  IMX_SC_R_I2C_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_I2C3_CLK]		= imx_clk_scu("i2c3_clk",  IMX_SC_R_I2C_3, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_FTM0_CLK]		= imx_clk_scu("ftm0_clk",  IMX_SC_R_FTM_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_FTM1_CLK]		= imx_clk_scu("ftm1_clk",  IMX_SC_R_FTM_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_ADC0_CLK]		= imx_clk_scu("adc0_clk",  IMX_SC_R_ADC_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_PWM_CLK]		= imx_clk_scu("pwm_clk",   IMX_SC_R_LCD_0_PWM_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_ADMA_LCD_CLK]		= imx_clk_scu("lcd_clk",   IMX_SC_R_LCD_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm0_clk", IMX_SC_R_PWM_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm1_clk", IMX_SC_R_PWM_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm2_clk", IMX_SC_R_PWM_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm3_clk", IMX_SC_R_PWM_3, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm4_clk", IMX_SC_R_PWM_4, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm5_clk", IMX_SC_R_PWM_5, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm6_clk", IMX_SC_R_PWM_6, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm7_clk", IMX_SC_R_PWM_7, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("gpt1_clk", IMX_SC_R_GPT_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("gpt2_clk", IMX_SC_R_GPT_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("gpt3_clk", IMX_SC_R_GPT_3, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("gpt4_clk", IMX_SC_R_GPT_4, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("fspi0_clk", IMX_SC_R_FSPI_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("fspi1_clk", IMX_SC_R_FSPI_1, IMX_SC_PM_CLK_PER);
++
++	/* DMA SS */
++	imx_clk_scu("uart0_clk", IMX_SC_R_UART_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("uart1_clk", IMX_SC_R_UART_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("uart2_clk", IMX_SC_R_UART_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("uart3_clk", IMX_SC_R_UART_3, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("uart4_clk", IMX_SC_R_UART_4, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("sim0_clk",  IMX_SC_R_EMVSIM_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("spi0_clk",  IMX_SC_R_SPI_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("spi1_clk",  IMX_SC_R_SPI_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("spi2_clk",  IMX_SC_R_SPI_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("spi3_clk",  IMX_SC_R_SPI_3, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("can0_clk",  IMX_SC_R_CAN_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("can1_clk",  IMX_SC_R_CAN_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("can2_clk",  IMX_SC_R_CAN_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("i2c0_clk",  IMX_SC_R_I2C_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("i2c1_clk",  IMX_SC_R_I2C_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("i2c2_clk",  IMX_SC_R_I2C_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("i2c3_clk",  IMX_SC_R_I2C_3, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("i2c4_clk",  IMX_SC_R_I2C_4, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("ftm0_clk",  IMX_SC_R_FTM_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("ftm1_clk",  IMX_SC_R_FTM_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("adc0_clk",  IMX_SC_R_ADC_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pwm_clk",   IMX_SC_R_LCD_0_PWM_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("elcdif_pll", IMX_SC_R_ELCDIF_PLL, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu2("lcd_clk", lcd_sels, ARRAY_SIZE(lcd_sels), IMX_SC_R_LCD_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu2("lcd_pxl_clk", lcd_pxl_sels, ARRAY_SIZE(lcd_pxl_sels), IMX_SC_R_LCD_0, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu("lcd_pxl_bypass_div_clk", IMX_SC_R_LCD_0, IMX_SC_PM_CLK_BYPASS);
++
++
++	/* Audio SS */
++	imx_clk_scu("audio_pll0_clk", IMX_SC_R_AUDIO_PLL_0, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("audio_pll1_clk", IMX_SC_R_AUDIO_PLL_1, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("audio_pll_div_clk0_clk", IMX_SC_R_AUDIO_PLL_0, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu("audio_pll_div_clk1_clk", IMX_SC_R_AUDIO_PLL_1, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu("audio_rec_clk0_clk", IMX_SC_R_AUDIO_PLL_0, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu("audio_rec_clk1_clk", IMX_SC_R_AUDIO_PLL_1, IMX_SC_PM_CLK_MISC1);
+ 
+ 	/* Connectivity */
+-	clks[IMX_CONN_SDHC0_CLK]	= imx_clk_scu("sdhc0_clk", IMX_SC_R_SDHC_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_SDHC1_CLK]	= imx_clk_scu("sdhc1_clk", IMX_SC_R_SDHC_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_SDHC2_CLK]	= imx_clk_scu("sdhc2_clk", IMX_SC_R_SDHC_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_ENET0_ROOT_CLK]	= imx_clk_scu("enet0_clk", IMX_SC_R_ENET_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_ENET0_BYPASS_CLK]	= imx_clk_scu("enet0_bypass_clk", IMX_SC_R_ENET_0, IMX_SC_PM_CLK_BYPASS);
+-	clks[IMX_CONN_ENET0_RGMII_CLK]	= imx_clk_scu("enet0_rgmii_clk", IMX_SC_R_ENET_0, IMX_SC_PM_CLK_MISC0);
+-	clks[IMX_CONN_ENET1_ROOT_CLK]	= imx_clk_scu("enet1_clk", IMX_SC_R_ENET_1, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_ENET1_BYPASS_CLK]	= imx_clk_scu("enet1_bypass_clk", IMX_SC_R_ENET_1, IMX_SC_PM_CLK_BYPASS);
+-	clks[IMX_CONN_ENET1_RGMII_CLK]	= imx_clk_scu("enet1_rgmii_clk", IMX_SC_R_ENET_1, IMX_SC_PM_CLK_MISC0);
+-	clks[IMX_CONN_GPMI_BCH_IO_CLK]	= imx_clk_scu("gpmi_io_clk", IMX_SC_R_NAND, IMX_SC_PM_CLK_MST_BUS);
+-	clks[IMX_CONN_GPMI_BCH_CLK]	= imx_clk_scu("gpmi_bch_clk", IMX_SC_R_NAND, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_USB2_ACLK]	= imx_clk_scu("usb3_aclk_div", IMX_SC_R_USB_2, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CONN_USB2_BUS_CLK]	= imx_clk_scu("usb3_bus_div", IMX_SC_R_USB_2, IMX_SC_PM_CLK_MST_BUS);
+-	clks[IMX_CONN_USB2_LPM_CLK]	= imx_clk_scu("usb3_lpm_div", IMX_SC_R_USB_2, IMX_SC_PM_CLK_MISC);
++	imx_clk_scu("sdhc0_clk", IMX_SC_R_SDHC_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("sdhc1_clk", IMX_SC_R_SDHC_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("sdhc2_clk", IMX_SC_R_SDHC_2, IMX_SC_PM_CLK_PER);
++	if (of_id->data == &imx_clk_scu_rsrc_imx8dxl) {
++		imx_clk_divider_gpr_scu("enet0_ref_div", "conn_enet0_root_clk", IMX_SC_R_ENET_0, IMX_SC_C_CLKDIV);
++	} else {
++		imx_clk_scu("enet0_root_clk", IMX_SC_R_ENET_0, IMX_SC_PM_CLK_PER);
++		imx_clk_divider_gpr_scu("enet0_ref_div", "enet0_root_clk", IMX_SC_R_ENET_0, IMX_SC_C_CLKDIV);
++	}
++	imx_clk_mux_gpr_scu("enet0_rgmii_txc_sel", enet0_rgmii_txc_sels, ARRAY_SIZE(enet0_rgmii_txc_sels), IMX_SC_R_ENET_0, IMX_SC_C_TXCLK);
++	imx_clk_scu("enet0_bypass_clk", IMX_SC_R_ENET_0, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_gate_gpr_scu("enet0_ref_50_clk", "clk_dummy", IMX_SC_R_ENET_0, IMX_SC_C_DISABLE_50, true);
++	imx_clk_scu("enet1_root_clk", IMX_SC_R_ENET_1, IMX_SC_PM_CLK_PER);
++
++	if (of_id->data != &imx_clk_scu_rsrc_imx8dxl) {
++		imx_clk_scu("enet0_rgmii_rx_clk", IMX_SC_R_ENET_0, IMX_SC_PM_CLK_MISC0);
++		imx_clk_scu("enet1_rgmii_rx_clk", IMX_SC_R_ENET_1, IMX_SC_PM_CLK_MISC0);
++		imx_clk_divider_gpr_scu("enet1_ref_div", "enet1_root_clk", IMX_SC_R_ENET_1, IMX_SC_C_CLKDIV);
++		imx_clk_mux_gpr_scu("enet1_rgmii_txc_sel", enet1_rgmii_txc_sels, ARRAY_SIZE(enet1_rgmii_txc_sels), IMX_SC_R_ENET_1, IMX_SC_C_TXCLK);
++	}
++	imx_clk_scu("enet1_bypass_clk", IMX_SC_R_ENET_1, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_gate_gpr_scu("enet1_ref_50_clk", "clk_dummy", IMX_SC_R_ENET_1, IMX_SC_C_DISABLE_50, true);
++	imx_clk_scu("gpmi_io_clk", IMX_SC_R_NAND, IMX_SC_PM_CLK_MST_BUS);
++	imx_clk_scu("gpmi_bch_clk", IMX_SC_R_NAND, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("usb3_aclk_div", IMX_SC_R_USB_2, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("usb3_bus_div", IMX_SC_R_USB_2, IMX_SC_PM_CLK_MST_BUS);
++	imx_clk_scu("usb3_lpm_div", IMX_SC_R_USB_2, IMX_SC_PM_CLK_MISC);
+ 
+ 	/* Display controller SS */
+-	clks[IMX_DC0_DISP0_CLK]		= imx_clk_scu("dc0_disp0_clk", IMX_SC_R_DC_0, IMX_SC_PM_CLK_MISC0);
+-	clks[IMX_DC0_DISP1_CLK]		= imx_clk_scu("dc0_disp1_clk", IMX_SC_R_DC_0, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu2("dc0_disp0_clk", dc0_sels, ARRAY_SIZE(dc0_sels), IMX_SC_R_DC_0, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu2("dc0_disp1_clk", dc0_sels, ARRAY_SIZE(dc0_sels), IMX_SC_R_DC_0, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu("dc0_pll0_clk", IMX_SC_R_DC_0_PLL_0, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("dc0_pll1_clk", IMX_SC_R_DC_0_PLL_1, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("dc0_bypass0_clk", IMX_SC_R_DC_0_VIDEO0, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("dc0_bypass1_clk", IMX_SC_R_DC_0_VIDEO1, IMX_SC_PM_CLK_BYPASS);
++
++	imx_clk_scu2("dc1_disp0_clk", dc1_sels, ARRAY_SIZE(dc1_sels), IMX_SC_R_DC_1, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu2("dc1_disp1_clk", dc1_sels, ARRAY_SIZE(dc1_sels), IMX_SC_R_DC_1, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu("dc1_pll0_clk", IMX_SC_R_DC_1_PLL_0, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("dc1_pll1_clk", IMX_SC_R_DC_1_PLL_1, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("dc1_bypass0_clk", IMX_SC_R_DC_1_VIDEO0, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("dc1_bypass1_clk", IMX_SC_R_DC_1_VIDEO1, IMX_SC_PM_CLK_BYPASS);
+ 
+ 	/* MIPI-LVDS SS */
+-	clks[IMX_MIPI0_I2C0_CLK]	= imx_clk_scu("mipi0_i2c0_clk", IMX_SC_R_MIPI_0_I2C_0, IMX_SC_PM_CLK_MISC2);
+-	clks[IMX_MIPI0_I2C1_CLK]	= imx_clk_scu("mipi0_i2c1_clk", IMX_SC_R_MIPI_0_I2C_1, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("mipi0_bypass_clk", IMX_SC_R_MIPI_0, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("mipi0_pixel_clk", IMX_SC_R_MIPI_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("lvds0_pixel_clk", IMX_SC_R_LVDS_0, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("lvds0_bypass_clk", IMX_SC_R_LVDS_0, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("lvds0_phy_clk", IMX_SC_R_LVDS_0, IMX_SC_PM_CLK_MISC3);
++	imx_clk_scu2("mipi0_dsi_tx_esc_clk", mipi_sels, ARRAY_SIZE(mipi_sels), IMX_SC_R_MIPI_0, IMX_SC_PM_CLK_MST_BUS);
++	imx_clk_scu2("mipi0_dsi_rx_esc_clk", mipi_sels, ARRAY_SIZE(mipi_sels), IMX_SC_R_MIPI_0, IMX_SC_PM_CLK_SLV_BUS);
++	imx_clk_scu2("mipi0_dsi_phy_clk", mipi_sels, ARRAY_SIZE(mipi_sels), IMX_SC_R_MIPI_0, IMX_SC_PM_CLK_PHY);
++	imx_clk_scu("mipi0_i2c0_clk", IMX_SC_R_MIPI_0_I2C_0, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("mipi0_i2c1_clk", IMX_SC_R_MIPI_0_I2C_1, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("mipi0_pwm_clk", IMX_SC_R_MIPI_0_PWM_0, IMX_SC_PM_CLK_PER);
++
++	imx_clk_scu("mipi1_bypass_clk", IMX_SC_R_MIPI_1, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("mipi1_pixel_clk", IMX_SC_R_MIPI_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("lvds1_pixel_clk", IMX_SC_R_LVDS_1, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("lvds1_bypass_clk", IMX_SC_R_LVDS_1, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("lvds1_phy_clk", IMX_SC_R_LVDS_1, IMX_SC_PM_CLK_MISC3);
++	imx_clk_scu2("mipi1_dsi_tx_esc_clk", mipi_sels, ARRAY_SIZE(mipi_sels), IMX_SC_R_MIPI_1, IMX_SC_PM_CLK_MST_BUS);
++	imx_clk_scu2("mipi1_dsi_rx_esc_clk", mipi_sels, ARRAY_SIZE(mipi_sels), IMX_SC_R_MIPI_1, IMX_SC_PM_CLK_SLV_BUS);
++	imx_clk_scu2("mipi1_dsi_phy_clk", mipi_sels, ARRAY_SIZE(mipi_sels), IMX_SC_R_MIPI_1, IMX_SC_PM_CLK_PHY);
++	imx_clk_scu("mipi1_i2c0_clk", IMX_SC_R_MIPI_1_I2C_0, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("mipi1_i2c1_clk", IMX_SC_R_MIPI_1_I2C_1, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("mipi1_pwm_clk", IMX_SC_R_MIPI_1_PWM_0, IMX_SC_PM_CLK_PER);
++
++	imx_clk_scu("lvds0_i2c0_clk", IMX_SC_R_LVDS_0_I2C_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("lvds0_pwm0_clk", IMX_SC_R_LVDS_0_PWM_0, IMX_SC_PM_CLK_PER);
++
++	imx_clk_scu("lvds1_i2c0_clk", IMX_SC_R_LVDS_1_I2C_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("lvds1_pwm0_clk", IMX_SC_R_LVDS_1_PWM_0, IMX_SC_PM_CLK_PER);
+ 
+ 	/* MIPI CSI SS */
+-	clks[IMX_CSI0_CORE_CLK]		= imx_clk_scu("mipi_csi0_core_clk", IMX_SC_R_CSI_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CSI0_ESC_CLK]		= imx_clk_scu("mipi_csi0_esc_clk",  IMX_SC_R_CSI_0, IMX_SC_PM_CLK_MISC);
+-	clks[IMX_CSI0_I2C0_CLK]		= imx_clk_scu("mipi_csi0_i2c0_clk", IMX_SC_R_CSI_0_I2C_0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_CSI0_PWM0_CLK]		= imx_clk_scu("mipi_csi0_pwm0_clk", IMX_SC_R_CSI_0_PWM_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("mipi_csi0_core_clk", IMX_SC_R_CSI_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("mipi_csi0_esc_clk",  IMX_SC_R_CSI_0, IMX_SC_PM_CLK_MISC);
++	imx_clk_scu("mipi_csi0_i2c0_clk", IMX_SC_R_CSI_0_I2C_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("mipi_csi0_pwm0_clk", IMX_SC_R_CSI_0_PWM_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("mipi_csi1_core_clk", IMX_SC_R_CSI_1, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("mipi_csi1_esc_clk",  IMX_SC_R_CSI_1, IMX_SC_PM_CLK_MISC);
++	imx_clk_scu("mipi_csi1_i2c0_clk", IMX_SC_R_CSI_1_I2C_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("mipi_csi1_pwm0_clk", IMX_SC_R_CSI_1_PWM_0, IMX_SC_PM_CLK_PER);
++
++	/* Parallel Interface SS */
++	imx_clk_scu("pi_dpll_clk", IMX_SC_R_PI_0_PLL, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu2("pi_per_div_clk", pll0_sels, ARRAY_SIZE(pll0_sels), IMX_SC_R_PI_0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("pi_mclk_div_clk", IMX_SC_R_PI_0, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu("pi_i2c0_div_clk", IMX_SC_R_PI_0_I2C_0, IMX_SC_PM_CLK_PER);
+ 
+ 	/* GPU SS */
+-	clks[IMX_GPU0_CORE_CLK]		= imx_clk_scu("gpu_core0_clk",	 IMX_SC_R_GPU_0_PID0, IMX_SC_PM_CLK_PER);
+-	clks[IMX_GPU0_SHADER_CLK]	= imx_clk_scu("gpu_shader0_clk", IMX_SC_R_GPU_0_PID0, IMX_SC_PM_CLK_MISC);
++	imx_clk_scu("gpu_core0_clk",	 IMX_SC_R_GPU_0_PID0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("gpu_shader0_clk", IMX_SC_R_GPU_0_PID0, IMX_SC_PM_CLK_MISC);
+ 
+-	for (i = 0; i < clk_data->num; i++) {
+-		if (IS_ERR(clks[i]))
+-			pr_warn("i.MX clk %u: register failed with %ld\n",
+-				i, PTR_ERR(clks[i]));
+-	}
++	imx_clk_scu("gpu_core1_clk",	 IMX_SC_R_GPU_1_PID0, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("gpu_shader1_clk", IMX_SC_R_GPU_1_PID0, IMX_SC_PM_CLK_MISC);
++	 /* CM40 SS */
++	imx_clk_scu("cm40_i2c_div", IMX_SC_R_M4_0_I2C, IMX_SC_PM_CLK_PER);
++	imx_clk_scu("cm40_lpuart_div", IMX_SC_R_M4_0_UART, IMX_SC_PM_CLK_PER);
+ 
+-	return of_clk_add_hw_provider(ccm_node, of_clk_hw_onecell_get, clk_data);
+-}
++	 /* CM41 SS */
++	imx_clk_scu("cm41_i2c_div", IMX_SC_R_M4_1_I2C, IMX_SC_PM_CLK_PER);
+ 
+-static const struct of_device_id imx8qxp_match[] = {
+-	{ .compatible = "fsl,scu-clk", },
+-	{ .compatible = "fsl,imx8qxp-clk", },
+-	{ /* sentinel */ }
+-};
++	/* HDMI TX SS */
++	imx_clk_scu("hdmi_dig_pll_clk",  IMX_SC_R_HDMI_PLL_0, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu("hdmi_av_pll_clk", IMX_SC_R_HDMI_PLL_1, IMX_SC_PM_CLK_PLL);
++	imx_clk_scu2("hdmi_pixel_mux_clk", hdmi_sels, ARRAY_SIZE(hdmi_sels), IMX_SC_R_HDMI, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu2("hdmi_pixel_link_clk", hdmi_sels, ARRAY_SIZE(hdmi_sels), IMX_SC_R_HDMI, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu("hdmi_ipg_clk", IMX_SC_R_HDMI, IMX_SC_PM_CLK_MISC4);
++	imx_clk_scu("hdmi_i2c0_clk", IMX_SC_R_HDMI_I2C_0, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("hdmi_hdp_core_clk", IMX_SC_R_HDMI, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu2("hdmi_pxl_clk", hdmi_sels, ARRAY_SIZE(hdmi_sels), IMX_SC_R_HDMI, IMX_SC_PM_CLK_MISC3);
++	imx_clk_scu("hdmi_i2s_bypass_clk", IMX_SC_R_HDMI_I2S, IMX_SC_PM_CLK_BYPASS);
++	imx_clk_scu("hdmi_i2s_clk", IMX_SC_R_HDMI_I2S, IMX_SC_PM_CLK_MISC0);
++
++	/* HDMI RX SS */
++	imx_clk_scu("hdmi_rx_i2s_bypass_clk", IMX_SC_R_HDMI_RX_BYPASS, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu("hdmi_rx_spdif_bypass_clk", IMX_SC_R_HDMI_RX_BYPASS, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu("hdmi_rx_bypass_clk", IMX_SC_R_HDMI_RX_BYPASS, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("hdmi_rx_i2c0_clk", IMX_SC_R_HDMI_RX_I2C_0, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("hdmi_rx_pwm_clk", IMX_SC_R_HDMI_RX_PWM_0, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu("hdmi_rx_spdif_clk", IMX_SC_R_HDMI_RX, IMX_SC_PM_CLK_MISC0);
++	imx_clk_scu2("hdmi_rx_hd_ref_clk", hdmi_rx_sels, ARRAY_SIZE(hdmi_rx_sels), IMX_SC_R_HDMI_RX, IMX_SC_PM_CLK_MISC1);
++	imx_clk_scu2("hdmi_rx_hd_core_clk", hdmi_rx_sels, ARRAY_SIZE(hdmi_rx_sels), IMX_SC_R_HDMI_RX, IMX_SC_PM_CLK_MISC2);
++	imx_clk_scu2("hdmi_rx_pxl_clk", hdmi_rx_sels, ARRAY_SIZE(hdmi_rx_sels), IMX_SC_R_HDMI_RX, IMX_SC_PM_CLK_MISC3);
++	imx_clk_scu("hdmi_rx_i2s_clk", IMX_SC_R_HDMI_RX, IMX_SC_PM_CLK_MISC4);
++
++	return of_clk_add_hw_provider(ccm_node, imx_scu_of_clk_src_get, imx_scu_clks);
++}
+ 
+ static struct platform_driver imx8qxp_clk_driver = {
+ 	.driver = {
+@@ -151,7 +307,12 @@ static struct platform_driver imx8qxp_clk_driver = {
+ 	},
+ 	.probe = imx8qxp_clk_probe,
+ };
+-module_platform_driver(imx8qxp_clk_driver);
++
++static int __init imx8qxp_clk_driver_init(void)
++{
++	return platform_driver_register(&imx8qxp_clk_driver);
++}
++subsys_initcall_sync(imx8qxp_clk_driver_init);
+ 
+ MODULE_AUTHOR("Aisheng Dong <aisheng.dong@nxp.com>");
+ MODULE_DESCRIPTION("NXP i.MX8QXP clock driver");
+diff --git a/drivers/clk/imx/clk-lpcg-scu.c b/drivers/clk/imx/clk-lpcg-scu.c
+index 1f0e44f92..a2a78a3df 100644
+--- a/drivers/clk/imx/clk-lpcg-scu.c
++++ b/drivers/clk/imx/clk-lpcg-scu.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/bits.h>
+ #include <linux/clk-provider.h>
++#include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
+@@ -34,10 +35,38 @@ struct clk_lpcg_scu {
+ 	void __iomem *reg;
+ 	u8 bit_idx;
+ 	bool hw_gate;
++
++	/* for state save&restore */
++	u32 state;
+ };
+ 
+ #define to_clk_lpcg_scu(_hw) container_of(_hw, struct clk_lpcg_scu, hw)
+ 
++/* e10858 -LPCG clock gating register synchronization errata */
++static void do_lpcg_workaround(u32 rate, void __iomem *reg, u32 val)
++{
++	writel(val, reg);
++
++	if (rate >= 24000000 || rate == 0) {
++		u32 reg1;
++
++		/*
++		 * The time taken to access the LPCG registers from the AP core
++		 * through the interconnect is longer than the minimum delay
++		 * of 4 clock cycles required by the errata.
++		 * Adding a readl will provide sufficient delay to prevent
++		 * back-to-back writes.
++		 */
++		reg1 = readl(reg);
++	} else {
++		/*
++		 * For clocks running below 24MHz, wait a minimum of
++		 * 4 clock cycles.
++		 */
++		ndelay(4 * (DIV_ROUND_UP(1000000000, rate)));
++	}
++}
++
+ static int clk_lpcg_scu_enable(struct clk_hw *hw)
+ {
+ 	struct clk_lpcg_scu *clk = to_clk_lpcg_scu(hw);
+@@ -54,7 +83,8 @@ static int clk_lpcg_scu_enable(struct clk_hw *hw)
+ 		val |= CLK_GATE_SCU_LPCG_HW_SEL;
+ 
+ 	reg |= val << clk->bit_idx;
+-	writel(reg, clk->reg);
++
++	do_lpcg_workaround(clk_hw_get_rate(hw), clk->reg, reg);
+ 
+ 	spin_unlock_irqrestore(&imx_lpcg_scu_lock, flags);
+ 
+@@ -71,7 +101,7 @@ static void clk_lpcg_scu_disable(struct clk_hw *hw)
+ 
+ 	reg = readl_relaxed(clk->reg);
+ 	reg &= ~(CLK_GATE_SCU_LPCG_MASK << clk->bit_idx);
+-	writel(reg, clk->reg);
++	do_lpcg_workaround(clk_hw_get_rate(hw), clk->reg, reg);
+ 
+ 	spin_unlock_irqrestore(&imx_lpcg_scu_lock, flags);
+ }
+@@ -81,9 +111,9 @@ static const struct clk_ops clk_lpcg_scu_ops = {
+ 	.disable = clk_lpcg_scu_disable,
+ };
+ 
+-struct clk_hw *imx_clk_lpcg_scu(const char *name, const char *parent_name,
+-				unsigned long flags, void __iomem *reg,
+-				u8 bit_idx, bool hw_gate)
++struct clk_hw *__imx_clk_lpcg_scu(struct device *dev, const char *name,
++				  const char *parent_name, unsigned long flags,
++				  void __iomem *reg, u8 bit_idx, bool hw_gate)
+ {
+ 	struct clk_lpcg_scu *clk;
+ 	struct clk_init_data init;
+@@ -107,11 +137,47 @@ struct clk_hw *imx_clk_lpcg_scu(const char *name, const char *parent_name,
+ 	clk->hw.init = &init;
+ 
+ 	hw = &clk->hw;
+-	ret = clk_hw_register(NULL, hw);
++	ret = clk_hw_register(dev, hw);
+ 	if (ret) {
+ 		kfree(clk);
+-		hw = ERR_PTR(ret);
++		return ERR_PTR(ret);
+ 	}
+ 
++	if (dev)
++		dev_set_drvdata(dev, clk);
++
+ 	return hw;
+ }
++
++int __maybe_unused imx_clk_lpcg_scu_suspend(struct device *dev)
++{
++	struct clk_lpcg_scu *clk = dev_get_drvdata(dev);
++
++	if (!strncmp("hdmi_lpcg", clk_hw_get_name(&clk->hw), strlen("hdmi_lpcg")))
++		return 0;
++
++	clk->state = readl_relaxed(clk->reg);
++	dev_dbg(dev, "save lpcg state 0x%x\n", clk->state);
++
++	return 0;
++}
++
++int __maybe_unused imx_clk_lpcg_scu_resume(struct device *dev)
++{
++	struct clk_lpcg_scu *clk = dev_get_drvdata(dev);
++
++	if (!strncmp("hdmi_lpcg", clk_hw_get_name(&clk->hw), strlen("hdmi_lpcg")))
++		return 0;
++
++	/* FIXME: double write in case a failure */
++	writel(clk->state, clk->reg);
++	do_lpcg_workaround(0, clk->reg, clk->state);
++	dev_dbg(dev, "restore lpcg state 0x%x\n", clk->state);
++
++	return 0;
++}
++
++const struct dev_pm_ops imx_clk_lpcg_scu_pm_ops = {
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(imx_clk_lpcg_scu_suspend,
++				      imx_clk_lpcg_scu_resume)
++};
+diff --git a/drivers/clk/imx/clk-pfd.c b/drivers/clk/imx/clk-pfd.c
+index 5d2a9a3be..6c39b8c5a 100644
+--- a/drivers/clk/imx/clk-pfd.c
++++ b/drivers/clk/imx/clk-pfd.c
+@@ -5,9 +5,11 @@
+  */
+ 
+ #include <linux/clk-provider.h>
++#include <linux/imx_sema4.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
+ #include <linux/err.h>
++#include <soc/imx/src.h>
+ #include "clk.h"
+ 
+ /**
+@@ -32,20 +34,57 @@ struct clk_pfd {
+ #define CLR	0x8
+ #define OTG	0xc
+ 
+-static int clk_pfd_enable(struct clk_hw *hw)
++static void clk_pfd_do_hardware(struct clk_pfd *pfd, bool enable)
++{
++	if (enable)
++		writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + CLR);
++	else
++		writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + SET);
++}
++
++static void clk_pfd_do_shared_clks(struct clk_hw *hw, bool enable)
+ {
+ 	struct clk_pfd *pfd = to_clk_pfd(hw);
+ 
+-	writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + CLR);
++	if (imx_src_is_m4_enabled() && clk_on_imx6sx()) {
++#ifdef CONFIG_SOC_IMX6SX
++		if (!amp_power_mutex || !shared_mem) {
++			if (enable)
++				clk_pfd_do_hardware(pfd, enable);
++			return;
++		}
++
++		imx_sema4_mutex_lock(amp_power_mutex);
++		if (shared_mem->ca9_valid != SHARED_MEM_MAGIC_NUMBER ||
++			shared_mem->cm4_valid != SHARED_MEM_MAGIC_NUMBER) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		if (!imx_update_shared_mem(hw, enable)) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		clk_pfd_do_hardware(pfd, enable);
++
++		imx_sema4_mutex_unlock(amp_power_mutex);
++#endif
++	} else {
++		clk_pfd_do_hardware(pfd, enable);
++	}
++}
++
++static int clk_pfd_enable(struct clk_hw *hw)
++{
++	clk_pfd_do_shared_clks(hw, true);
+ 
+ 	return 0;
+ }
+ 
+ static void clk_pfd_disable(struct clk_hw *hw)
+ {
+-	struct clk_pfd *pfd = to_clk_pfd(hw);
+-
+-	writel_relaxed(1 << ((pfd->idx + 1) * 8 - 1), pfd->reg + SET);
++	clk_pfd_do_shared_clks(hw, false);
+ }
+ 
+ static unsigned long clk_pfd_recalc_rate(struct clk_hw *hw,
+diff --git a/drivers/clk/imx/clk-pfdv2.c b/drivers/clk/imx/clk-pfdv2.c
+index 6b744c842..42505669c 100644
+--- a/drivers/clk/imx/clk-pfdv2.c
++++ b/drivers/clk/imx/clk-pfdv2.c
+@@ -161,8 +161,17 @@ static int clk_pfdv2_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	if (!rate)
+ 		return -EINVAL;
+ 
+-	/* PFD can NOT change rate without gating */
+-	WARN_ON(clk_pfdv2_is_enabled(hw));
++	/*
++	 * PFD can NOT change rate without gating.
++	 * as the PFDs may enabled in HW by default but no
++	 * consumer used it, the enable count is '0', so the
++	 * 'SET_RATE_GATE' can NOT help on blocking the set_rate
++	 * ops especially for 'assigned-clock-xxx'. In order
++	 * to simplify the case, just disable the PFD if it is
++	 * enabled in HW but not in SW.
++	 */
++	if (clk_pfdv2_is_enabled(hw))
++		clk_pfdv2_disable(hw);
+ 
+ 	tmp = tmp * 18 + rate / 2;
+ 	do_div(tmp, rate);
+@@ -191,8 +200,8 @@ static const struct clk_ops clk_pfdv2_ops = {
+ 	.is_enabled     = clk_pfdv2_is_enabled,
+ };
+ 
+-struct clk_hw *imx_clk_hw_pfdv2(const char *name, const char *parent_name,
+-			     void __iomem *reg, u8 idx)
++struct clk_hw *imx_clk_hw_pfdv2(enum imx_pfdv2_type type, const char *name,
++			     const char *parent_name, void __iomem *reg, u8 idx)
+ {
+ 	struct clk_init_data init;
+ 	struct clk_pfdv2 *pfd;
+@@ -214,7 +223,10 @@ struct clk_hw *imx_clk_hw_pfdv2(const char *name, const char *parent_name,
+ 	init.ops = &clk_pfdv2_ops;
+ 	init.parent_names = &parent_name;
+ 	init.num_parents = 1;
+-	init.flags = CLK_SET_RATE_GATE | CLK_SET_RATE_PARENT;
++	if (type == IMX_PFDV2_IMX7ULP)
++		init.flags = CLK_SET_RATE_GATE | CLK_SET_RATE_PARENT;
++	else
++		init.flags = CLK_SET_RATE_GATE;
+ 
+ 	pfd->hw.init = &init;
+ 
+diff --git a/drivers/clk/imx/clk-pll14xx.c b/drivers/clk/imx/clk-pll14xx.c
+index aba36e421..f7cfc5fea 100644
+--- a/drivers/clk/imx/clk-pll14xx.c
++++ b/drivers/clk/imx/clk-pll14xx.c
+@@ -137,9 +137,12 @@ static unsigned long clk_pll1443x_recalc_rate(struct clk_hw *hw,
+ 						  unsigned long parent_rate)
+ {
+ 	struct clk_pll14xx *pll = to_clk_pll14xx(hw);
++	const struct imx_pll14xx_rate_table *rate_table = pll->rate_table;
+ 	u32 mdiv, pdiv, sdiv, pll_div_ctl0, pll_div_ctl1;
+ 	short int kdiv;
+ 	u64 fvco = parent_rate;
++	long rate = 0;
++	int i;
+ 
+ 	pll_div_ctl0 = readl_relaxed(pll->base + 4);
+ 	pll_div_ctl1 = readl_relaxed(pll->base + 8);
+@@ -148,13 +151,25 @@ static unsigned long clk_pll1443x_recalc_rate(struct clk_hw *hw,
+ 	sdiv = (pll_div_ctl0 & SDIV_MASK) >> SDIV_SHIFT;
+ 	kdiv = pll_div_ctl1 & KDIV_MASK;
+ 
++	/*
++	 * Sometimes, the recalculated rate has deviation due to
++	 * the frac part. So find the accurate pll rate from the table
++	 * first, if no match rate in the table, use the rate calculated
++	 * from the equation below.
++	 */
++	for (i = 0; i < pll->rate_count; i++) {
++		if (rate_table[i].pdiv == pdiv && rate_table[i].mdiv == mdiv &&
++		    rate_table[i].sdiv == sdiv && rate_table[i].kdiv == kdiv)
++			rate = rate_table[i].rate;
++	}
++
+ 	/* fvco = (m * 65536 + k) * Fin / (p * 65536) */
+ 	fvco *= (mdiv * 65536 + kdiv);
+ 	pdiv *= 65536;
+ 
+ 	do_div(fvco, pdiv << sdiv);
+ 
+-	return fvco;
++	return rate ? (unsigned long) rate : (unsigned long)fvco;
+ }
+ 
+ static inline bool clk_pll14xx_mp_change(const struct imx_pll14xx_rate_table *rate,
+@@ -360,6 +375,26 @@ static void clk_pll14xx_unprepare(struct clk_hw *hw)
+ 	writel_relaxed(val, pll->base + GNRL_CTL);
+ }
+ 
++void clk_set_delta_k(struct clk_hw *hw, short int delta_k)
++{
++	struct clk_pll14xx *pll = to_clk_pll14xx(hw);
++	short int k;
++	u32 val;
++
++	val = readl_relaxed(pll->base + 8);
++	k = (val & KDIV_MASK) + delta_k;
++	writel_relaxed(k << KDIV_SHIFT, pll->base + 8);
++}
++
++void clk_get_pll_setting(struct clk_hw *hw, u32 *pll_div_ctrl0,
++	u32 *pll_div_ctrl1)
++{
++	struct clk_pll14xx *pll = to_clk_pll14xx(hw);
++
++	*pll_div_ctrl0 = readl_relaxed(pll->base + 4);
++	*pll_div_ctrl1 = readl_relaxed(pll->base + 8);
++}
++
+ static const struct clk_ops clk_pll1416x_ops = {
+ 	.prepare	= clk_pll14xx_prepare,
+ 	.unprepare	= clk_pll14xx_unprepare,
+diff --git a/drivers/clk/imx/clk-pllv3.c b/drivers/clk/imx/clk-pllv3.c
+index 20ee9611b..5fd4765e6 100644
+--- a/drivers/clk/imx/clk-pllv3.c
++++ b/drivers/clk/imx/clk-pllv3.c
+@@ -8,9 +8,11 @@
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/imx_sema4.h>
+ #include <linux/slab.h>
+ #include <linux/jiffies.h>
+ #include <linux/err.h>
++#include <soc/imx/src.h>
+ #include "clk.h"
+ 
+ #define PLL_NUM_OFFSET		0x10
+@@ -65,36 +67,82 @@ static int clk_pllv3_wait_lock(struct clk_pllv3 *pll)
+ 	if ((pll->powerup_set && !val) || (!pll->powerup_set && val))
+ 		return 0;
+ 
+-	return readl_relaxed_poll_timeout(pll->base, val, val & BM_PLL_LOCK,
+-					  500, PLL_LOCK_TIMEOUT);
++	if (!(imx_src_is_m4_enabled() && clk_on_imx6sx()))
++		return readl_relaxed_poll_timeout(pll->base, val, val & BM_PLL_LOCK,
++						  500, PLL_LOCK_TIMEOUT);
++	else
++		return readl_relaxed_poll_timeout_atomic(pll->base, val, val & BM_PLL_LOCK,
++						  10, PLL_LOCK_TIMEOUT);
+ }
+ 
+-static int clk_pllv3_prepare(struct clk_hw *hw)
++static int clk_pllv3_do_hardware(struct clk_hw *hw, bool enable)
+ {
+ 	struct clk_pllv3 *pll = to_clk_pllv3(hw);
++	int ret;
+ 	u32 val;
+ 
+ 	val = readl_relaxed(pll->base);
+-	if (pll->powerup_set)
+-		val |= pll->power_bit;
+-	else
+-		val &= ~pll->power_bit;
+-	writel_relaxed(val, pll->base);
++	if (enable) {
++		if (pll->powerup_set)
++			val |= pll->power_bit;
++		else
++			val &= ~pll->power_bit;
++		writel_relaxed(val, pll->base);
++
++		ret = clk_pllv3_wait_lock(pll);
++		if (ret)
++			return ret;
++	} else {
++		if (pll->powerup_set)
++			val &= ~pll->power_bit;
++		else
++			val |= pll->power_bit;
++		writel_relaxed(val, pll->base);
++	}
+ 
+-	return clk_pllv3_wait_lock(pll);
++	return 0;
+ }
+ 
+-static void clk_pllv3_unprepare(struct clk_hw *hw)
++static void clk_pllv3_do_shared_clks(struct clk_hw *hw, bool enable)
+ {
+-	struct clk_pllv3 *pll = to_clk_pllv3(hw);
+-	u32 val;
++	if (imx_src_is_m4_enabled() && clk_on_imx6sx()) {
++#ifdef CONFIG_SOC_IMX6SX
++		if (!amp_power_mutex || !shared_mem) {
++			if (enable)
++				clk_pllv3_do_hardware(hw, enable);
++			return;
++		}
++
++		imx_sema4_mutex_lock(amp_power_mutex);
++		if (shared_mem->ca9_valid != SHARED_MEM_MAGIC_NUMBER ||
++			shared_mem->cm4_valid != SHARED_MEM_MAGIC_NUMBER) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++
++		if (!imx_update_shared_mem(hw, enable)) {
++			imx_sema4_mutex_unlock(amp_power_mutex);
++			return;
++		}
++		clk_pllv3_do_hardware(hw, enable);
++
++		imx_sema4_mutex_unlock(amp_power_mutex);
++#endif
++	} else {
++		clk_pllv3_do_hardware(hw, enable);
++	}
++}
+ 
+-	val = readl_relaxed(pll->base);
+-	if (pll->powerup_set)
+-		val &= ~pll->power_bit;
+-	else
+-		val |= pll->power_bit;
+-	writel_relaxed(val, pll->base);
++static int clk_pllv3_prepare(struct clk_hw *hw)
++{
++	clk_pllv3_do_shared_clks(hw, true);
++
++	return 0;
++}
++
++static void clk_pllv3_unprepare(struct clk_hw *hw)
++{
++	clk_pllv3_do_shared_clks(hw, false);
+ }
+ 
+ static int clk_pllv3_is_prepared(struct clk_hw *hw)
+diff --git a/drivers/clk/imx/clk-pllv4.c b/drivers/clk/imx/clk-pllv4.c
+index 8ec703f27..3c750ccbe 100644
+--- a/drivers/clk/imx/clk-pllv4.c
++++ b/drivers/clk/imx/clk-pllv4.c
+@@ -23,14 +23,17 @@
+ 
+ /* PLL Configuration Register (xPLLCFG) */
+ #define PLL_CFG_OFFSET		0x08
++#define IMX8ULP_PLL_CFG_OFFSET	0x10
+ #define BP_PLL_MULT		16
+ #define BM_PLL_MULT		(0x7f << 16)
+ 
+ /* PLL Numerator Register (xPLLNUM) */
+ #define PLL_NUM_OFFSET		0x10
++#define IMX8ULP_PLL_NUM_OFFSET	0x1c
+ 
+ /* PLL Denominator Register (xPLLDENOM) */
+ #define PLL_DENOM_OFFSET	0x14
++#define IMX8ULP_PLL_DENOM_OFFSET	0x18
+ 
+ #define MAX_MFD			0x3fffffff
+ #define DEFAULT_MFD		1000000
+@@ -38,6 +41,9 @@
+ struct clk_pllv4 {
+ 	struct clk_hw	hw;
+ 	void __iomem	*base;
++	u32		cfg_offset;
++	u32		num_offset;
++	u32		denom_offset;
+ };
+ 
+ /* Valid PLL MULT Table */
+@@ -72,12 +78,12 @@ static unsigned long clk_pllv4_recalc_rate(struct clk_hw *hw,
+ 	u32 mult, mfn, mfd;
+ 	u64 temp64;
+ 
+-	mult = readl_relaxed(pll->base + PLL_CFG_OFFSET);
++	mult = readl_relaxed(pll->base + pll->cfg_offset);
+ 	mult &= BM_PLL_MULT;
+ 	mult >>= BP_PLL_MULT;
+ 
+-	mfn = readl_relaxed(pll->base + PLL_NUM_OFFSET);
+-	mfd = readl_relaxed(pll->base + PLL_DENOM_OFFSET);
++	mfn = readl_relaxed(pll->base + pll->num_offset);
++	mfd = readl_relaxed(pll->base + pll->denom_offset);
+ 	temp64 = parent_rate;
+ 	temp64 *= mfn;
+ 	do_div(temp64, mfd);
+@@ -165,13 +171,13 @@ static int clk_pllv4_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	do_div(temp64, parent_rate);
+ 	mfn = temp64;
+ 
+-	val = readl_relaxed(pll->base + PLL_CFG_OFFSET);
++	val = readl_relaxed(pll->base + pll->cfg_offset);
+ 	val &= ~BM_PLL_MULT;
+ 	val |= mult << BP_PLL_MULT;
+-	writel_relaxed(val, pll->base + PLL_CFG_OFFSET);
++	writel_relaxed(val, pll->base + pll->cfg_offset);
+ 
+-	writel_relaxed(mfn, pll->base + PLL_NUM_OFFSET);
+-	writel_relaxed(mfd, pll->base + PLL_DENOM_OFFSET);
++	writel_relaxed(mfn, pll->base + pll->num_offset);
++	writel_relaxed(mfd, pll->base + pll->denom_offset);
+ 
+ 	return 0;
+ }
+@@ -207,8 +213,8 @@ static const struct clk_ops clk_pllv4_ops = {
+ 	.is_prepared	= clk_pllv4_is_prepared,
+ };
+ 
+-struct clk_hw *imx_clk_hw_pllv4(const char *name, const char *parent_name,
+-			  void __iomem *base)
++struct clk_hw *imx_clk_hw_pllv4(enum imx_pllv4_type type, const char *name,
++		 const char *parent_name, void __iomem *base)
+ {
+ 	struct clk_pllv4 *pll;
+ 	struct clk_hw *hw;
+@@ -221,6 +227,16 @@ struct clk_hw *imx_clk_hw_pllv4(const char *name, const char *parent_name,
+ 
+ 	pll->base = base;
+ 
++	if (type == IMX_PLLV4_IMX8ULP) {
++		pll->cfg_offset = IMX8ULP_PLL_CFG_OFFSET;
++		pll->num_offset = IMX8ULP_PLL_NUM_OFFSET;
++		pll->denom_offset = IMX8ULP_PLL_DENOM_OFFSET;
++	} else {
++		pll->cfg_offset = PLL_CFG_OFFSET;
++		pll->num_offset = PLL_NUM_OFFSET;
++		pll->denom_offset = PLL_DENOM_OFFSET;
++	}
++
+ 	init.name = name;
+ 	init.ops = &clk_pllv4_ops;
+ 	init.parent_names = &parent_name;
+diff --git a/drivers/clk/imx/clk-scu.c b/drivers/clk/imx/clk-scu.c
+index b8b207274..bd71f24f8 100644
+--- a/drivers/clk/imx/clk-scu.c
++++ b/drivers/clk/imx/clk-scu.c
+@@ -6,16 +6,41 @@
+ 
+ #include <dt-bindings/firmware/imx/rsrc.h>
+ #include <linux/arm-smccc.h>
++#include <linux/bsearch.h>
+ #include <linux/clk-provider.h>
+ #include <linux/err.h>
++#include <linux/firmware/imx/svc/rm.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
+ #include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <xen/xen.h>
+ 
+ #include "clk-scu.h"
+ 
+ #define IMX_SIP_CPUFREQ			0xC2000001
+ #define IMX_SIP_SET_CPUFREQ		0x00
++#define MAX_CLUSTER_NUM			2
+ 
+ static struct imx_sc_ipc *ccm_ipc_handle;
++static const struct imx_clk_scu_rsrc_table *rsrc_table;
++struct device_node *pd_np;
++u32 clock_cells;
++
++struct imx_scu_clk_node {
++	const char *name;
++	u32 rsrc;
++	u8 clk_type;
++	const char * const *parents;
++	int num_parents;
++
++	struct clk_hw *hw;
++	struct list_head node;
++};
++
++struct list_head imx_scu_clks[IMX_SC_R_LAST];
+ 
+ /*
+  * struct clk_scu - Description of one SCU clock
+@@ -27,6 +52,26 @@ struct clk_scu {
+ 	struct clk_hw hw;
+ 	u16 rsrc_id;
+ 	u8 clk_type;
++
++	/* for state save&restore */
++	struct clk_hw *parent;
++	u8 parent_index;
++	bool is_enabled;
++	u32 rate;
++};
++
++/*
++ * struct clk_gpr_scu - Description of one gate SCU clock
++ * @hw: the common clk_hw
++ * @rsrc_id: resource ID of this SCU clock
++ * @gpr_id: GPR ID index to control the divider
++ */
++struct clk_gpr_scu {
++	struct clk_hw hw;
++	u16 rsrc_id;
++	u8 gpr_id;
++	u8 flags;
++	bool gate_invert;
+ };
+ 
+ /*
+@@ -54,6 +99,9 @@ struct resp_get_clock_rate {
+ 	__le32 rate;
+ };
+ 
++#define to_clk_mux_gpr_scu(_hw) container_of(_hw, struct clk_mux_gpr_scu, hw)
++#define to_clk_gpr_scu(_hw) container_of(_hw, struct clk_gpr_scu, hw)
++
+ /*
+  * struct imx_sc_msg_get_clock_rate - clock get rate protocol
+  * @hdr: SCU protocol header
+@@ -128,9 +176,48 @@ static inline struct clk_scu *to_clk_scu(struct clk_hw *hw)
+ 	return container_of(hw, struct clk_scu, hw);
+ }
+ 
+-int imx_clk_scu_init(void)
++static int imx_scu_clk_search_cmp(const void *rsrc, const void *rsrc_p)
+ {
+-	return imx_scu_get_handle(&ccm_ipc_handle);
++	return *(u32 *)rsrc - *(u32 *)rsrc_p;
++}
++
++bool imx_scu_clk_is_valid(u32 rsrc_id)
++{
++	void *p;
++
++	if (!rsrc_table)
++		return true;
++
++        p = bsearch(&rsrc_id, rsrc_table->rsrc, rsrc_table->num,
++		    sizeof(rsrc_table->rsrc[0]), imx_scu_clk_search_cmp);
++	return p != NULL;
++}
++
++int imx_clk_scu_init(struct device_node *np, const void *data)
++{
++	struct platform_device *pd_dev;
++	int ret, i;
++
++	ret = imx_scu_get_handle(&ccm_ipc_handle);
++	if (ret)
++		return ret;
++
++	if (of_property_read_u32(np, "#clock-cells", &clock_cells))
++		return -EINVAL;
++
++	if (clock_cells == 2) {
++		for (i = 0; i < IMX_SC_R_LAST; i++)
++			INIT_LIST_HEAD(&imx_scu_clks[i]);
++
++		pd_np = of_find_compatible_node(NULL, NULL, "fsl,scu-pd");
++		pd_dev = of_find_device_by_node(pd_np);
++		if (!pd_dev || !device_is_bound(&pd_dev->dev))
++			return -EPROBE_DEFER;
++
++		rsrc_table = data;
++	}
++
++	return 0;
+ }
+ 
+ /*
+@@ -192,8 +279,10 @@ static int clk_scu_atf_set_cpu_rate(struct clk_hw *hw, unsigned long rate,
+ 	struct arm_smccc_res res;
+ 	unsigned long cluster_id;
+ 
+-	if (clk->rsrc_id == IMX_SC_R_A35)
++	if (clk->rsrc_id == IMX_SC_R_A35 || clk->rsrc_id == IMX_SC_R_A53)
+ 		cluster_id = 0;
++	else if (clk->rsrc_id == IMX_SC_R_A72)
++		cluster_id = 1;
+ 	else
+ 		return -EINVAL;
+ 
+@@ -254,6 +343,8 @@ static u8 clk_scu_get_parent(struct clk_hw *hw)
+ 		return 0;
+ 	}
+ 
++	clk->parent_index = msg.data.resp.parent;
++
+ 	return msg.data.resp.parent;
+ }
+ 
+@@ -262,6 +353,7 @@ static int clk_scu_set_parent(struct clk_hw *hw, u8 index)
+ 	struct clk_scu *clk = to_clk_scu(hw);
+ 	struct imx_sc_msg_set_clock_parent msg;
+ 	struct imx_sc_rpc_msg *hdr = &msg.hdr;
++	int ret;
+ 
+ 	hdr->ver = IMX_SC_RPC_VERSION;
+ 	hdr->svc = IMX_SC_RPC_SVC_PM;
+@@ -272,7 +364,16 @@ static int clk_scu_set_parent(struct clk_hw *hw, u8 index)
+ 	msg.clk = clk->clk_type;
+ 	msg.parent = index;
+ 
+-	return imx_scu_call_rpc(ccm_ipc_handle, &msg, true);
++	ret = imx_scu_call_rpc(ccm_ipc_handle, &msg, true);
++	if (ret) {
++		pr_err("%s: failed to set clock parent %d\n",
++		       clk_hw_get_name(hw), ret);
++		return ret;
++	}
++
++	clk->parent_index = index;
++
++	return 0;
+ }
+ 
+ static int sc_pm_clock_enable(struct imx_sc_ipc *ipc, u16 resource,
+@@ -344,8 +445,15 @@ static const struct clk_ops clk_scu_cpu_ops = {
+ 	.unprepare = clk_scu_unprepare,
+ };
+ 
+-struct clk_hw *__imx_clk_scu(const char *name, const char * const *parents,
+-			     int num_parents, u32 rsrc_id, u8 clk_type)
++static const struct clk_ops clk_scu_pi_ops = {
++	.recalc_rate = clk_scu_recalc_rate,
++	.round_rate  = clk_scu_round_rate,
++	.set_rate    = clk_scu_set_rate,
++};
++
++struct clk_hw *__imx_clk_scu(struct device *dev, const char *name,
++			     const char * const *parents, int num_parents,
++			     u32 rsrc_id, u8 clk_type)
+ {
+ 	struct clk_init_data init;
+ 	struct clk_scu *clk;
+@@ -361,8 +469,10 @@ struct clk_hw *__imx_clk_scu(const char *name, const char * const *parents,
+ 
+ 	init.name = name;
+ 	init.ops = &clk_scu_ops;
+-	if (rsrc_id == IMX_SC_R_A35)
++	if (rsrc_id == IMX_SC_R_A35 || rsrc_id == IMX_SC_R_A53 || rsrc_id == IMX_SC_R_A72)
+ 		init.ops = &clk_scu_cpu_ops;
++	else if (rsrc_id == IMX_SC_R_PI_0_PLL)
++		init.ops = &clk_scu_pi_ops;
+ 	else
+ 		init.ops = &clk_scu_ops;
+ 	init.parent_names = parents;
+@@ -375,14 +485,429 @@ struct clk_hw *__imx_clk_scu(const char *name, const char * const *parents,
+ 	 * clock status from HW instead of using the possible invalid
+ 	 * cached rate.
+ 	 */
+-	init.flags = CLK_GET_RATE_NOCACHE;
++	init.flags = CLK_GET_RATE_NOCACHE | CLK_SET_PARENT_NOCACHE;
++	clk->hw.init = &init;
++
++	hw = &clk->hw;
++	ret = clk_hw_register(dev, hw);
++	if (ret) {
++		kfree(clk);
++		return ERR_PTR(ret);
++	}
++
++	if (dev)
++		dev_set_drvdata(dev, clk);
++
++	return hw;
++}
++
++struct clk_hw *imx_scu_of_clk_src_get(struct of_phandle_args *clkspec,
++				      void *data)
++{
++	unsigned int rsrc = clkspec->args[0];
++	unsigned int idx = clkspec->args[1];
++	struct list_head *scu_clks = data;
++	struct imx_scu_clk_node *clk;
++
++	list_for_each_entry(clk, &scu_clks[rsrc], node) {
++		if (clk->clk_type == idx)
++			return clk->hw;
++	}
++
++	return ERR_PTR(-ENODEV);
++}
++
++static int imx_clk_scu_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct imx_scu_clk_node *clk = dev_get_platdata(dev);
++	struct clk_hw *hw;
++	int ret;
++
++       if (!((clk->rsrc == IMX_SC_R_A35) || (clk->rsrc == IMX_SC_R_A53) ||
++           (clk->rsrc == IMX_SC_R_A72))) {
++		pm_runtime_set_suspended(dev);
++		pm_runtime_set_autosuspend_delay(dev, 50);
++		pm_runtime_use_autosuspend(&pdev->dev);
++		pm_runtime_enable(dev);
++
++		ret = pm_runtime_get_sync(dev);
++		if (ret) {
++			pm_genpd_remove_device(dev);
++			pm_runtime_disable(dev);
++			return ret;
++		}
++	}
++
++	hw = __imx_clk_scu(dev, clk->name, clk->parents, clk->num_parents,
++			   clk->rsrc, clk->clk_type);
++	if (IS_ERR(hw)) {
++		pm_runtime_disable(dev);
++		return PTR_ERR(hw);
++	}
++
++	clk->hw = hw;
++	list_add_tail(&clk->node, &imx_scu_clks[clk->rsrc]);
++
++       if (!((clk->rsrc == IMX_SC_R_A35) || (clk->rsrc == IMX_SC_R_A53) ||
++           (clk->rsrc == IMX_SC_R_A72))) {
++		pm_runtime_mark_last_busy(&pdev->dev);
++		pm_runtime_put_autosuspend(&pdev->dev);
++	}
++
++	dev_dbg(dev, "register SCU clock rsrc:%d type:%d\n", clk->rsrc,
++		clk->clk_type);
++
++	return 0;
++}
++
++int __maybe_unused imx_clk_scu_suspend(struct device *dev)
++{
++	struct clk_scu *clk = dev_get_drvdata(dev);
++	u32 rsrc_id = clk->rsrc_id;
++
++	if ((rsrc_id == IMX_SC_R_A35) || (rsrc_id == IMX_SC_R_A53) ||
++	    (rsrc_id == IMX_SC_R_A72))
++		return 0;
++
++	clk->parent = clk_hw_get_parent(&clk->hw);
++
++	/* DC SS needs to handle bypass clock using non-cached clock rate */
++	if (clk->rsrc_id == IMX_SC_R_DC_0_VIDEO0 ||
++		clk->rsrc_id == IMX_SC_R_DC_0_VIDEO1 ||
++		clk->rsrc_id == IMX_SC_R_DC_1_VIDEO0 ||
++		clk->rsrc_id == IMX_SC_R_DC_1_VIDEO1)
++		clk->rate = clk_scu_recalc_rate(&clk->hw, 0);
++	else
++		clk->rate = clk_hw_get_rate(&clk->hw);
++
++	clk->is_enabled = clk_hw_is_enabled(&clk->hw);
++
++	if (clk->parent)
++		dev_dbg(dev, "save parent %s idx %u\n", clk_hw_get_name(clk->parent),
++			clk->parent_index);
++
++	if (clk->rate)
++		dev_dbg(dev, "save rate %d\n", clk->rate);
++
++	if (clk->is_enabled)
++		dev_dbg(dev, "save enabled state\n");
++
++	return 0;
++}
++
++int __maybe_unused imx_clk_scu_resume(struct device *dev)
++{
++	struct clk_scu *clk = dev_get_drvdata(dev);
++	u32 rsrc_id = clk->rsrc_id;
++	int ret = 0;
++
++	if ((rsrc_id == IMX_SC_R_A35) || (rsrc_id == IMX_SC_R_A53) ||
++	    (rsrc_id == IMX_SC_R_A72))
++		return 0;
++
++	if (clk->parent) {
++		ret = clk_scu_set_parent(&clk->hw, clk->parent_index);
++		dev_dbg(dev, "restore parent %s idx %u %s\n",
++			clk_hw_get_name(clk->parent),
++			clk->parent_index, !ret ? "success" : "failed");
++	}
++
++	if (clk->rate) {
++		ret = clk_scu_set_rate(&clk->hw, clk->rate, 0);
++		dev_dbg(dev, "restore rate %d %s\n", clk->rate,
++			!ret ? "success" : "failed");
++	}
++
++	if (clk->is_enabled && rsrc_id != IMX_SC_R_PI_0_PLL) {
++		ret = clk_scu_prepare(&clk->hw);
++		dev_dbg(dev, "restore enabled state %s\n",
++			!ret ? "success" : "failed");
++	}
++
++	return ret;
++}
++
++const struct dev_pm_ops imx_clk_scu_pm_ops = {
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(imx_clk_scu_suspend,
++				      imx_clk_scu_resume)
++};
++
++static struct platform_driver imx_clk_scu_driver = {
++	.driver = {
++		.name = "imx-scu-clk",
++		.suppress_bind_attrs = true,
++		.pm = &imx_clk_scu_pm_ops,
++	},
++	.probe = imx_clk_scu_probe,
++};
++
++static int __init imx_clk_scu_driver_init(void)
++{
++	return platform_driver_register(&imx_clk_scu_driver);
++}
++subsys_initcall_sync(imx_clk_scu_driver_init);
++
++static int imx_clk_scu_attach_pd(struct device *dev, u32 rsrc_id)
++{
++	struct of_phandle_args genpdspec = {
++		.np = pd_np,
++		.args_count = 1,
++		.args[0] = rsrc_id,
++	};
++
++	if ((rsrc_id == IMX_SC_R_A35) || (rsrc_id == IMX_SC_R_A53) ||
++	    (rsrc_id == IMX_SC_R_A72))
++		return 0;
++
++	/*
++	 * Temp fix to avoid the uart clk attached pd power off uart_0
++	 */
++	if (rsrc_id == IMX_SC_R_UART_0 && xen_initial_domain())
++			return 0;
++
++	return of_genpd_add_device(&genpdspec, dev);
++}
++
++static bool imx_clk_is_resource_owned(u32 rsrc)
++{
++	/*
++	 * A-core resources are special. SCFW reports they are not "owned" by
++	 * current partition but linux can still adjust them for cpufreq.
++	 *
++	 * So force this to return false when running as a VM guest and always
++	 * true otherwise.
++	 */
++	if (rsrc == IMX_SC_R_A53 || rsrc == IMX_SC_R_A72 ||
++	    rsrc == IMX_SC_R_A35) {
++		if (xen_domain() && !xen_initial_domain())
++			return false;
++		return true;
++	}
++
++	return imx_sc_rm_is_resource_owned(ccm_ipc_handle, rsrc);
++}
++
++struct clk_hw *imx_clk_scu_alloc_dev(const char *name,
++				     const char * const *parents,
++				     int num_parents, u32 rsrc_id, u8 clk_type)
++{
++	struct imx_scu_clk_node clk = {
++		.name = name,
++		.rsrc = rsrc_id,
++		.clk_type = clk_type,
++		.parents = parents,
++		.num_parents = num_parents,
++	};
++	struct platform_device *pdev;
++	int ret;
++
++	if (!imx_scu_clk_is_valid(rsrc_id))
++		return NULL;
++
++	if (!imx_clk_is_resource_owned(rsrc_id))
++		return NULL;
++
++	pdev = platform_device_alloc(name, PLATFORM_DEVID_NONE);
++	if (!pdev) {
++		pr_err("%s: failed to allocate scu clk dev rsrc %d type %d\n",
++		       name, rsrc_id, clk_type);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	ret = platform_device_add_data(pdev, &clk, sizeof(clk));
++	if (ret) {
++		platform_device_put(pdev);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	pdev->driver_override = "imx-scu-clk";
++
++	ret = imx_clk_scu_attach_pd(&pdev->dev, rsrc_id);
++	if (ret)
++		pr_warn("%s: failed to attached the power domain %d\n",
++			name, ret);
++
++	platform_device_add(pdev);
++
++	/* For API backwards compatiblilty, simply return NULL for success */
++	return NULL;
++}
++
++static unsigned long clk_gpr_div_scu_recalc_rate(struct clk_hw *hw,
++						 unsigned long parent_rate)
++{
++	struct clk_gpr_scu *clk = to_clk_gpr_scu(hw);
++	unsigned long rate = 0;
++	u32 val;
++	int err;
++
++	err = imx_sc_misc_get_control(ccm_ipc_handle, clk->rsrc_id,
++				      clk->gpr_id, &val);
++
++	rate  = val ? parent_rate / 2 : parent_rate;
++
++	return err ? 0 : rate;
++}
++
++static long clk_gpr_div_scu_round_rate(struct clk_hw *hw, unsigned long rate,
++				   unsigned long *prate)
++{
++	if (rate < *prate)
++		rate = *prate / 2;
++	else
++		rate = *prate;
++
++	return rate;
++}
++
++static int clk_gpr_div_scu_set_rate(struct clk_hw *hw, unsigned long rate,
++				unsigned long parent_rate)
++{
++	struct clk_gpr_scu *clk = to_clk_gpr_scu(hw);
++	uint32_t val;
++	int err;
++
++	val = (rate < parent_rate) ? 1 : 0;
++	err = imx_sc_misc_set_control(ccm_ipc_handle, clk->rsrc_id,
++				      clk->gpr_id, val);
++
++	return err ? -EINVAL : 0;
++}
++
++static const struct clk_ops clk_gpr_div_scu_ops = {
++	.recalc_rate = clk_gpr_div_scu_recalc_rate,
++	.round_rate = clk_gpr_div_scu_round_rate,
++	.set_rate = clk_gpr_div_scu_set_rate,
++};
++
++static u8 clk_gpr_mux_scu_get_parent(struct clk_hw *hw)
++{
++	struct clk_gpr_scu *clk= to_clk_gpr_scu(hw);
++	u32 val = 0;
++
++	imx_sc_misc_get_control(ccm_ipc_handle, clk->rsrc_id,
++				clk->gpr_id, &val);
++
++	return (u8)val;
++}
++
++static int clk_gpr_mux_scu_set_parent(struct clk_hw *hw, u8 index)
++{
++	struct clk_gpr_scu *clk= to_clk_gpr_scu(hw);
++
++	imx_sc_misc_set_control(ccm_ipc_handle,	clk->rsrc_id,
++				clk->gpr_id, index);
++
++	return 0;
++}
++
++static const struct clk_ops clk_gpr_mux_scu_ops = {
++	.get_parent = clk_gpr_mux_scu_get_parent,
++	.set_parent = clk_gpr_mux_scu_set_parent,
++};
++
++static int clk_gpr_gate_scu_prepare(struct clk_hw *hw)
++{
++	struct clk_gpr_scu *clk = to_clk_gpr_scu(hw);
++
++	return imx_sc_misc_set_control(ccm_ipc_handle, clk->rsrc_id,
++				       clk->gpr_id, !clk->gate_invert);
++}
++
++static void clk_gpr_gate_scu_unprepare(struct clk_hw *hw)
++{
++	struct clk_gpr_scu *clk = to_clk_gpr_scu(hw);
++	int ret;
++
++	ret = imx_sc_misc_set_control(ccm_ipc_handle, clk->rsrc_id,
++				      clk->gpr_id, clk->gate_invert);
++	if (ret)
++		pr_err("%s: clk unprepare failed %d\n", clk_hw_get_name(hw),
++		       ret);
++}
++
++static int clk_gpr_gate_scu_is_prepared(struct clk_hw *hw)
++{
++	struct clk_gpr_scu *clk= to_clk_gpr_scu(hw);
++	int ret;
++	u32 val;
++
++	ret = imx_sc_misc_get_control(ccm_ipc_handle, clk->rsrc_id,
++				      clk->gpr_id, &val);
++	if (ret)
++		return ret;
++
++	return clk->gate_invert ? !val : val;
++}
++
++static struct clk_ops clk_gpr_gate_scu_ops = {
++	.prepare = clk_gpr_gate_scu_prepare,
++	.unprepare = clk_gpr_gate_scu_unprepare,
++	.is_prepared = clk_gpr_gate_scu_is_prepared,
++};
++
++struct clk_hw *__imx_clk_gpr_scu(const char *name, const char * const *parent_name,
++				 int num_parents, u32 rsrc_id, u8 gpr_id, u8 flags,
++				 bool invert)
++{
++	struct imx_scu_clk_node *clk_node;
++	struct clk_gpr_scu *clk;
++	struct clk_hw *hw;
++	struct clk_init_data init;
++	int ret;
++
++	if (rsrc_id >= IMX_SC_R_LAST)
++		return NULL;
++
++	if (gpr_id >= IMX_SC_C_LAST)
++		return NULL;
++
++	if (!imx_scu_clk_is_valid(rsrc_id))
++		return ERR_PTR(-EINVAL);
++
++	clk = kzalloc(sizeof(*clk), GFP_KERNEL);
++	if (!clk)
++		return ERR_PTR(-ENOMEM);
++
++	clk_node = kzalloc(sizeof(*clk_node), GFP_KERNEL);
++	if (!clk_node) {
++		kfree(clk);
++		return ERR_PTR(-ENOMEM);
++	};
++
++	/* struct clk_gate_scu assignments */
++	clk->rsrc_id = rsrc_id;
++	clk->gpr_id = gpr_id;
++	clk->flags = flags;
++	clk->gate_invert = invert;
++
++	if (flags & IMX_SCU_GPR_CLK_GATE)
++		init.ops = &clk_gpr_gate_scu_ops;
++
++	if (flags & IMX_SCU_GPR_CLK_DIV)
++		init.ops = &clk_gpr_div_scu_ops;
++
++	if (flags & IMX_SCU_GPR_CLK_MUX)
++		init.ops = &clk_gpr_mux_scu_ops;
++
++	init.flags = 0;
++	init.name = name;
++	init.parent_names = parent_name;
++	init.num_parents = num_parents;
++
+ 	clk->hw.init = &init;
+ 
+ 	hw = &clk->hw;
+ 	ret = clk_hw_register(NULL, hw);
+ 	if (ret) {
+ 		kfree(clk);
++		kfree(clk_node);
+ 		hw = ERR_PTR(ret);
++	} else {
++		clk_node->hw = hw;
++		clk_node->clk_type = gpr_id;
++		list_add_tail(&clk_node->node, &imx_scu_clks[rsrc_id]);
+ 	}
+ 
+ 	return hw;
+diff --git a/drivers/clk/imx/clk-scu.h b/drivers/clk/imx/clk-scu.h
+index 2bcfaf06a..50f883199 100644
+--- a/drivers/clk/imx/clk-scu.h
++++ b/drivers/clk/imx/clk-scu.h
+@@ -8,25 +8,95 @@
+ #define __IMX_CLK_SCU_H
+ 
+ #include <linux/firmware/imx/sci.h>
++#include <linux/of.h>
+ 
+-int imx_clk_scu_init(void);
++#define IMX_SCU_GPR_CLK_GATE	BIT(0)
++#define IMX_SCU_GPR_CLK_DIV	BIT(1)
++#define IMX_SCU_GPR_CLK_MUX	BIT(2)
+ 
+-struct clk_hw *__imx_clk_scu(const char *name, const char * const *parents,
+-			     int num_parents, u32 rsrc_id, u8 clk_type);
++struct imx_clk_scu_rsrc_table {
++	const u32 *rsrc;
++	u8 num;
++};
++
++extern u32 clock_cells;
++extern struct list_head imx_scu_clks[];
++extern const struct dev_pm_ops imx_clk_lpcg_scu_pm_ops;
++extern const struct imx_clk_scu_rsrc_table imx_clk_scu_rsrc_imx8qxp;
++extern const struct imx_clk_scu_rsrc_table imx_clk_scu_rsrc_imx8qm;
++extern const struct imx_clk_scu_rsrc_table imx_clk_scu_rsrc_imx8dxl;
++
++int imx_clk_scu_init(struct device_node *np, const void *data);
++struct clk_hw *imx_scu_of_clk_src_get(struct of_phandle_args *clkspec,
++				      void *data);
++struct clk_hw *imx_clk_scu_alloc_dev(const char *name,
++				     const char * const *parents,
++				     int num_parents, u32 rsrc_id, u8 clk_type);
++
++struct clk_hw *__imx_clk_scu(struct device *dev, const char *name,
++			     const char * const *parents, int num_parents,
++			     u32 rsrc_id, u8 clk_type);
++
++struct clk_hw *__imx_clk_lpcg_scu(struct device *dev, const char *name,
++				  const char *parent_name, unsigned long flags,
++				  void __iomem *reg, u8 bit_idx, bool hw_gate);
++
++struct clk_hw *__imx_clk_gpr_scu(const char *name, const char * const *parent_name,
++				 int num_parents, u32 rsrc_id, u8 gpr_id, u8 flags,
++				 bool invert);
+ 
+ static inline struct clk_hw *imx_clk_scu(const char *name, u32 rsrc_id,
+ 					 u8 clk_type)
+ {
+-	return __imx_clk_scu(name, NULL, 0, rsrc_id, clk_type);
++	if (clock_cells == 2)
++		return imx_clk_scu_alloc_dev(name, NULL, 0, rsrc_id, clk_type);
++	else
++		return __imx_clk_scu(NULL, name, NULL, 0, rsrc_id, clk_type);
+ }
+ 
+ static inline struct clk_hw *imx_clk_scu2(const char *name, const char * const *parents,
+ 					  int num_parents, u32 rsrc_id, u8 clk_type)
+ {
+-	return __imx_clk_scu(name, parents, num_parents, rsrc_id, clk_type);
++	if (clock_cells == 2)
++		return imx_clk_scu_alloc_dev(name, parents, num_parents, rsrc_id, clk_type);
++	else
++		return __imx_clk_scu(NULL, name, parents, num_parents, rsrc_id, clk_type);
+ }
+ 
+-struct clk_hw *imx_clk_lpcg_scu(const char *name, const char *parent_name,
+-				unsigned long flags, void __iomem *reg,
+-				u8 bit_idx, bool hw_gate);
++static inline struct clk_hw *imx_clk_lpcg_scu_dev(struct device *dev, const char *name,
++						  const char *parent_name, unsigned long flags,
++						  void __iomem *reg, u8 bit_idx, bool hw_gate)
++{
++	return __imx_clk_lpcg_scu(dev, name, parent_name, flags, reg,
++				  bit_idx, hw_gate);
++}
++
++static inline struct clk_hw *imx_clk_lpcg_scu(const char *name, const char *parent_name,
++					      unsigned long flags, void __iomem *reg,
++					      u8 bit_idx, bool hw_gate)
++{
++	return __imx_clk_lpcg_scu(NULL, name, parent_name, flags, reg,
++				  bit_idx, hw_gate);
++}
++
++static inline struct clk_hw *imx_clk_gate_gpr_scu(const char *name, const char *parent_name,
++						  u32 rsrc_id, u8 gpr_id, bool invert)
++{
++	return __imx_clk_gpr_scu(name, &parent_name, 1, rsrc_id, gpr_id,
++				 IMX_SCU_GPR_CLK_GATE, invert);
++}
++
++static inline struct clk_hw *imx_clk_divider_gpr_scu(const char *name, const char *parent_name,
++						     u32 rsrc_id, u8 gpr_id)
++{
++	return __imx_clk_gpr_scu(name, &parent_name, 1, rsrc_id, gpr_id,
++				 IMX_SCU_GPR_CLK_DIV, 0);
++}
++
++static inline struct clk_hw *imx_clk_mux_gpr_scu(const char *name, const char * const *parent_names,
++						 int num_parents, u32 rsrc_id, u8 gpr_id)
++{
++	return __imx_clk_gpr_scu(name, parent_names, num_parents, rsrc_id,
++				 gpr_id, IMX_SCU_GPR_CLK_MUX, 0);
++}
+ #endif
+diff --git a/drivers/clk/imx/clk.c b/drivers/clk/imx/clk.c
+index 7cc669934..c323ddbbb 100644
+--- a/drivers/clk/imx/clk.c
++++ b/drivers/clk/imx/clk.c
+@@ -17,6 +17,8 @@
+ DEFINE_SPINLOCK(imx_ccm_lock);
+ EXPORT_SYMBOL_GPL(imx_ccm_lock);
+ 
++bool uart_from_osc;
++
+ void imx_unregister_clocks(struct clk *clks[], unsigned int count)
+ {
+ 	unsigned int i;
+@@ -207,6 +209,14 @@ static int __init imx_clk_disable_uart(void)
+ 	return 0;
+ }
+ late_initcall_sync(imx_clk_disable_uart);
++
++static int __init setup_uart_clk(char *uart_rate)
++{
++       uart_from_osc = true;
++       return 1;
++}
++__setup("uart_from_osc", setup_uart_clk);
++
+ #endif
+ 
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/clk/imx/clk.h b/drivers/clk/imx/clk.h
+index c66e00e87..7f82eea83 100644
+--- a/drivers/clk/imx/clk.h
++++ b/drivers/clk/imx/clk.h
+@@ -5,8 +5,7 @@
+ #include <linux/bits.h>
+ #include <linux/spinlock.h>
+ #include <linux/clk-provider.h>
+-
+-#define IMX_CLK_GATE2_SINGLE_BIT	1
++#include <soc/imx/src.h>
+ 
+ extern spinlock_t imx_ccm_lock;
+ 
+@@ -24,6 +23,9 @@ void imx_unregister_clocks(struct clk *clks[], unsigned int count);
+ void imx_unregister_hw_clocks(struct clk_hw *hws[], unsigned int count);
+ 
+ extern void imx_cscmr1_fixup(u32 *val);
++extern struct imx_sema4_mutex *amp_power_mutex;
++extern struct imx_shared_mem *shared_mem;
++extern bool uart_from_osc;
+ 
+ enum imx_pllv1_type {
+ 	IMX_PLLV1_IMX1,
+@@ -44,6 +46,16 @@ enum imx_pll14xx_type {
+ 	PLL_1443X,
+ };
+ 
++enum imx_pllv4_type {
++	IMX_PLLV4_IMX7ULP,
++	IMX_PLLV4_IMX8ULP,
++};
++
++enum imx_pfdv2_type {
++	IMX_PFDV2_IMX7ULP,
++	IMX_PFDV2_IMX8ULP,
++};
++
+ /* NOTE: Rate table should be kept sorted in descending order. */
+ struct imx_pll14xx_rate_table {
+ 	unsigned int rate;
+@@ -173,6 +185,25 @@ enum imx_pllv3_type {
+ 	IMX_PLLV3_AV_IMX7,
+ };
+ 
++#define MAX_SHARED_CLK_NUMBER		100
++#define SHARED_MEM_MAGIC_NUMBER		0x12345678
++#define MCC_POWER_SHMEM_NUMBER		(6)
++
++struct imx_shared_clk {
++	struct clk *self;
++	struct clk *parent;
++	void *m4_clk;
++	void *m4_clk_parent;
++	u8 ca9_enabled;
++	u8 cm4_enabled;
++};
++
++struct imx_shared_mem {
++	u32 ca9_valid;
++	u32 cm4_valid;
++	struct imx_shared_clk imx_clk[MAX_SHARED_CLK_NUMBER];
++};
++
+ struct clk_hw *imx_clk_hw_pllv3(enum imx_pllv3_type type, const char *name,
+ 		const char *parent_name, void __iomem *base, u32 div_mask);
+ 
+@@ -193,8 +224,8 @@ struct clk_hw *imx_clk_hw_pllv3(enum imx_pllv3_type type, const char *name,
+ 		.kdiv	=	(_k),			\
+ 	}
+ 
+-struct clk_hw *imx_clk_hw_pllv4(const char *name, const char *parent_name,
+-			     void __iomem *base);
++struct clk_hw *imx_clk_hw_pllv4(enum imx_pllv4_type type, const char *name,
++		const char *parent_name, void __iomem *base);
+ 
+ struct clk_hw *clk_hw_register_gate2(struct device *dev, const char *name,
+ 		const char *parent_name, unsigned long flags,
+@@ -217,8 +248,8 @@ struct clk_hw *imx_clk_hw_gate_exclusive(const char *name, const char *parent,
+ struct clk_hw *imx_clk_hw_pfd(const char *name, const char *parent_name,
+ 		void __iomem *reg, u8 idx);
+ 
+-struct clk_hw *imx_clk_hw_pfdv2(const char *name, const char *parent_name,
+-			     void __iomem *reg, u8 idx);
++struct clk_hw *imx_clk_hw_pfdv2(enum imx_pfdv2_type type, const char *name,
++	 const char *parent_name, void __iomem *reg, u8 idx);
+ 
+ struct clk_hw *imx_clk_hw_busy_divider(const char *name, const char *parent_name,
+ 				 void __iomem *reg, u8 shift, u8 width,
+@@ -228,12 +259,25 @@ struct clk_hw *imx_clk_hw_busy_mux(const char *name, void __iomem *reg, u8 shift
+ 			     u8 width, void __iomem *busy_reg, u8 busy_shift,
+ 			     const char * const *parent_names, int num_parents);
+ 
++int imx_update_shared_mem(struct clk_hw *hw, bool enable);
++
++static inline int clk_on_imx6sx(void)
++{
++	return of_machine_is_compatible("fsl,imx6sx");
++}
++
+ struct clk_hw *imx7ulp_clk_hw_composite(const char *name,
+ 				     const char * const *parent_names,
+ 				     int num_parents, bool mux_present,
+ 				     bool rate_present, bool gate_present,
+ 				     void __iomem *reg);
+ 
++struct clk_hw *imx8ulp_clk_hw_composite(const char *name,
++				     const char * const *parent_names,
++				     int num_parents, bool mux_present,
++				     bool rate_present, bool gate_present,
++				     void __iomem *reg, bool has_swrst);
++
+ struct clk_hw *imx_clk_hw_fixup_divider(const char *name, const char *parent,
+ 				  void __iomem *reg, u8 shift, u8 width,
+ 				  void (*fixup)(u32 *val));
+@@ -286,6 +330,15 @@ static inline struct clk_hw *imx_clk_hw_divider(const char *name,
+ 				       reg, shift, width, 0, &imx_ccm_lock);
+ }
+ 
++static inline struct clk_hw *imx_clk_hw_divider_closest(const char *name,
++						const char *parent,
++						void __iomem *reg, u8 shift,
++						u8 width)
++{
++	return clk_hw_register_divider(NULL, name, parent, 0,
++				       reg, shift, width, CLK_DIVIDER_ROUND_CLOSEST, &imx_ccm_lock);
++}
++
+ static inline struct clk_hw *imx_clk_hw_divider_flags(const char *name,
+ 						   const char *parent,
+ 						   void __iomem *reg, u8 shift,
+@@ -383,10 +436,8 @@ static inline struct clk_hw *imx_dev_clk_hw_gate_shared(struct device *dev,
+ 				void __iomem *reg, u8 shift,
+ 				unsigned int *share_count)
+ {
+-	return clk_hw_register_gate2(NULL, name, parent, CLK_SET_RATE_PARENT |
+-					CLK_OPS_PARENT_ENABLE, reg, shift, 0x3,
+-					IMX_CLK_GATE2_SINGLE_BIT,
+-					&imx_ccm_lock, share_count);
++	return clk_hw_register_gate2(dev, name, parent, CLK_SET_RATE_PARENT, reg,
++			shift, 0x1, 0, &imx_ccm_lock, share_count);
+ }
+ 
+ static inline struct clk *imx_clk_gate2_cgr(const char *name,
+@@ -399,7 +450,17 @@ static inline struct clk *imx_clk_gate2_cgr(const char *name,
+ static inline struct clk_hw *imx_clk_hw_gate3(const char *name, const char *parent,
+ 		void __iomem *reg, u8 shift)
+ {
+-	return clk_hw_register_gate(NULL, name, parent,
++	/*
++	 * per design team's suggestion, clk root is NOT consuming
++	 * much power, and clk root enable/disable does NOT have domain
++	 * control, so they suggest to leave clk root always on when
++	 * M4 is enabled.
++	 */
++	if (imx_src_is_m4_enabled())
++		return clk_hw_register_fixed_factor(NULL, name, parent,
++						 CLK_SET_RATE_PARENT, 1, 1);
++	else
++		return clk_hw_register_gate(NULL, name, parent,
+ 			CLK_SET_RATE_PARENT | CLK_OPS_PARENT_ENABLE,
+ 			reg, shift, 0, &imx_ccm_lock);
+ }
+@@ -454,6 +515,15 @@ static inline struct clk_hw *imx_dev_clk_hw_mux(struct device *dev,
+ 			reg, shift, width, 0, &imx_ccm_lock);
+ }
+ 
++static inline struct clk *imx_dev_clk_mux(struct device *dev, const char *name,
++			void __iomem *reg, u8 shift, u8 width,
++			const char * const *parents, int num_parents)
++{
++	return clk_register_mux(dev, name, parents, num_parents,
++			CLK_SET_RATE_NO_REPARENT | CLK_SET_PARENT_GATE,
++			reg, shift, width, 0, &imx_ccm_lock);
++}
++
+ static inline struct clk *imx_clk_mux2(const char *name, void __iomem *reg,
+ 			u8 shift, u8 width, const char * const *parents,
+ 			int num_parents)
+@@ -601,4 +671,7 @@ struct clk_hw *imx_clk_hw_divider_gate(const char *name, const char *parent_name
+ 		unsigned long flags, void __iomem *reg, u8 shift, u8 width,
+ 		u8 clk_divider_flags, const struct clk_div_table *table,
+ 		spinlock_t *lock);
++
++void clk_set_delta_k(struct clk_hw *hw, short int delta_k);
++void clk_get_pll_setting(struct clk_hw *hw, u32 *pll_div_ctrl0, u32 *pll_div_ctrl1);
+ #endif
+diff --git a/drivers/clk/s32/Kconfig b/drivers/clk/s32/Kconfig
+new file mode 100644
+index 000000000..c28bdbbfa
+--- /dev/null
++++ b/drivers/clk/s32/Kconfig
+@@ -0,0 +1,4 @@
++config ARCH_S32_CLK
++	bool "Enable S32 CLK Framework"
++	help
++	  Support for the Clock Framework on S32 SoCs.
+diff --git a/drivers/clk/s32/Makefile b/drivers/clk/s32/Makefile
+new file mode 100644
+index 000000000..169b8b590
+--- /dev/null
++++ b/drivers/clk/s32/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_ARCH_S32_CLK) += clk-core.o
++obj-$(CONFIG_ARCH_S32_CLK) += s32v234/
+diff --git a/drivers/clk/s32/clk-core.c b/drivers/clk/s32/clk-core.c
+new file mode 100644
+index 000000000..a8cca66f7
+--- /dev/null
++++ b/drivers/clk/s32/clk-core.c
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright 2015 Freescale Semiconductor, Inc.
++ * Copyright 2017 NXP
++ */
++
++#include <linux/clk.h>
++#include <linux/err.h>
++#include <linux/of.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include "clk.h"
++
++void __init s32_check_clocks(struct clk *clks[], unsigned int count)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++)
++		if (IS_ERR(clks[i]))
++			pr_err("S32 clk %u: register failed with %ld\n",
++			       i, PTR_ERR(clks[i]));
++}
++
++static struct clk * __init s32_obtain_fixed_clock_from_dt(const char *name)
++{
++	struct of_phandle_args phandle;
++	struct clk *clk = ERR_PTR(-ENODEV);
++	char *path;
++
++	path = kasprintf(GFP_KERNEL, "/clocks/%s", name);
++	if (!path)
++		return ERR_PTR(-ENOMEM);
++
++	phandle.np = of_find_node_by_path(path);
++	kfree(path);
++
++	if (phandle.np) {
++		clk = of_clk_get_from_provider(&phandle);
++		of_node_put(phandle.np);
++	}
++	return clk;
++}
++
++struct clk * __init s32_obtain_fixed_clock(
++			const char *name, unsigned long rate)
++{
++	struct clk *clk;
++
++	clk = s32_obtain_fixed_clock_from_dt(name);
++	if (IS_ERR(clk))
++		clk = s32_clk_fixed(name, rate);
++	return clk;
++}
+diff --git a/drivers/clk/s32/clk.h b/drivers/clk/s32/clk.h
+new file mode 100644
+index 000000000..831006411
+--- /dev/null
++++ b/drivers/clk/s32/clk.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright 2015-2016 Freescale Semiconductor, Inc.
++ * Copyright 2017-2018 NXP
++ */
++
++#ifndef __MACH_S32_CLK_H
++#define __MACH_S32_CLK_H
++
++#include <linux/spinlock.h>
++#include <linux/clk-provider.h>
++
++#define PNAME(x) \
++	static const char *x[] __initconst
++
++void s32_check_clocks(struct clk *clks[], unsigned int count);
++
++struct clk *s32_obtain_fixed_clock(
++			const char *name, unsigned long rate);
++
++static inline struct clk *s32_clk_fixed(const char *name, unsigned long rate)
++{
++	return clk_register_fixed_rate(NULL, name, NULL, 0, rate);
++}
++
++static inline struct clk *s32_clk_divider(const char *name, const char *parent,
++					  void __iomem *reg, u8 shift, u8 width,
++					  spinlock_t *lock)
++{
++	struct clk *tmp_clk = clk_register_divider(NULL, name, parent,
++			      CLK_SET_RATE_PARENT,
++			      reg, shift, width, 0, lock);
++
++	return tmp_clk;
++}
++
++static inline struct clk *s32_clk_mux(const char *name, void __iomem *reg,
++				      u8 shift, u8 width, const char **parents,
++				      u8 num_parents, spinlock_t *lock)
++{
++	return clk_register_mux(NULL, name, parents, num_parents,
++			CLK_SET_RATE_NO_REPARENT, reg, shift,
++			width, 0, lock);
++}
++
++static inline struct clk *s32_clk_fixed_factor(const char *name,
++					       const char *parent,
++					       unsigned int mult,
++					       unsigned int div)
++{
++	return clk_register_fixed_factor(NULL, name, parent,
++			CLK_SET_RATE_PARENT, mult, div);
++}
++
++#endif
+diff --git a/drivers/clk/s32/s32v234/Makefile b/drivers/clk/s32/s32v234/Makefile
+new file mode 100644
+index 000000000..7ddf9f4b5
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_ARCH_S32_CLK) += clk.o clk-plldig.o clk-dfs.o
+diff --git a/drivers/clk/s32/s32v234/clk-dfs.c b/drivers/clk/s32/s32v234/clk-dfs.c
+new file mode 100644
+index 000000000..2bd569e13
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/clk-dfs.c
+@@ -0,0 +1,236 @@
++/*
++ * Copyright 2015-2016 Freescale Semiconductor, Inc.
++ * Copyright 2017-2018 NXP
++ *
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/err.h>
++#include "clk.h"
++
++/**
++ * struct clk_dfs - S32 DFS clock
++ * @clk_hw:	clock source
++ * @reg:	DFS register address
++ * @idx:	the index of DFS encoded in the register
++ *
++ * DFS clock found on S32 series. Each register for DFS has 4 clk_dfs
++ * data encoded, and member idx is used to specify the one.
++ * Only ARMPLL(3 DFS), ENETPLL(4 DFS) and DDRPLL(3 DFS) has DFS outputs.
++ */
++struct clk_dfs {
++	struct clk_hw	hw;
++	void __iomem	*reg;
++	enum s32v234_plldig_type plltype;
++	u8		idx;
++	u32		mfn;
++};
++
++#define to_clk_dfs(_hw) container_of(_hw, struct clk_dfs, hw)
++
++static int get_pllx_dfs_nr(enum s32v234_plldig_type plltype)
++{
++	switch (plltype) {
++	case S32_PLLDIG_ARM:
++		return ARMPLL_DFS_NR;
++	case S32_PLLDIG_ENET:
++		return ENETPLL_DFS_NR;
++	case S32_PLLDIG_DDR:
++		return DDRPLL_DFS_NR;
++	case S32_PLLDIG_PERIPH:
++	case S32_PLLDIG_VIDEO:
++		pr_warn("Current selected PLL has no DFS\n");
++		break;
++	}
++
++	return -EINVAL;
++}
++static unsigned long get_pllx_dfsy_max_rate(enum s32v234_plldig_type plltype,
++					    int dfsno)
++{
++	switch (plltype) {
++	case S32_PLLDIG_ARM:
++		switch (dfsno) {
++		case 0:
++			return ARMPLL_DFS0_MAX_RATE;
++		case 1:
++			return ARMPLL_DFS1_MAX_RATE;
++		case 2:
++			return ARMPLL_DFS2_MAX_RATE;
++		}
++		break;
++	case S32_PLLDIG_ENET:
++		switch (dfsno) {
++		case 0:
++			return ENETPLL_DFS0_MAX_RATE;
++		case 1:
++			return ENETPLL_DFS1_MAX_RATE;
++		case 2:
++			return ENETPLL_DFS2_MAX_RATE;
++		case 3:
++			return ENETPLL_DFS3_MAX_RATE;
++		}
++		break;
++	case S32_PLLDIG_DDR:
++		switch (dfsno) {
++		case 0:
++			return DDRPLL_DFS0_MAX_RATE;
++		case 1:
++			return DDRPLL_DFS1_MAX_RATE;
++		case 2:
++			return DDRPLL_DFS2_MAX_RATE;
++		}
++		break;
++	case S32_PLLDIG_PERIPH:
++	case S32_PLLDIG_VIDEO:
++		pr_warn("Current selected PLL has no DFS.");
++		break;
++	default:
++		pr_warn("Unsupported PLL. Use %d or %d\n",
++			S32_PLLDIG_ARM,	S32_PLLDIG_VIDEO);
++		break;
++	}
++
++	return -EINVAL;
++}
++static int clk_dfs_enable(struct clk_hw *hw)
++{
++	/*
++	 * TODO: When SOC is available, this function
++	 * should be tested and implemented for DFS
++	 * if it is possible
++	 */
++	return 0;
++}
++
++static void clk_dfs_disable(struct clk_hw *hw)
++{
++	/*
++	 * TODO: When SOC is available, this function
++	 * should be tested and implemented for DFS
++	 * if it is possible
++	 */
++}
++
++static unsigned long clk_dfs_recalc_rate(struct clk_hw *hw,
++					 unsigned long parent_rate)
++{
++	struct clk_dfs *dfs = to_clk_dfs(hw);
++	u32 mfn, mfi, rate;
++	u32 dvport = readl_relaxed(DFS_DVPORTn(dfs->reg, dfs->idx));
++
++	mfn = (dvport & DFS_DVPORTn_MFN_MASK) >> DFS_DVPORTn_MFN_OFFSET;
++	mfi = (dvport & DFS_DVPORTn_MFI_MASK) >> DFS_DVPORTn_MFI_OFFSET;
++	mfi <<= 8;
++	rate = parent_rate / (mfi + mfn);
++	rate <<= 8;
++
++	return rate;
++}
++
++static long clk_dfs_round_rate(struct clk_hw *hw, unsigned long rate,
++			       unsigned long *prate)
++{
++	struct clk_dfs *dfs = to_clk_dfs(hw);
++	unsigned long max_allowed_rate;
++
++	max_allowed_rate = get_pllx_dfsy_max_rate(dfs->plltype, dfs->idx);
++
++	if (rate > max_allowed_rate)
++		rate = max_allowed_rate;
++
++	return rate;
++}
++
++static int clk_dfs_set_rate(struct clk_hw *hw, unsigned long rate,
++			    unsigned long parent_rate)
++{
++	struct clk_dfs *dfs = to_clk_dfs(hw);
++	u32 mfi;
++	u32 portreset = readl_relaxed(DFS_PORTRESET(dfs->reg));
++
++	writel_relaxed(DFS_CTRL_DLL_RESET, DFS_CTRL(dfs->reg));
++	writel_relaxed(portreset | ~DFS_PORTRESET_PORTRESET_SET(dfs->idx),
++			DFS_PORTRESET(dfs->reg));
++
++	mfi = parent_rate/rate;
++	writel_relaxed(DFS_DVPORTn_MFI_SET(mfi) |
++		       DFS_DVPORTn_MFN_SET(dfs->mfn),
++		       DFS_DVPORTn(dfs->reg, dfs->idx));
++
++	writel_relaxed(~DFS_CTRL_DLL_RESET, DFS_CTRL(dfs->reg));
++
++	while (readl_relaxed(DFS_PORTSR(dfs->reg)) & (1 << (dfs->idx)))
++		;
++
++	return 0;
++}
++
++static int clk_dfs_is_enabled(struct clk_hw *hw)
++{
++	struct clk_dfs *dfs = to_clk_dfs(hw);
++
++	/* Check if current DFS output port is locked */
++	if (readl_relaxed(DFS_PORTSR(dfs->reg)) & (1 << (dfs->idx)))
++		return 0;
++
++	return 1;
++}
++
++static const struct clk_ops clk_dfs_ops = {
++	.enable		= clk_dfs_enable,
++	.disable	= clk_dfs_disable,
++	.recalc_rate	= clk_dfs_recalc_rate,
++	.round_rate	= clk_dfs_round_rate,
++	.set_rate	= clk_dfs_set_rate,
++	.is_enabled	= clk_dfs_is_enabled,
++};
++
++struct clk *s32v234_clk_dfs(enum s32v234_plldig_type type, const char *name,
++			const char *parent_name, void __iomem *reg,
++			u8 idx, u32 mfn)
++{
++	struct clk_dfs *dfs;
++	struct clk *clk;
++	struct clk_init_data init;
++
++	/* PERIPH and VIDEO PLL do not have DFS */
++	if (type == S32_PLLDIG_PERIPH || type == S32_PLLDIG_VIDEO)
++		return ERR_PTR(-EINVAL);
++
++	/* check if DFS index is valid for current pll */
++	if (idx >= get_pllx_dfs_nr(type))
++		return ERR_PTR(-EINVAL);
++
++	dfs = kzalloc(sizeof(*dfs), GFP_KERNEL);
++	if (!dfs)
++		return ERR_PTR(-ENOMEM);
++
++	dfs->reg = reg;
++	dfs->idx = idx;
++	dfs->mfn = mfn;
++	dfs->plltype = type;
++
++	init.name = name;
++	init.ops = &clk_dfs_ops;
++	init.flags = 0;
++	init.parent_names = &parent_name;
++	init.num_parents = 1;
++
++	dfs->hw.init = &init;
++
++	clk = clk_register(NULL, &dfs->hw);
++	if (IS_ERR(clk))
++		kfree(dfs);
++
++	return clk;
++}
+diff --git a/drivers/clk/s32/s32v234/clk-plldig.c b/drivers/clk/s32/s32v234/clk-plldig.c
+new file mode 100644
+index 000000000..6ed23974e
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/clk-plldig.c
+@@ -0,0 +1,240 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright 2015-2016 Freescale Semiconductor, Inc.
++ * Copyright 2017-2018 NXP
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/slab.h>
++#include <linux/jiffies.h>
++#include <linux/err.h>
++#include "clk.h"
++
++/*
++ * struct clk_plldig - S32 PLLDIG clock
++ * @clk_hw:	   clock source
++ * @base:	   base address of PLL registers
++ * @plldv_mfd:	   multiplication loop factor divider
++ * @plldv_rfdphi:  PHI reduced frequency divider
++ * @plldv_rfdphi1: PHI reduced frequency divider
++ *
++ * PLLDIG clock version 1, found on S32 series.
++ */
++struct clk_plldig {
++	struct clk_hw	hw;
++	void __iomem	*base;
++	enum s32v234_plldig_type type;
++	u32		plldv_mfd;
++	u32		pllfd_mfn;
++	u32		plldv_rfdphi;
++	u32		plldv_rfdphi1;
++};
++
++#define to_clk_plldig(_hw) container_of(_hw, struct clk_plldig, hw)
++
++static unsigned long get_pllx_max_vco_rate(enum s32v234_plldig_type plltype)
++{
++	switch (plltype) {
++	case S32_PLLDIG_PERIPH:
++		return PERIPHPLL_MAX_VCO_RATE;
++	default:
++		pr_warn("Unsupported PLL.\n");
++			return -EINVAL;
++	}
++}
++
++static unsigned long get_pllx_phiy_max_rate(enum s32v234_plldig_type plltype,
++					    unsigned int phino)
++{
++	switch (plltype) {
++	case S32_PLLDIG_PERIPH:
++		switch (phino) {
++		case 0:
++			return PERIPHPLL_MAX_PHI0_MAX_RATE;
++		case 1:
++			return PERIPHPLL_MAX_PHI1_MAX_RATE;
++		default:
++			break;
++		}
++		break;
++	default:
++		pr_warn("Unsupported PLL.\n");
++		break;
++	}
++	return -EINVAL;
++}
++
++static int clk_plldig_prepare(struct clk_hw *hw)
++{
++	return 0;
++}
++
++static void clk_plldig_unprepare(struct clk_hw *hw)
++{
++}
++
++static unsigned long clk_plldig_recalc_rate(struct clk_hw *hw,
++					    unsigned long parent_rate)
++{
++	struct clk_plldig *pll = to_clk_plldig(hw);
++	u32 plldv = readl_relaxed(PLLDIG_PLLDV(pll->base));
++	u32 pllfd = readl_relaxed(PLLDIG_PLLFD(pll->base));
++	u32 prediv, mfd, mfn, vco;
++
++	prediv = (plldv & PLLDIG_PLLDV_PREDIV_MASK)
++			 >> PLLDIG_PLLDV_PREDIV_OFFSET;
++	mfd = (plldv & PLLDIG_PLLDV_MFD_MASK);
++
++	mfn = (pllfd & PLLDIG_PLLFD_MFN_MASK);
++
++	if (prediv == 0)
++		prediv = 1;
++
++	/*
++	 * This formula is from platform reference manual
++	 * (Rev. 1, 6/2015), PLLDIG chapter.
++	 */
++	vco = (parent_rate / prediv) * (mfd + mfn / 20480);
++
++	return vco;
++}
++
++static long clk_plldig_round_rate(struct clk_hw *hw, unsigned long rate,
++				  unsigned long *prate)
++{
++	struct clk_plldig *pll = to_clk_plldig(hw);
++	unsigned long max_allowed_rate = get_pllx_max_vco_rate(pll->type);
++
++	if (rate > max_allowed_rate)
++		rate = max_allowed_rate;
++	else if (rate < MIN_VCO_RATE)
++		rate = MIN_VCO_RATE;
++
++	return rate;
++}
++
++static int clk_plldig_set_rate(struct clk_hw *hw, unsigned long rate,
++			       unsigned long parent_rate)
++{
++	struct clk_plldig *pll = to_clk_plldig(hw);
++	u32 pllfd, prediv;
++
++	unsigned long max_allowed_rate = get_pllx_max_vco_rate(pll->type);
++	unsigned long phi0_max_rate =  get_pllx_phiy_max_rate(pll->type, 0);
++	unsigned long phi1_max_rate =  get_pllx_phiy_max_rate(pll->type, 1);
++
++	if (rate < MIN_VCO_RATE || rate > max_allowed_rate)
++		return -EINVAL;
++
++	if (((rate / pll->plldv_rfdphi) > phi0_max_rate) ||
++	    ((rate / pll->plldv_rfdphi) > phi1_max_rate))
++		return -EINVAL;
++
++	pllfd = readl_relaxed(PLLDIG_PLLFD(pll->base));
++	prediv = (parent_rate / rate) *
++		 (pll->plldv_mfd + pll->pllfd_mfn / 20480);
++
++	writel_relaxed(PLLDIG_PLLDV_RFDPHI1_SET(pll->plldv_rfdphi1) |
++			PLLDIG_PLLDV_RFDPHI_SET(pll->plldv_rfdphi) |
++			PLLDIG_PLLDV_PREDIV_SET(prediv) |
++			PLLDIG_PLLDV_MFD_SET(pll->plldv_mfd),
++			PLLDIG_PLLDV(pll->base));
++
++	writel_relaxed(pllfd | PLLDIG_PLLFD_MFN_SET(pll->pllfd_mfn),
++		       PLLDIG_PLLFD(pll->base));
++
++	/*
++	 * To be implemented the wait_lock or an equivalent state
++	 * return clk_plldig_wait_lock(pll);
++	 */
++	return 0;
++}
++
++static const struct clk_ops clk_plldig_ops = {
++	.prepare	= clk_plldig_prepare,
++	.unprepare	= clk_plldig_unprepare,
++	.recalc_rate	= clk_plldig_recalc_rate,
++	.round_rate	= clk_plldig_round_rate,
++	.set_rate	= clk_plldig_set_rate,
++};
++
++struct clk *s32v234_clk_plldig_phi(enum s32v234_plldig_type type,
++				   const char *name, const char *parent,
++				   void __iomem *base, u32 phi)
++{
++	u32 plldv, rfd_phi;
++
++	if (!base)
++		return ERR_PTR(-ENOMEM);
++
++	plldv = readl_relaxed(PLLDIG_PLLDV(base));
++
++	switch (phi) {
++	/* PHI0 */
++	case 0:
++		rfd_phi = (plldv & PLLDIG_PLLDV_RFDPHI_MASK)
++			  >> PLLDIG_PLLDV_RFDPHI_OFFSET;
++		break;
++	/* PHI1 */
++	case 1:
++		rfd_phi = (plldv & PLLDIG_PLLDV_RFDPHI1_MASK)
++			  >> PLLDIG_PLLDV_RFDPHI1_OFFSET;
++
++		if (rfd_phi == 0)
++			rfd_phi = 1;
++
++		break;
++	default:
++		return ERR_PTR(-EINVAL);
++	}
++
++	return clk_register_fixed_factor(NULL, name, parent,
++			CLK_SET_RATE_PARENT, 1, rfd_phi);
++}
++
++struct clk *s32v234_clk_plldig(enum s32v234_plldig_type type, const char *name,
++			       const char *parent_name, void __iomem *base,
++			       u32 plldv_mfd, u32 pllfd_mfn,
++			       u32 plldv_rfdphi, u32 plldv_rfdphi1)
++{
++	struct clk_plldig *pll;
++	const struct clk_ops *ops;
++	struct clk *clk;
++	struct clk_init_data init;
++
++	if (plldv_rfdphi > PLLDIG_PLLDV_RFDPHI_MAXVALUE)
++		return ERR_PTR(-EINVAL);
++
++	if (plldv_rfdphi1 > PLLDIG_PLLDV_RFDPHI1_MAXVALUE)
++		return ERR_PTR(-EINVAL);
++
++	pll = kzalloc(sizeof(*pll), GFP_KERNEL);
++	if (!pll)
++		return ERR_PTR(-ENOMEM);
++
++	ops = &clk_plldig_ops;
++
++	pll->base = base;
++	pll->type = type;
++	pll->plldv_mfd = plldv_mfd;
++	pll->pllfd_mfn = pllfd_mfn;
++	pll->plldv_rfdphi = plldv_rfdphi;
++	pll->plldv_rfdphi1 = plldv_rfdphi1;
++
++	init.name = name;
++	init.ops = ops;
++	init.flags = 0;
++	init.parent_names = &parent_name;
++	init.num_parents = 1;
++
++	pll->hw.init = &init;
++
++	clk = clk_register(NULL, &pll->hw);
++	if (IS_ERR(clk))
++		kfree(pll);
++
++	return clk;
++}
+diff --git a/drivers/clk/s32/s32v234/clk.c b/drivers/clk/s32/s32v234/clk.c
+new file mode 100644
+index 000000000..ad88c6b45
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/clk.c
+@@ -0,0 +1,299 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright 2015-2016 Freescale Semiconductor, Inc.
++ * Copyright 2017-2018 NXP
++ */
++
++#include <linux/of_address.h>
++#include <linux/clk.h>
++#include <dt-bindings/clock/s32v234-clock.h>
++
++#include "clk.h"
++
++static void __iomem *mc_cgm0_base;
++static void __iomem *mc_cgm1_base;
++static void __iomem *mc_cgm2_base;
++static void __iomem *mc_cgm3_base;
++static void __iomem *mc_me_base;
++static void __iomem *src_base;
++
++DEFINE_SPINLOCK(s32v234_lock);
++
++/* sources for multiplexer clocks, this is used multiple times */
++PNAME(osc_sels) = {"firc", "fxosc", };
++
++PNAME(sys_sels) = {"firc", "fxosc", "armpll_dfs0", };
++
++PNAME(can_sels) = {"firc", "fxosc", "dummy",
++		   "periphpll_phi0_div5", };
++
++PNAME(lin_sels) = {"firc", "fxosc", "dummy",
++		   "periphpll_phi0_div3", "dummy", "dummy",
++		   "dummy", "dummy", "sys6",};
++
++PNAME(sdhc_sels) = {"firc", "fxosc", "dummy", "dummy",
++		    "enetpll_dfs3",};
++
++PNAME(enet_sels) = {"firc", "fxosc", "dummy",
++		    "dummy", "enetpll_phi0",};
++
++PNAME(enet_time_sels) = {"firc", "fxosc", "dummy",
++			 "dummy", "enetpll_phi0",};
++
++static struct clk *clk[S32V234_CLK_END];
++static struct clk_onecell_data clk_data;
++
++static void __init s32v234_clocks_init(struct device_node *mc_cgm0_node)
++{
++	struct device_node *np;
++
++	clk[S32V234_CLK_DUMMY] = s32_clk_fixed("dummy", 0);
++	clk[S32V234_CLK_FXOSC] = s32_obtain_fixed_clock("fxosc", 0);
++	clk[S32V234_CLK_FIRC] = s32_obtain_fixed_clock("firc", 0);
++
++	np = of_find_compatible_node(NULL, NULL, "fsl,s32v234-mc_me");
++	mc_me_base = of_iomap(np, 0);
++	if (WARN_ON(!mc_me_base))
++		return;
++
++	np = of_find_compatible_node(NULL, NULL, "fsl,s32v234-src");
++	src_base = of_iomap(np, 0);
++	if (WARN_ON(!src_base))
++		return;
++
++	np = of_find_compatible_node(NULL, NULL, "fsl,s32v234-mc_cgm1");
++	mc_cgm1_base = of_iomap(np, 0);
++	if (WARN_ON(!mc_cgm1_base))
++		return;
++
++	np = of_find_compatible_node(NULL, NULL, "fsl,s32v234-mc_cgm2");
++	mc_cgm2_base = of_iomap(np, 0);
++	if (WARN_ON(!mc_cgm2_base))
++		return;
++
++	np = of_find_compatible_node(NULL, NULL, "fsl,s32v234-mc_cgm3");
++	mc_cgm3_base = of_iomap(np, 0);
++	if (WARN_ON(!mc_cgm3_base))
++		return;
++
++	np = mc_cgm0_node;
++	mc_cgm0_base = of_iomap(np, 0);
++	if (WARN_ON(!mc_cgm0_base))
++		return;
++
++	enable_cpumodes_onperipheralconfig(mc_me_base, MC_ME_RUN_PCn_DRUN |
++					    MC_ME_RUN_PCn_RUN0 |
++					    MC_ME_RUN_PCn_RUN1 |
++					    MC_ME_RUN_PCn_RUN2 |
++					    MC_ME_RUN_PCn_RUN3,
++					    0);
++
++	/* turn on XOSC and FIRC */
++	enable_clocks_sources(MC_ME_MODE_MC_MVRON, MC_ME_MODE_MC_XOSCON |
++			      MC_ME_MODE_MC_FIRCON,
++			      MC_ME_RUNn_MC(mc_me_base, 0));
++
++	/* transition the core to RUN0 mode */
++	entry_to_target_mode(mc_me_base, MC_ME_MCTL_RUN0);
++
++	clk[S32V234_CLK_ARMPLL_SRC_SEL] = s32_clk_mux("armpll_sel",
++		SRC_GPR1, SRC_GPR1_ARMPLL_SRC_SEL_OFFSET,
++		SRC_GPR1_XPLL_SRC_SEL_SIZE,
++		osc_sels, ARRAY_SIZE(osc_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_PERIPHPLL_SRC_SEL] = s32_clk_mux("periphpll_sel",
++		SRC_GPR1, SRC_GPR1_PERIPHPLL_SRC_SEL_OFFSET,
++		SRC_GPR1_XPLL_SRC_SEL_SIZE,
++		osc_sels, ARRAY_SIZE(osc_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_ENETPLL_SRC_SEL] = s32_clk_mux("enetpll_sel",
++		SRC_GPR1, SRC_GPR1_ENETPLL_SRC_SEL_OFFSET,
++		SRC_GPR1_XPLL_SRC_SEL_SIZE,
++		osc_sels, ARRAY_SIZE(osc_sels), &s32v234_lock);
++
++	/* ARM_PLL */
++	clk[S32V234_CLK_ARMPLL_VCO] = s32v234_clk_plldig(S32_PLLDIG_ARM,
++		"armpll_vco", "armpll_sel", ARMPLL_PLLDIG(mc_cgm0_base),
++		ARMPLL_PLLDIG_PLLDV_MFD, ARMPLL_PLLDIG_PLLDV_MFN,
++		ARMPLL_PLLDIG_PLLDV_RFDPHI0, ARMPLL_PLLDIG_PLLDV_RFDPHI1);
++
++	clk[S32V234_CLK_ARMPLL_PHI0] = s32v234_clk_plldig_phi(S32_PLLDIG_ARM,
++		"armpll_phi0", "armpll_vco",
++		ARMPLL_PLLDIG(mc_cgm0_base), 0);
++
++	clk[S32V234_CLK_ARMPLL_PHI1] = s32v234_clk_plldig_phi(S32_PLLDIG_ARM,
++		"armpll_phi1", "armpll_vco",
++		ARMPLL_PLLDIG(mc_cgm0_base), 1);
++
++	clk[S32V234_CLK_ARMPLL_DFS0] = s32v234_clk_dfs(S32_PLLDIG_ARM,
++		 "armpll_dfs0", "armpll_phi1",
++		 ARMPLL_PLLDIG_DFS(mc_cgm0_base), 0,
++		 ARMPLL_PLLDIG_DFS0_MFN);
++
++	clk[S32V234_CLK_ARMPLL_DFS1] = s32v234_clk_dfs(S32_PLLDIG_ARM,
++		 "armpll_dfs1", "armpll_phi1",
++		 ARMPLL_PLLDIG_DFS(mc_cgm0_base), 1,
++		 ARMPLL_PLLDIG_DFS1_MFN);
++
++	clk[S32V234_CLK_ARMPLL_DFS2] = s32v234_clk_dfs(S32_PLLDIG_ARM,
++		 "armpll_dfs2", "armpll_phi1",
++		 ARMPLL_PLLDIG_DFS(mc_cgm0_base), 2,
++		 ARMPLL_PLLDIG_DFS2_MFN);
++
++	clk[S32V234_CLK_SYS_SEL] = s32_clk_mux("sys_sel",
++		MC_ME_RUNn_MC(mc_me_base, 0),
++		MC_ME_MODE_MC_SYSCLK_OFFSET,
++		MC_ME_MODE_MC_SYSCLK_SIZE,
++		sys_sels, ARRAY_SIZE(sys_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_SYS3] = s32_clk_divider("sys3", "sys_sel",
++		CGM_SC_DCn(mc_cgm0_base, 0), MC_CGM_SC_DCn_PREDIV_OFFSET,
++		MC_CGM_SC_DCn_PREDIV_SIZE, &s32v234_lock);
++
++	clk[S32V234_CLK_SYS6] = s32_clk_divider("sys6", "sys_sel",
++		CGM_SC_DCn(mc_cgm0_base, 1), MC_CGM_SC_DCn_PREDIV_OFFSET,
++		MC_CGM_SC_DCn_PREDIV_SIZE, &s32v234_lock);
++
++	clk[S32V234_CLK_SYS6_DIV2] = s32_clk_divider("sys6_div2", "sys_sel",
++		CGM_SC_DCn(mc_cgm0_base, 2), MC_CGM_SC_DCn_PREDIV_OFFSET,
++		MC_CGM_SC_DCn_PREDIV_SIZE, &s32v234_lock);
++
++	/* PERIPH_PLL */
++	clk[S32V234_CLK_PERIPHPLL_VCO] = s32v234_clk_plldig(S32_PLLDIG_PERIPH,
++		"periphpll_vco", "periphpll_sel",
++		PERIPHPLL_PLLDIG(mc_cgm0_base),
++		PERIPHPLL_PLLDIG_PLLDV_MFD, PERIPHPLL_PLLDIG_PLLDV_MFN,
++		PERIPHPLL_PLLDIG_PLLDV_RFDPHI0,
++		PERIPHPLL_PLLDIG_PLLDV_RFDPHI1);
++
++	clk[S32V234_CLK_PERIPHPLL_PHI0] =
++		s32v234_clk_plldig_phi(S32_PLLDIG_PERIPH,
++		"periphpll_phi0", "periphpll_vco",
++		PERIPHPLL_PLLDIG(mc_cgm0_base), 0);
++
++	clk[S32V234_CLK_PERIPHPLL_PHI1] =
++		s32v234_clk_plldig_phi(S32_PLLDIG_PERIPH,
++		"periphpll_phi1", "periphpll_vco",
++		PERIPHPLL_PLLDIG(mc_cgm0_base), 1);
++
++	clk[S32V234_CLK_PERIPHPLL_PHI0_DIV3] = s32_clk_fixed_factor(
++		"periphpll_phi0_div3", "periphpll_phi0", 1, 3);
++
++	clk[S32V234_CLK_PERIPHPLL_PHI0_DIV5] = s32_clk_fixed_factor(
++		"periphpll_phi0_div5", "periphpll_phi0", 1, 5);
++
++	clk[S32V234_CLK_CAN_SEL] = s32_clk_mux("can_sel",
++		CGM_ACn_SC(mc_cgm0_base, 6),
++		MC_CGM_ACn_SEL_OFFSET,
++		MC_CGM_ACn_SEL_SIZE,
++		can_sels, ARRAY_SIZE(can_sels), &s32v234_lock);
++
++	/* CAN Clock */
++	clk[S32V234_CLK_CAN] = s32_clk_divider("can", "can_sel",
++		CGM_ACn_DCm(mc_cgm0_base, 6, 0),
++		MC_CGM_ACn_DCm_PREDIV_OFFSET,
++		MC_CGM_ACn_DCm_PREDIV_SIZE, &s32v234_lock);
++
++	/* Lin Clock */
++	clk[S32V234_CLK_LIN_SEL] = s32_clk_mux("lin_sel",
++		CGM_ACn_SC(mc_cgm0_base, 3),
++		MC_CGM_ACn_SEL_OFFSET,
++		MC_CGM_ACn_SEL_SIZE,
++		lin_sels, ARRAY_SIZE(lin_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_LIN] = s32_clk_divider("lin", "lin_sel",
++		CGM_ACn_DCm(mc_cgm0_base, 3, 0),
++		MC_CGM_ACn_DCm_PREDIV_OFFSET,
++		MC_CGM_ACn_DCm_PREDIV_SIZE, &s32v234_lock);
++
++	clk[S32V234_CLK_LIN_IPG] = s32_clk_fixed_factor("lin_ipg",
++		"lin", 1, 2);
++
++	/* enable PERIPHPLL */
++	enable_clocks_sources(0, MC_ME_MODE_MC_PERIPHPLL,
++			      MC_ME_RUNn_MC(mc_me_base, 0));
++
++	/* ENET_PLL */
++	clk[S32V234_CLK_ENETPLL_VCO] = s32v234_clk_plldig(S32_PLLDIG_ENET,
++		"enetpll_vco", "enetpll_sel", ENETPLL_PLLDIG(mc_cgm0_base),
++		ENETPLL_PLLDIG_PLLDV_MFD, ENETPLL_PLLDIG_PLLDV_MFN,
++		ENETPLL_PLLDIG_PLLDV_RFDPHI0, ENETPLL_PLLDIG_PLLDV_RFDPHI1);
++
++	clk[S32V234_CLK_ENETPLL_PHI0] = s32v234_clk_plldig_phi(S32_PLLDIG_ENET,
++		"enetpll_phi0", "enetpll_vco",
++		ENETPLL_PLLDIG(mc_cgm0_base), 0);
++
++	clk[S32V234_CLK_ENETPLL_PHI1] = s32v234_clk_plldig_phi(S32_PLLDIG_ENET,
++		"enetpll_phi1", "enetpll_vco",
++		ENETPLL_PLLDIG(mc_cgm0_base), 1);
++
++	clk[S32V234_CLK_ENETPLL_DFS0] = s32v234_clk_dfs(S32_PLLDIG_ENET,
++		 "enetpll_dfs0", "enetpll_phi1",
++		 ENETPLL_PLLDIG_DFS(mc_cgm0_base), 0,
++		 ENETPLL_PLLDIG_DFS0_MFN);
++
++	clk[S32V234_CLK_ENETPLL_DFS1] = s32v234_clk_dfs(S32_PLLDIG_ENET,
++		 "enetpll_dfs1", "enetpll_phi1",
++		 ENETPLL_PLLDIG_DFS(mc_cgm0_base), 1,
++		 ENETPLL_PLLDIG_DFS1_MFN);
++
++	clk[S32V234_CLK_ENETPLL_DFS2] = s32v234_clk_dfs(S32_PLLDIG_ENET,
++		 "enetpll_dfs2", "enetpll_phi1",
++		 ENETPLL_PLLDIG_DFS(mc_cgm0_base), 2,
++		 ENETPLL_PLLDIG_DFS2_MFN);
++
++	clk[S32V234_CLK_ENETPLL_DFS3] = s32v234_clk_dfs(S32_PLLDIG_ENET,
++		 "enetpll_dfs3", "enetpll_phi1",
++		 ENETPLL_PLLDIG_DFS(mc_cgm0_base), 3,
++		 ENETPLL_PLLDIG_DFS3_MFN);
++
++	/* ENET Clock */
++	clk[S32V234_CLK_ENET_SEL] = s32_clk_mux("enet_sel",
++		CGM_ACn_SC(mc_cgm2_base, 2),
++		MC_CGM_ACn_SEL_OFFSET,
++		MC_CGM_ACn_SEL_SIZE,
++		enet_sels, ARRAY_SIZE(enet_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_ENET_TIME_SEL] = s32_clk_mux("enet_time_sel",
++		CGM_ACn_SC(mc_cgm0_base, 7),
++		MC_CGM_ACn_SEL_OFFSET,
++		MC_CGM_ACn_SEL_SIZE,
++		enet_time_sels, ARRAY_SIZE(enet_time_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_ENET] = s32_clk_divider("enet", "enet_sel",
++		CGM_ACn_DCm(mc_cgm2_base, 2, 0),
++		MC_CGM_ACn_DCm_PREDIV_OFFSET,
++		MC_CGM_ACn_DCm_PREDIV_SIZE, &s32v234_lock);
++
++	clk[S32V234_CLK_ENET_TIME] = s32_clk_divider("enet_time",
++		"enet_time_sel",
++		CGM_ACn_DCm(mc_cgm0_base, 7, 1),
++		MC_CGM_ACn_DCm_PREDIV_OFFSET,
++		MC_CGM_ACn_DCm_PREDIV_SIZE, &s32v234_lock);
++
++	/* SDHC Clock */
++	clk[S32V234_CLK_SDHC_SEL] = s32_clk_mux("sdhc_sel",
++		CGM_ACn_SC(mc_cgm0_base, 15),
++		MC_CGM_ACn_SEL_OFFSET,
++		MC_CGM_ACn_SEL_SIZE,
++		sdhc_sels, ARRAY_SIZE(sdhc_sels), &s32v234_lock);
++
++	clk[S32V234_CLK_SDHC] = s32_clk_divider("sdhc", "sdhc_sel",
++		CGM_ACn_DCm(mc_cgm0_base, 15, 0),
++		MC_CGM_ACn_DCm_PREDIV_OFFSET,
++		MC_CGM_ACn_DCm_PREDIV_SIZE, &s32v234_lock);
++
++	/* set the system clock */
++	enable_sysclock(MC_ME_MODE_MC_SYSCLK(0x2),
++			MC_ME_RUNn_MC(mc_me_base, 0));
++
++	/* transition the core to RUN0 mode */
++	entry_to_target_mode(mc_me_base, MC_ME_MCTL_RUN0);
++
++	/* Add the clocks to provider list */
++	clk_data.clks = clk;
++	clk_data.clk_num = ARRAY_SIZE(clk);
++	of_clk_add_provider(np, of_clk_src_onecell_get, &clk_data);
++}
++
++CLK_OF_DECLARE(S32V234, "fsl,s32v234-mc_cgm0", s32v234_clocks_init);
+diff --git a/drivers/clk/s32/s32v234/clk.h b/drivers/clk/s32/s32v234/clk.h
+new file mode 100644
+index 000000000..82a222483
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/clk.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright 2015-2016 Freescale Semiconductor, Inc.
++ * Copyright 2017-2018 NXP
++ */
++
++#ifndef __MACH_S32V234_CLK_H
++#define __MACH_S32V234_CLK_H
++
++#include <linux/spinlock.h>
++#include <linux/clk-provider.h>
++#include "mc_cgm.h"
++#include "mc_me.h"
++#include "pll.h"
++#include "src.h"
++#include "dfs.h"
++#include "../clk.h"
++
++struct clk *s32v234_clk_plldig(enum s32v234_plldig_type type, const char *name,
++			       const char *parent_name, void __iomem *base,
++			       u32 plldv_mfd, u32 plldv_mfn,
++			       u32 plldv_rfdphi, u32 plldv_rfdphi1);
++
++struct clk *s32v234_clk_plldig_phi(enum s32v234_plldig_type type,
++				   const char *name, const char *parent,
++				   void __iomem *base, u32 phi);
++
++struct clk *s32v234_clk_dfs(enum s32v234_plldig_type type, const char *name,
++			    const char *parent_name,
++			    void __iomem *reg, u8 idx, u32 mfn);
++#endif
+diff --git a/drivers/clk/s32/s32v234/dfs.h b/drivers/clk/s32/s32v234/dfs.h
+new file mode 100644
+index 000000000..be3104f7a
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/dfs.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ * Copyright 2018 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#ifndef _DFS_S32V234_H
++#define _DFS_S32V234_H
++
++/* DFS Control Register (DFS_CTRL) */
++#define DFS_CTRL(base)		((base) + 0x00000018)
++#define DFS_CTRL_DLL_LOLIE	(1 << 0)
++#define DFS_CTRL_DLL_RESET	(1 << 1)
++
++/* DFS Port Status (DFS_PORTSR) */
++#define DFS_PORTSR(base)	((base) + 0x0000000C)
++#define DFS_PORTSR_MASK		(0x0000000F)
++#define DFS_PORTSR_OFFSET	(28)
++
++/* DFS Port Reset Register (DFS_PORTRESET) */
++#define DFS_PORTRESET(base)	((base) + 0x00000014)
++#define DFS_PORTRESET_PORTRESET_SET(val) \
++		(DFS_PORTRESET_PORTRESET_MASK | \
++		(((val) & DFS_PORTRESET_PORTRESET_MAXVAL) \
++		<< DFS_PORTRESET_PORTRESET_OFFSET))
++#define DFS_PORTRESET_PORTRESET_MAXVAL		(0xF)
++#define DFS_PORTRESET_PORTRESET_MASK		(0x0000000F)
++#define DFS_PORTRESET_PORTRESET_OFFSET		(28)
++
++/* DFS Divide Register Portn (DFS_DVPORTn) */
++#define DFS_DVPORTn(base, n)		((base) + (0x0000001C + \
++					((n) * sizeof(u32))))
++#define DFS_DVPORTn_MFI_SET(val)	(DFS_DVPORTn_MFI_MASK & \
++					(((val) & DFS_DVPORTn_MFI_MAXVAL) \
++					<< DFS_DVPORTn_MFI_OFFSET))
++#define DFS_DVPORTn_MFN_SET(val)	(DFS_DVPORTn_MFN_MASK & \
++					(((val) & DFS_DVPORTn_MFN_MAXVAL) \
++					<< DFS_DVPORTn_MFN_OFFSET))
++#define DFS_DVPORTn_MFI_MASK		(0x0000FF00)
++#define DFS_DVPORTn_MFN_MASK		(0x000000FF)
++#define DFS_DVPORTn_MFI_MAXVAL		(0xFF)
++#define DFS_DVPORTn_MFN_MAXVAL		(0xFF)
++#define DFS_DVPORTn_MFI_OFFSET		(8)
++#define DFS_DVPORTn_MFN_OFFSET		(0)
++#define DFS_MAXNUMBER			(4)
++
++/*
++ * Naming convention for PLL:
++ * ARMPLL - PLL0
++ * PERIPHPLL - PLL1
++ * ENETPLL - PLL2
++ * DDRPLL - PLL3
++ * VIDEOPLL - PLL4
++ */
++
++/* The max values for PLL DFS is in Hz */
++/* ARMPLL */
++#define ARMPLL_DFS0_MAX_RATE		(266000000)
++#define ARMPLL_DFS1_MAX_RATE		(600000000)
++#define ARMPLL_DFS2_MAX_RATE		(600000000)
++/* ENETPLL */
++#define ENETPLL_DFS0_MAX_RATE		(350000000)
++#define ENETPLL_DFS1_MAX_RATE		(350000000)
++#define ENETPLL_DFS2_MAX_RATE		(416000000)
++#define ENETPLL_DFS3_MAX_RATE		(104000000)
++/* DDRPLL */
++#define DDRPLL_DFS0_MAX_RATE		(500000000)
++#define DDRPLL_DFS1_MAX_RATE		(500000000)
++#define DDRPLL_DFS2_MAX_RATE		(350000000)
++
++#define ARMPLL_DFS_NR			(3)
++#define ENETPLL_DFS_NR			(4)
++#define DDRPLL_DFS_NR			(3)
++
++#endif
+diff --git a/drivers/clk/s32/s32v234/mc_cgm.h b/drivers/clk/s32/s32v234/mc_cgm.h
+new file mode 100644
+index 000000000..aeac68771
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/mc_cgm.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ * Copyright (C) 2017 NXP
++ */
++#ifndef _MC_CGM_H
++#define _MC_CGM_H
++
++#define ARMPLL_PLLDIG(mc_cgm)		(mc_cgm)
++#define ARMPLL_PLLDIG_DFS(mc_cgm)	((mc_cgm) + 0x40)
++#define ARMPLL_PLLDIG_PLLDV_MFD		(50)
++#define ARMPLL_PLLDIG_PLLDV_MFN		(0)
++#define ARMPLL_PLLDIG_PLLDV_RFDPHI0	(1)
++#define ARMPLL_PLLDIG_PLLDV_RFDPHI1	(1)
++#define ARMPLL_PLLDIG_DFS0_MFN		(195)
++#define ARMPLL_PLLDIG_DFS1_MFN		(171)
++#define ARMPLL_PLLDIG_DFS2_MFN		(171)
++
++#define PERIPHPLL_PLLDIG(mc_cgm)	((mc_cgm) + 0x80)
++#define PERIPHPLL_PLLDIG_PLLDV_MFD	(30)
++#define PERIPHPLL_PLLDIG_PLLDV_MFN	(0)
++#define PERIPHPLL_PLLDIG_PLLDV_RFDPHI0	(0x1)
++#define PERIPHPLL_PLLDIG_PLLDV_RFDPHI1	(0x1)
++
++#define ENETPLL_PLLDIG(mc_cgm)		((mc_cgm) + 0x100)
++#define ENETPLL_PLLDIG_DFS(mc_cgm)	((mc_cgm) + 0x100 + 0x40)
++#define ENETPLL_PLLDIG_PLLDV_MFD	(50)
++#define ENETPLL_PLLDIG_PLLDV_MFN	(0)
++#define ENETPLL_PLLDIG_PLLDV_RFDPHI0	(0x1)
++#define ENETPLL_PLLDIG_PLLDV_RFDPHI1	(0x1)
++#define ENETPLL_PLLDIG_DFS0_MFN		(220)
++#define ENETPLL_PLLDIG_DFS1_MFN		(220)
++#define ENETPLL_PLLDIG_DFS2_MFN		(33)
++#define ENETPLL_PLLDIG_DFS3_MFN		(1)
++
++/* MC_CGM_SC_SS */
++#define CGM_SC_SS(mc_cgm)		(((mc_cgm) + 0x7E4))
++
++/* MC_CGM_SC_DCn */
++#define CGM_SC_DCn(mc_cgm, dc)		(((mc_cgm) + 0x7E8) + ((dc) * 0x4))
++
++#define MC_CGM_SC_DCn_PREDIV_OFFSET	(16)
++#define MC_CGM_SC_DCn_PREDIV_SIZE	(3)
++#define MC_CGM_SC_DCn_DE		(1 << 31)
++#define MC_CGM_SC_SEL_OFFSET		(24)
++#define MC_CGM_SC_SEL_SIZE		(4)
++
++/* MC_CGM_ACn_DCm */
++#define CGM_ACn_DCm(mc_cgm, ac, dc)	(((mc_cgm) + 0x808) + ((ac) * 0x20)\
++					+ ((dc) * 0x4))
++
++#define MC_CGM_ACn_DCm_PREDIV(val)	(MC_CGM_ACn_DCm_PREDIV_MASK & \
++					((val) \
++					<< MC_CGM_ACn_DCm_PREDIV_OFFSET))
++#define MC_CGM_ACn_DCm_PREDIV_MASK	(0x001F0000)
++#define MC_CGM_ACn_DCm_PREDIV_OFFSET	(16)
++#define MC_CGM_ACn_DCm_PREDIV_SIZE	(5)
++#define MC_CGM_ACn_DCm_DE		(1 << 31)
++
++/* MC_CGM_ACn_SC/MC_CGM_ACn_SS */
++#define CGM_ACn_SC(mc_cgm, ac)		(((mc_cgm) + 0x800) + ((ac) * 0x20))
++#define CGM_ACn_SS(mc_cgm, ac)		(((mc_cgm) + 0x804) + ((ac) * 0x24))
++#define MC_CGM_ACn_SEL_MASK		(0x07000000)
++#define MC_CGM_ACn_SEL_SET(source)	(MC_CGM_ACn_SEL_MASK & \
++					(((source) & 0x7) \
++					<< MC_CGM_ACn_SEL_OFFSET))
++#define MC_CGM_ACn_SEL_OFFSET		(24)
++#define MC_CGM_ACn_SEL_SIZE		(4)
++
++#endif
+diff --git a/drivers/clk/s32/s32v234/mc_me.h b/drivers/clk/s32/s32v234/mc_me.h
+new file mode 100644
+index 000000000..718f1d1a0
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/mc_me.h
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ * Copyright (C) 2017 NXP
++ */
++
++#ifndef _MC_ME_H
++#define _MC_ME_H
++
++/* MC_ME registers definitions */
++/* MC_ME_GS */
++ #define MC_ME_GS(mc_me)                ((mc_me) + 0x00000000)
++
++/* MC_ME_MCTL */
++#define MC_ME_MCTL(mc_me)               ((mc_me) + 0x00000004)
++#define MC_ME_MCTL_RESET                (0x0 << 28)
++#define MC_ME_MCTL_TEST                 (0x1 << 28)
++#define MC_ME_MCTL_DRUN                 (0x3 << 28)
++#define MC_ME_MCTL_RUN0                 (0x4 << 28)
++#define MC_ME_MCTL_RUN1                 (0x5 << 28)
++#define MC_ME_MCTL_RUN2                 (0x6 << 28)
++#define MC_ME_MCTL_RUN3                 (0x7 << 28)
++
++#define MC_ME_GS_S_MTRANS               (1 << 27)
++
++#define MC_ME_MCTL_KEY                  (0x00005AF0)
++#define MC_ME_MCTL_INVERTEDKEY          (0x0000A50F)
++
++/*
++ * MC_ME_RESET_MC/MC_ME_TEST_MC
++ * MC_ME_DRUN_MC
++ * MC_ME_RUNn_MC
++ */
++#define MC_ME_RESET_MC(mc_me)           ((mc_me) + 0x00000020)
++#define MC_ME_TEST_MC(mc_me)            ((mc_me) + 0x00000024)
++#define MC_ME_DRUN_MC(mc_me)            ((mc_me) + 0x0000002C)
++#define MC_ME_RUNn_MC(mc_me, n)         ((mc_me) + 0x00000030 + 0x4 * (n))
++#define MC_ME_MODE_MC_SYSCLK_OFFSET     (0)
++#define MC_ME_MODE_MC_SYSCLK_SIZE       (0x3)
++#define MC_ME_MODE_MC_SYSCLK(val)       (MC_ME_MODE_MC_SYSCLK_MASK & (val))
++#define MC_ME_MODE_MC_SYSCLK_MASK       (0x0000000F)
++#define MC_ME_MODE_MC_FIRCON            (1 << 4)
++#define MC_ME_MODE_MC_XOSCON            (1 << 5)
++#define MC_ME_MODE_MC_ARMPLL            (1 << 6)
++#define MC_ME_MODE_MC_PERIPHPLL         (1 << 7)
++#define MC_ME_MODE_MC_ENETPLL           (1 << 8)
++#define MC_ME_MODE_MC_DDRPLL            (1 << 9)
++#define MC_ME_MODE_MC_VIDEOPLL          (1 << 10)
++#define MC_ME_MODE_MC_MVRON             (1 << 20)
++
++/* MC_ME_DRUN_SEC_CC_I */
++#define MC_ME_DRUN_SEC_CC_I(mc_me)              ((mc_me) + 0x260)
++/* MC_ME_RUNn_SEC_CC_I */
++#define MC_ME_RUNn_SEC_CC_I(mc_me, n)           ((mc_me) + 0x270 + (n) * 0x10)
++#define MC_ME_MODE_SEC_CC_I_SYSCLK1_OFFSET      (4)
++#define MC_ME_MODE_SEC_CC_I_SYSCLK2_OFFSET      (8)
++#define MC_ME_MODE_SEC_CC_I_SYSCLK3_OFFSET      (12)
++/* Consider only the defined clocks */
++#define MC_ME_MODE_SEC_CC_I_SYSCLK1_SIZE        (0x3)
++#define MC_ME_MODE_SEC_CC_I_SYSCLK2_SIZE        (0x3)
++#define MC_ME_MODE_SEC_CC_I_SYSCLK3_SIZE        (0x3)
++
++/* MC_ME_RUN_PCn */
++#define MC_ME_RUN_PCn(mc_me, n)         (mc_me + 0x00000080 + 0x4 * (n))
++
++#define MC_ME_RUN_PCn_MAX_IDX           (7)
++#define MC_ME_RUN_PCn_RESET             (1 << 0)
++#define MC_ME_RUN_PCn_TEST              (1 << 1)
++#define MC_ME_RUN_PCn_DRUN              (1 << 3)
++#define MC_ME_RUN_PCn_RUN0              (1 << 4)
++#define MC_ME_RUN_PCn_RUN1              (1 << 5)
++#define MC_ME_RUN_PCn_RUN2              (1 << 6)
++#define MC_ME_RUN_PCn_RUN3              (1 << 7)
++
++#define MC_ME_PCTLn(mc_me, n)           (mc_me + 0xC0 + 4 * (n >> 2) + \
++					(3 - (n) % 4))
++
++static inline void entry_to_target_mode(void __iomem *mc_me, u32 mode)
++{
++	writel_relaxed(mode | MC_ME_MCTL_KEY, MC_ME_MCTL(mc_me));
++	writel_relaxed(mode | MC_ME_MCTL_INVERTEDKEY, MC_ME_MCTL(mc_me));
++	while ((readl_relaxed(MC_ME_GS(mc_me)) &
++		MC_ME_GS_S_MTRANS) != 0x00000000)
++		;
++}
++
++static inline void enable_cpumodes_onperipheralconfig(void __iomem *mc_me,
++						      u32 modes, u32 run_pc_idx)
++{
++	WARN_ON(run_pc_idx > MC_ME_RUN_PCn_MAX_IDX);
++	if (run_pc_idx > MC_ME_RUN_PCn_MAX_IDX)
++		return;
++
++	writel_relaxed(modes, MC_ME_RUN_PCn(mc_me, run_pc_idx));
++}
++
++static inline void enable_clocks_sources(u32 flags, u32 clks,
++					 void __iomem *xrun_mc_addr)
++{
++	writel_relaxed(readl_relaxed(xrun_mc_addr) | flags | clks,
++		       xrun_mc_addr);
++}
++
++static inline void enable_sysclock(u32 clk, void __iomem *xrun_mc_addr)
++{
++	writel_relaxed(readl_relaxed(xrun_mc_addr) & clk,
++		       xrun_mc_addr);
++}
++
++#endif
+diff --git a/drivers/clk/s32/s32v234/pll.h b/drivers/clk/s32/s32v234/pll.h
+new file mode 100644
+index 000000000..b7bcc50f0
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/pll.h
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ * Copyright (C) 2017-2018 NXP
++ */
++#ifndef _PLL_S32V234_H
++#define _PLL_S32V234_H
++
++/* PLLDIG PLL Divider Register (PLLDIG_PLLDV) */
++#define PLLDIG_PLLDV(base)		((base) + 0x00000028)
++#define PLLDIG_PLLDV_MFD_SET(val)	(PLLDIG_PLLDV_MFD_MASK & (val))
++#define PLLDIG_PLLDV_MFD_MASK		(0x000000FF)
++
++#define PLLDIG_PLLDV_RFDPHI_SET(val)	(PLLDIG_PLLDV_RFDPHI_MASK & \
++					(((val) & \
++					PLLDIG_PLLDV_RFDPHI_MAXVALUE) \
++					<< PLLDIG_PLLDV_RFDPHI_OFFSET))
++#define PLLDIG_PLLDV_RFDPHI_MASK	(0x003F0000)
++#define PLLDIG_PLLDV_RFDPHI_MAXVALUE	(0x3F)
++
++#define PLLDIG_PLLDV_RFDPHI_OFFSET	(16)
++
++#define PLLDIG_PLLDV_RFDPHI1_SET(val)   (PLLDIG_PLLDV_RFDPHI1_MASK & \
++					(((val) & \
++					PLLDIG_PLLDV_RFDPHI1_MAXVALUE) \
++					<< PLLDIG_PLLDV_RFDPHI1_OFFSET))
++#define PLLDIG_PLLDV_RFDPHI1_MASK	(0x7E000000)
++#define PLLDIG_PLLDV_RFDPHI1_MAXVALUE	(0x3F)
++#define PLLDIG_PLLDV_RFDPHI1_OFFSET	(25)
++
++#define PLLDIG_PLLDV_PREDIV_SET(val)	(PLLDIG_PLLDV_PREDIV_MASK & \
++					(((val) & \
++					PLLDIG_PLLDV_PREDIV_MAXVALUE) \
++					<< PLLDIG_PLLDV_PREDIV_OFFSET))
++#define PLLDIG_PLLDV_PREDIV_MASK	(0x00007000)
++#define PLLDIG_PLLDV_PREDIV_MAXVALUE	(0x7)
++#define PLLDIG_PLLDV_PREDIV_OFFSET	(12)
++
++/* PLLDIG PLL Fractional  Divide Register (PLLDIG_PLLFD) */
++#define PLLDIG_PLLFD(base)		((base) + 0x00000030)
++#define PLLDIG_PLLFD_MFN_SET(val)	(PLLDIG_PLLFD_MFN_MASK & (val))
++#define PLLDIG_PLLFD_MFN_MASK		(0x00007FFF)
++
++/* PLL Calibration Register 1 (PLLDIG_PLLCAL1) */
++#define PLLDIG_PLLCAL1(base)	((base) + 0x00000038)
++#define PLLDIG_PLLCAL1_NDAC1_SET(val)	(PLLDIG_PLLCAL1_NDAC1_MASK & \
++					((val) \
++					 << PLLDIG_PLLCAL1_NDAC1_OFFSET))
++#define PLLDIG_PLLCAL1_NDAC1_OFFSET	(24)
++#define PLLDIG_PLLCAL1_NDAC1_MASK	(0x7F000000)
++
++/* Naming convention for PLL:
++ * ARMPLL - PLL0
++ * PERIPHPLL - PLL1
++ * ENETPLL - PLL2
++ * DDRPLL - PLL3
++ * VIDEOPLL - PLL4
++ */
++/* The min,max values for PLL VCO (Hz) */
++#define PERIPHPLL_MAX_VCO_RATE          (1200000000)
++
++/* The min,max values for PLL PHI0 and PHI1 outputs (Hz) */
++#define PERIPHPLL_MAX_PHI0_MAX_RATE	(400000000)
++#define PERIPHPLL_MAX_PHI1_MAX_RATE	(100000000)
++
++/* The maximum value for PLL VCO according to data sheet */
++#define MAX_VCO_RATE			(1300000000)
++#define MIN_VCO_RATE			(650000000)
++
++enum s32v234_plldig_type {
++	S32_PLLDIG_ARM,
++	S32_PLLDIG_PERIPH,
++	S32_PLLDIG_ENET,
++	S32_PLLDIG_DDR,
++	S32_PLLDIG_VIDEO,
++};
++
++#endif
+diff --git a/drivers/clk/s32/s32v234/src.h b/drivers/clk/s32/s32v234/src.h
+new file mode 100644
+index 000000000..39fa973b7
+--- /dev/null
++++ b/drivers/clk/s32/s32v234/src.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ */
++#ifndef _SRC_H
++#define _SRC_H
++
++/* Source Reset Control: General Purpose Register 1 */
++#define SRC_GPR1                                (src_base + 0x100)
++#define SRC_GPR1_ARMPLL_SRC_SEL_OFFSET          (27)
++#define SRC_GPR1_ENETPLL_SRC_SEL_OFFSET         (28)
++#define SRC_GPR1_DDRPLL_SRC_SEL_OFFSET          (29)
++#define SRC_GPR1_PERIPHPLL_SRC_SEL_OFFSET       (30)
++#define SRC_GPR1_VIDEOPLL_SRC_SEL_OFFSET        (31)
++#define SRC_GPR1_XPLL_SRC_SEL_SIZE              (1)
++
++#endif

@@ -1,0 +1,5061 @@
+commit c55690302112eafb89737bcb361db864603b7015
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Sat Jul 16 10:48:28 2022 +0800
+
+    0033_linux_drivers_soc_scsi_spi_tee_thermal.patch
+    
+    Change-Id: I1ba947d26a24ae6708961a663867e136c1171c8d
+
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index f11f51e24..87b2da60a 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -63,6 +63,13 @@ static int scsi_eh_try_stu(struct scsi_cmnd *scmd);
+ static int scsi_try_to_abort_cmd(struct scsi_host_template *,
+ 				 struct scsi_cmnd *);
+ 
++#ifdef CONFIG_AHCI_IMX
++extern void *sg_io_buffer_hack;
++#else
++#define sg_io_buffer_hack NULL
++#endif
++
++/* called with shost->host_lock held */
+ void scsi_eh_wakeup(struct Scsi_Host *shost)
+ {
+ 	lockdep_assert_held(shost->host_lock);
+@@ -72,6 +79,11 @@ void scsi_eh_wakeup(struct Scsi_Host *shost)
+ 		wake_up_process(shost->ehandler);
+ 		SCSI_LOG_ERROR_RECOVERY(5, shost_printk(KERN_INFO, shost,
+ 			"Waking error handler thread\n"));
++	} else if ((shost->host_failed > 0) || (sg_io_buffer_hack != NULL)) {
++		trace_scsi_eh_wakeup(shost);
++		wake_up_process(shost->ehandler);
++		SCSI_LOG_ERROR_RECOVERY(5, shost_printk(KERN_INFO, shost,
++			"Waking error handler thread\n"));
+ 	}
+ }
+ 
+@@ -2203,8 +2215,15 @@ int scsi_error_handler(void *data)
+ 		if (kthread_should_stop())
+ 			break;
+ 
++		/*
++		 * Do not go to sleep, when there is host_failed when the
++		 * one-PRD per command workaroud is triggered.
++		 * Because that ata/scsi subsystem maybe hang, when CD_ROM
++		 * and HDD are accessed simultaneously.
++		 */
+ 		if ((shost->host_failed == 0 && shost->host_eh_scheduled == 0) ||
+-		    shost->host_failed != scsi_host_busy(shost)) {
++		    ((shost->host_failed != scsi_host_busy(shost)) &&
++		    (sg_io_buffer_hack == NULL) && (shost->host_failed > 0))) {
+ 			SCSI_LOG_ERROR_RECOVERY(1,
+ 				shost_printk(KERN_INFO, shost,
+ 					     "scsi_eh_%d: sleeping\n",
+diff --git a/drivers/soc/fsl/Kconfig b/drivers/soc/fsl/Kconfig
+index 4df32bc4c..60a1f566d 100644
+--- a/drivers/soc/fsl/Kconfig
++++ b/drivers/soc/fsl/Kconfig
+@@ -50,4 +50,15 @@ config FSL_RCPM
+ 	  tasks associated with power management, such as wakeup source control.
+ 	  Note that currently this driver will not support PowerPC based
+ 	  QorIQ processor.
++
++config FSL_QIXIS
++	tristate "QIXIS system controller driver"
++	depends on OF
++	select REGMAP_I2C
++	select REGMAP_MMIO
++	default n
++	help
++	  Say y here to enable QIXIS system controller api. The qixis driver
++	  provides FPGA functions to control system.
++
+ endmenu
+diff --git a/drivers/soc/fsl/Makefile b/drivers/soc/fsl/Makefile
+index 906f1cd8a..c7323834a 100644
+--- a/drivers/soc/fsl/Makefile
++++ b/drivers/soc/fsl/Makefile
+@@ -7,6 +7,7 @@ obj-$(CONFIG_FSL_DPAA)                 += qbman/
+ obj-$(CONFIG_QUICC_ENGINE)		+= qe/
+ obj-$(CONFIG_CPM)			+= qe/
+ obj-$(CONFIG_FSL_RCPM)			+= rcpm.o
++obj-$(CONFIG_FSL_QIXIS) 		+= qixis_ctrl.o
+ obj-$(CONFIG_FSL_GUTS)			+= guts.o
+ obj-$(CONFIG_FSL_MC_DPIO) 		+= dpio/
+ obj-$(CONFIG_DPAA2_CONSOLE)		+= dpaa2-console.o
+diff --git a/drivers/soc/fsl/dpaa2-console.c b/drivers/soc/fsl/dpaa2-console.c
+index 53917410f..e823fb9c9 100644
+--- a/drivers/soc/fsl/dpaa2-console.c
++++ b/drivers/soc/fsl/dpaa2-console.c
+@@ -3,7 +3,7 @@
+  * Freescale DPAA2 Platforms Console Driver
+  *
+  * Copyright 2015-2016 Freescale Semiconductor Inc.
+- * Copyright 2018 NXP
++ * Copyright 2021 NXP
+  */
+ 
+ #define pr_fmt(fmt) "dpaa2-console: " fmt
+diff --git a/drivers/soc/fsl/dpio/dpio-driver.c b/drivers/soc/fsl/dpio/dpio-driver.c
+index 7f397b4ad..6459b10db 100644
+--- a/drivers/soc/fsl/dpio/dpio-driver.c
++++ b/drivers/soc/fsl/dpio/dpio-driver.c
+@@ -27,6 +27,11 @@ MODULE_LICENSE("Dual BSD/GPL");
+ MODULE_AUTHOR("Freescale Semiconductor, Inc");
+ MODULE_DESCRIPTION("DPIO Driver");
+ 
++#define PROT_NORMAL_NS		(PTE_TYPE_PAGE | PTE_AF | PTE_PXN | PTE_UXN | PTE_DIRTY | PTE_WRITE | PTE_ATTRINDX(MT_NORMAL))
++
++#define ioremap_cache_ns(addr, size)	__ioremap((addr), (size), __pgprot(PROT_NORMAL_NS))
++
++
+ struct dpio_priv {
+ 	struct dpaa2_io *io;
+ };
+@@ -197,13 +202,11 @@ static int dpaa2_dpio_probe(struct fsl_mc_device *dpio_dev)
+ 	if (dpio_dev->obj_desc.region_count < 3) {
+ 		/* No support for DDR backed portals, use classic mapping */
+ 		/*
+-		 * Set the CENA regs to be the cache inhibited area of the
+-		 * portal to avoid coherency issues if a user migrates to
+-		 * another core.
++		 * Set the CENA regs to be the cache enabled area of the portal to
++		 * achieve the best performance.
+ 		 */
+-		desc.regs_cena = devm_memremap(dev, dpio_dev->regions[1].start,
+-					resource_size(&dpio_dev->regions[1]),
+-					MEMREMAP_WC);
++		desc.regs_cena = ioremap_cache_ns(dpio_dev->regions[0].start,
++						resource_size(&dpio_dev->regions[0]));
+ 	} else {
+ 		desc.regs_cena = devm_memremap(dev, dpio_dev->regions[2].start,
+ 					resource_size(&dpio_dev->regions[2]),
+@@ -211,7 +214,7 @@ static int dpaa2_dpio_probe(struct fsl_mc_device *dpio_dev)
+ 	}
+ 
+ 	if (IS_ERR(desc.regs_cena)) {
+-		dev_err(dev, "devm_memremap failed\n");
++		dev_err(dev, "ioremap_cache_ns failed\n");
+ 		err = PTR_ERR(desc.regs_cena);
+ 		goto err_allocate_irqs;
+ 	}
+diff --git a/drivers/soc/fsl/dpio/dpio-service.c b/drivers/soc/fsl/dpio/dpio-service.c
+index 779c319a4..3050a534d 100644
+--- a/drivers/soc/fsl/dpio/dpio-service.c
++++ b/drivers/soc/fsl/dpio/dpio-service.c
+@@ -779,3 +779,118 @@ int dpaa2_io_query_bp_count(struct dpaa2_io *d, u16 bpid, u32 *num)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(dpaa2_io_query_bp_count);
++
++/**
++ * dpaa2_io_service_enqueue_orp_fq() - Enqueue a frame to a frame queue with
++ * order restoration
++ * @d: the given DPIO service.
++ * @fqid: the given frame queue id.
++ * @fd: the frame descriptor which is enqueued.
++ * @orpid: the order restoration point ID
++ * @seqnum: the order sequence number
++ * @last: must be set for the final frame if seqnum is shared (spilt frame)
++ *
++ * Performs an enqueue to a frame queue using the specified order restoration
++ * point. The QMan device will ensure the order of frames placed on the
++ * queue will be ordered as per the sequence number.
++ *
++ * In the case a frame is split it is possible to enqueue using the same
++ * sequence number more than once. The final frame in a shared sequence number
++ * most be indicated by setting last = 1. For non shared sequence numbers
++ * last = 1 must always be set.
++ *
++ * Return 0 for successful enqueue, or -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_enqueue_orp_fq(struct dpaa2_io *d, u32 fqid,
++				    const struct dpaa2_fd *fd, u16 orpid,
++				    u16 seqnum, int last)
++{
++	struct qbman_eq_desc ed;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_orp(&ed, 0, orpid, seqnum, !last);
++	qbman_eq_desc_set_fq(&ed, fqid);
++	return qbman_swp_enqueue(d->swp, &ed, fd);
++}
++EXPORT_SYMBOL(dpaa2_io_service_enqueue_orp_fq);
++
++/**
++ * dpaa2_io_service_enqueue_orp_qd() - Enqueue a frame to a queueing destination
++ * with order restoration
++ * @d: the given DPIO service.
++ * @qdid: the given queuing destination id.
++ * @fd: the frame descriptor which is enqueued.
++ * @orpid: the order restoration point ID
++ * @seqnum: the order sequence number
++ * @last: must be set for the final frame if seqnum is shared (spilt frame)
++ *
++ * Performs an enqueue to a frame queue using the specified order restoration
++ * point. The QMan device will ensure the order of frames placed on the
++ * queue will be ordered as per the sequence number.
++ *
++ * In the case a frame is split it is possible to enqueue using the same
++ * sequence number more than once. The final frame in a shared sequence number
++ * most be indicated by setting last = 1. For non shared sequence numbers
++ * last = 1 must always be set.
++ *
++ * Return 0 for successful enqueue, or -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_enqueue_orp_qd(struct dpaa2_io *d, u32 qdid, u8 prio,
++				    u16 qdbin, const struct dpaa2_fd *fd,
++				    u16 orpid, u16 seqnum, int last)
++{
++	struct qbman_eq_desc ed;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_orp(&ed, 0, orpid, seqnum, !last);
++	qbman_eq_desc_set_qd(&ed, qdid, qdbin, prio);
++	return qbman_swp_enqueue(d->swp, &ed, fd);
++}
++EXPORT_SYMBOL_GPL(dpaa2_io_service_enqueue_orp_qd);
++
++/**
++ * dpaa2_io_service_orp_seqnum_drop() - Remove a sequence number from
++ * an order restoration list
++ * @d: the given DPIO service.
++ * @orpid: Order restoration point to remove a sequence number from
++ * @seqnum: Sequence number to remove
++ *
++ * Removes a frames sequence number from an order restoration point without
++ * enqueing the frame. Used to indicate that the order restoration hardware
++ * should not expect to see this sequence number. Typically used to indicate
++ * a frame was terminated or dropped from a flow.
++ *
++ * Return 0 for successful enqueue, or -EBUSY if the enqueue ring is not ready,
++ * or -ENODEV if there is no dpio service.
++ */
++int dpaa2_io_service_orp_seqnum_drop(struct dpaa2_io *d, u16 orpid, u16 seqnum)
++{
++	struct qbman_eq_desc ed;
++	struct dpaa2_fd fd;
++	unsigned long irqflags;
++	int ret;
++
++	d = service_select(d);
++	if (!d)
++		return -ENODEV;
++
++	if ((d->swp->desc->qman_version & QMAN_REV_MASK) >= QMAN_REV_5000) {
++		spin_lock_irqsave(&d->lock_mgmt_cmd, irqflags);
++		ret = qbman_orp_drop(d->swp, orpid, seqnum);
++		spin_unlock_irqrestore(&d->lock_mgmt_cmd, irqflags);
++		return ret;
++	}
++
++	qbman_eq_desc_clear(&ed);
++	qbman_eq_desc_set_orp_hole(&ed, orpid, seqnum);
++	return qbman_swp_enqueue(d->swp, &ed, &fd);
++}
++EXPORT_SYMBOL_GPL(dpaa2_io_service_orp_seqnum_drop);
+diff --git a/drivers/soc/fsl/dpio/qbman-portal.c b/drivers/soc/fsl/dpio/qbman-portal.c
+index 3d69f56d9..a56dbe4de 100644
+--- a/drivers/soc/fsl/dpio/qbman-portal.c
++++ b/drivers/soc/fsl/dpio/qbman-portal.c
+@@ -19,6 +19,7 @@
+ /* QBMan portal management command codes */
+ #define QBMAN_MC_ACQUIRE       0x30
+ #define QBMAN_WQCHAN_CONFIGURE 0x46
++#define QBMAN_MC_ORP           0x63
+ 
+ /* CINH register offsets */
+ #define QBMAN_CINH_SWP_EQCR_PI      0x800
+@@ -169,6 +170,14 @@ int (*qbman_swp_release_ptr)(struct qbman_swp *s,
+ 			     unsigned int num_buffers)
+ 			= qbman_swp_release_direct;
+ 
++#define dccvac(p) { asm volatile("dc cvac, %0;" : : "r" (p) : "memory"); }
++#define dcivac(p) { asm volatile("dc ivac, %0" : : "r"(p) : "memory"); }
++static inline void qbman_inval_prefetch(struct qbman_swp *p, u32 offset)
++{
++	dcivac(p->addr_cena + offset);
++	prefetch(p->addr_cena + offset);
++}
++
+ /* Portal Access */
+ 
+ static inline u32 qbman_read_register(struct qbman_swp *p, u32 offset)
+@@ -282,7 +291,7 @@ struct qbman_swp *qbman_swp_init(const struct qbman_swp_desc *d)
+ 	if ((p->desc->qman_version & QMAN_REV_MASK) < QMAN_REV_5000) {
+ 
+ 		reg = qbman_set_swp_cfg(p->dqrr.dqrr_size,
+-			1, /* Writes Non-cacheable */
++			0, /* Writes Non-cacheable */
+ 			0, /* EQCR_CI stashing threshold */
+ 			3, /* RPM: RCR in array mode */
+ 			2, /* DCM: Discrete consumption ack */
+@@ -291,12 +300,12 @@ struct qbman_swp *qbman_swp_init(const struct qbman_swp_desc *d)
+ 			1, /* mem stashing priority enable */
+ 			1, /* mem stashing enable */
+ 			1, /* dequeue stashing priority enable */
+-			0, /* dequeue stashing enable enable */
++			1, /* dequeue stashing enable enable */
+ 			0); /* EQCR_CI stashing priority enable */
+ 	} else {
+ 		memset(p->addr_cena, 0, 64 * 1024);
+ 		reg = qbman_set_swp_cfg(p->dqrr.dqrr_size,
+-			1, /* Writes Non-cacheable */
++			0, /* Writes Non-cacheable */
+ 			1, /* EQCR_CI stashing threshold */
+ 			3, /* RPM: RCR in array mode */
+ 			2, /* DCM: Discrete consumption ack */
+@@ -305,7 +314,7 @@ struct qbman_swp *qbman_swp_init(const struct qbman_swp_desc *d)
+ 			1, /* mem stashing priority enable */
+ 			1, /* mem stashing enable */
+ 			1, /* dequeue stashing priority enable */
+-			0, /* dequeue stashing enable */
++			1, /* dequeue stashing enable */
+ 			0); /* EQCR_CI stashing priority enable */
+ 		reg |= 1 << SWP_CFG_CPBS_SHIFT | /* memory-backed mode */
+ 		       1 << SWP_CFG_VPM_SHIFT |  /* VDQCR read triggered mode */
+@@ -459,6 +468,7 @@ void qbman_swp_mc_submit(struct qbman_swp *p, void *cmd, u8 cmd_verb)
+ 	if ((p->desc->qman_version & QMAN_REV_MASK) < QMAN_REV_5000) {
+ 		dma_wmb();
+ 		*v = cmd_verb | p->mc.valid_bit;
++		dccvac(cmd);
+ 	} else {
+ 		*v = cmd_verb | p->mc.valid_bit;
+ 		dma_wmb();
+@@ -475,6 +485,7 @@ void *qbman_swp_mc_result(struct qbman_swp *p)
+ 	u32 *ret, verb;
+ 
+ 	if ((p->desc->qman_version & QMAN_REV_MASK) < QMAN_REV_5000) {
++		qbman_inval_prefetch(p, QBMAN_CENA_SWP_RR(p->mc.valid_bit));
+ 		ret = qbman_get_cmd(p, QBMAN_CENA_SWP_RR(p->mc.valid_bit));
+ 		/* Remove the valid-bit - command completed if the rest
+ 		 * is non-zero.
+@@ -534,6 +545,43 @@ void qbman_eq_desc_set_no_orp(struct qbman_eq_desc *d, int respond_success)
+ 		d->verb |= enqueue_rejects_to_fq;
+ }
+ 
++/**
++ * qbman_eq_desc_set_orp() - Set order-restoration in the enqueue descriptor
++ * @d: the enqueue descriptor.
++ * @response_success: 1 = enqueue with response always; 0 = enqueue with
++ * rejections returned on a FQ.
++ * @oprid: the order point record id.
++ * @seqnum: the order restoration sequence number.
++ * @incomplete: indicates whether this is the last fragments using the same
++ * sequence number.
++ */
++void qbman_eq_desc_set_orp(struct qbman_eq_desc *d, int respond_success,
++			   u16 oprid, u16 seqnum, int incomplete)
++{
++	d->verb |= (1 << QB_ENQUEUE_CMD_ORP_ENABLE_SHIFT);
++	if (respond_success)
++		d->verb |= enqueue_response_always;
++	else
++		d->verb |= enqueue_rejects_to_fq;
++	d->orpid = cpu_to_le16(oprid);
++	d->seqnum = cpu_to_le16((!!incomplete << 14) | seqnum);
++}
++
++/**
++ * qbman_eq_desc_set_orp_hole() - fill a hole in the order-restoration sequence
++ * without any enqueue
++ * @d: the enqueue descriptor.
++ * @oprid: the order point record id.
++ * @seqnum: the order restoration sequence number.
++ */
++void qbman_eq_desc_set_orp_hole(struct qbman_eq_desc *d, u16 oprid,
++				u16 seqnum)
++{
++	d->verb |= (1 << QB_ENQUEUE_CMD_ORP_ENABLE_SHIFT) | enqueue_empty;
++	d->orpid = cpu_to_le16(oprid);
++	d->seqnum = cpu_to_le16(seqnum);
++}
++
+ /*
+  * Exactly one of the following descriptor "targets" should be set. (Calling any
+  * one of these will replace the effect of any prior call to one of these.)
+@@ -647,6 +695,7 @@ int qbman_swp_enqueue_multiple_direct(struct qbman_swp *s,
+ 	const uint32_t *cl = (uint32_t *)d;
+ 	uint32_t eqcr_ci, eqcr_pi, half_mask, full_mask;
+ 	int i, num_enqueued = 0;
++	uint64_t addr_cena;
+ 
+ 	spin_lock(&s->access_spinlock);
+ 	half_mask = (s->eqcr.pi_ci_mask>>1);
+@@ -674,8 +723,8 @@ int qbman_swp_enqueue_multiple_direct(struct qbman_swp *s,
+ 	for (i = 0; i < num_enqueued; i++) {
+ 		p = (s->addr_cena + QBMAN_CENA_SWP_EQCR(eqcr_pi & half_mask));
+ 		/* Skip copying the verb */
+-		memcpy(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
+-		memcpy(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
++		memcpy_toio(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
++		memcpy_toio(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
+ 		       &fd[i], sizeof(*fd));
+ 		eqcr_pi++;
+ 	}
+@@ -701,7 +750,11 @@ int qbman_swp_enqueue_multiple_direct(struct qbman_swp *s,
+ 	/* Flush all the cacheline without load/store in between */
+ 	eqcr_pi = s->eqcr.pi;
+ 	for (i = 0; i < num_enqueued; i++)
++	addr_cena = (size_t)s->addr_cena;
++	for (i = 0; i < num_enqueued; i++) {
++		dccvac((addr_cena + QBMAN_CENA_SWP_EQCR(eqcr_pi & half_mask)));
+ 		eqcr_pi++;
++	}
+ 	s->eqcr.pi = eqcr_pi & full_mask;
+ 	spin_unlock(&s->access_spinlock);
+ 
+@@ -756,8 +809,8 @@ int qbman_swp_enqueue_multiple_mem_back(struct qbman_swp *s,
+ 	for (i = 0; i < num_enqueued; i++) {
+ 		p = (s->addr_cena + QBMAN_CENA_SWP_EQCR(eqcr_pi & half_mask));
+ 		/* Skip copying the verb */
+-		memcpy(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
+-		memcpy(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
++		memcpy_toio(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
++		memcpy_toio(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
+ 		       &fd[i], sizeof(*fd));
+ 		eqcr_pi++;
+ 	}
+@@ -807,6 +860,7 @@ int qbman_swp_enqueue_multiple_desc_direct(struct qbman_swp *s,
+ 	const uint32_t *cl;
+ 	uint32_t eqcr_ci, eqcr_pi, half_mask, full_mask;
+ 	int i, num_enqueued = 0;
++	uint64_t addr_cena;
+ 
+ 	half_mask = (s->eqcr.pi_ci_mask>>1);
+ 	full_mask = s->eqcr.pi_ci_mask;
+@@ -829,8 +883,8 @@ int qbman_swp_enqueue_multiple_desc_direct(struct qbman_swp *s,
+ 		p = (s->addr_cena + QBMAN_CENA_SWP_EQCR(eqcr_pi & half_mask));
+ 		cl = (uint32_t *)(&d[i]);
+ 		/* Skip copying the verb */
+-		memcpy(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
+-		memcpy(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
++		memcpy_toio(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
++		memcpy_toio(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
+ 		       &fd[i], sizeof(*fd));
+ 		eqcr_pi++;
+ 	}
+@@ -850,8 +904,12 @@ int qbman_swp_enqueue_multiple_desc_direct(struct qbman_swp *s,
+ 
+ 	/* Flush all the cacheline without load/store in between */
+ 	eqcr_pi = s->eqcr.pi;
+-	for (i = 0; i < num_enqueued; i++)
++	addr_cena = (uint64_t)s->addr_cena;
++	for (i = 0; i < num_enqueued; i++) {
++		dccvac((uint64_t *)(addr_cena +
++			QBMAN_CENA_SWP_EQCR(eqcr_pi & half_mask)));
+ 		eqcr_pi++;
++	}
+ 	s->eqcr.pi = eqcr_pi & full_mask;
+ 
+ 	return num_enqueued;
+@@ -899,8 +957,8 @@ int qbman_swp_enqueue_multiple_desc_mem_back(struct qbman_swp *s,
+ 		p = (s->addr_cena + QBMAN_CENA_SWP_EQCR(eqcr_pi & half_mask));
+ 		cl = (uint32_t *)(&d[i]);
+ 		/* Skip copying the verb */
+-		memcpy(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
+-		memcpy(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
++		memcpy_toio(&p[1], &cl[1], EQ_DESC_SIZE_WITHOUT_FD - 1);
++		memcpy_toio(&p[EQ_DESC_SIZE_FD_START/sizeof(uint32_t)],
+ 		       &fd[i], sizeof(*fd));
+ 		eqcr_pi++;
+ 	}
+@@ -1111,6 +1169,7 @@ int qbman_swp_pull_direct(struct qbman_swp *s, struct qbman_pull_desc *d)
+ 	/* Set the verb byte, have to substitute in the valid-bit */
+ 	p->verb = d->verb | s->vdq.valid_bit;
+ 	s->vdq.valid_bit ^= QB_VALID_BIT;
++	dccvac(p);
+ 
+ 	return 0;
+ }
+@@ -1202,8 +1261,7 @@ const struct dpaa2_dq *qbman_swp_dqrr_next_direct(struct qbman_swp *s)
+ 				 s->dqrr.next_idx, pi);
+ 			s->dqrr.reset_bug = 0;
+ 		}
+-		prefetch(qbman_get_cmd(s,
+-				       QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx)));
++		qbman_inval_prefetch(s,	QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+ 	}
+ 
+ 	p = qbman_get_cmd(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+@@ -1218,8 +1276,7 @@ const struct dpaa2_dq *qbman_swp_dqrr_next_direct(struct qbman_swp *s)
+ 	 * knew from reading PI.
+ 	 */
+ 	if ((verb & QB_VALID_BIT) != s->dqrr.valid_bit) {
+-		prefetch(qbman_get_cmd(s,
+-				       QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx)));
++		qbman_inval_prefetch(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+ 		return NULL;
+ 	}
+ 	/*
+@@ -1242,7 +1299,7 @@ const struct dpaa2_dq *qbman_swp_dqrr_next_direct(struct qbman_swp *s)
+ 	    (flags & DPAA2_DQ_STAT_EXPIRED))
+ 		atomic_inc(&s->vdq.available);
+ 
+-	prefetch(qbman_get_cmd(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx)));
++	qbman_inval_prefetch(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+ 
+ 	return p;
+ }
+@@ -1294,8 +1351,7 @@ const struct dpaa2_dq *qbman_swp_dqrr_next_mem_back(struct qbman_swp *s)
+ 				 s->dqrr.next_idx, pi);
+ 			s->dqrr.reset_bug = 0;
+ 		}
+-		prefetch(qbman_get_cmd(s,
+-				       QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx)));
++		qbman_inval_prefetch(s,	QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+ 	}
+ 
+ 	p = qbman_get_cmd(s, QBMAN_CENA_SWP_DQRR_MEM(s->dqrr.next_idx));
+@@ -1310,8 +1366,7 @@ const struct dpaa2_dq *qbman_swp_dqrr_next_mem_back(struct qbman_swp *s)
+ 	 * knew from reading PI.
+ 	 */
+ 	if ((verb & QB_VALID_BIT) != s->dqrr.valid_bit) {
+-		prefetch(qbman_get_cmd(s,
+-				       QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx)));
++		qbman_inval_prefetch(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+ 		return NULL;
+ 	}
+ 	/*
+@@ -1334,7 +1389,7 @@ const struct dpaa2_dq *qbman_swp_dqrr_next_mem_back(struct qbman_swp *s)
+ 	    (flags & DPAA2_DQ_STAT_EXPIRED))
+ 		atomic_inc(&s->vdq.available);
+ 
+-	prefetch(qbman_get_cmd(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx)));
++	qbman_inval_prefetch(s, QBMAN_CENA_SWP_DQRR(s->dqrr.next_idx));
+ 
+ 	return p;
+ }
+@@ -1464,6 +1519,7 @@ int qbman_swp_release_direct(struct qbman_swp *s,
+ 	 */
+ 	dma_wmb();
+ 	p->verb = d->verb | RAR_VB(rar) | num_buffers;
++	dccvac(p);
+ 
+ 	return 0;
+ }
+@@ -1785,3 +1841,54 @@ u32 qbman_bp_info_num_free_bufs(struct qbman_bp_query_rslt *a)
+ {
+ 	return le32_to_cpu(a->fill);
+ }
++
++struct qbman_orp_cmd_desc {
++	u8 verb;
++	u8 reserved;
++	u8 cid;
++	u8 reserved2;
++	u16 orpid;
++	u16 seqnum;
++	u8 reserved3[56];
++};
++
++struct qbman_orp_cmd_rslt {
++	u8 verb;
++	u8 rslt;
++	u8 cid;
++	u8 reserved1[61];
++};
++
++int qbman_orp_drop(struct qbman_swp *s, u16 orpid, u16 seqnum)
++{
++	struct qbman_orp_cmd_desc *p;
++	struct qbman_orp_cmd_rslt *r;
++	void *resp;
++
++	p = (struct qbman_orp_cmd_desc *)qbman_swp_mc_start(s);
++	if (!p)
++		return -EBUSY;
++
++	p->cid = 0x7;
++	p->orpid = cpu_to_le16(orpid);
++	p->seqnum = cpu_to_le16(seqnum);
++
++	resp = qbman_swp_mc_complete(s, p, QBMAN_MC_ORP);
++	if (!resp) {
++		pr_err("qbman: Drop sequence num %d orpid 0x%x failed, no response\n",
++		       seqnum, orpid);
++		return -EIO;
++	}
++	r = (struct qbman_orp_cmd_rslt *)resp;
++	/* Decode the outcome */
++	WARN_ON((r->verb & QBMAN_RESPONSE_VERB_MASK) != QBMAN_MC_ORP);
++
++	/* Determine success or failure */
++	if (r->rslt != QBMAN_MC_RSLT_OK) {
++		pr_err("Drop seqnum %d of prpid 0x%x failed, code=0x%02x\n",
++		       seqnum, orpid, r->rslt);
++		return -EIO;
++	}
++
++	return 0;
++}
+diff --git a/drivers/soc/fsl/dpio/qbman-portal.h b/drivers/soc/fsl/dpio/qbman-portal.h
+index c7c2225b7..b6b79e3bb 100644
+--- a/drivers/soc/fsl/dpio/qbman-portal.h
++++ b/drivers/soc/fsl/dpio/qbman-portal.h
+@@ -215,11 +215,15 @@ int qbman_result_has_new_result(struct qbman_swp *p, const struct dpaa2_dq *dq);
+ 
+ void qbman_eq_desc_clear(struct qbman_eq_desc *d);
+ void qbman_eq_desc_set_no_orp(struct qbman_eq_desc *d, int respond_success);
++void qbman_eq_desc_set_orp(struct qbman_eq_desc *d, int respond_success,
++			   u16 oprid, u16 seqnum, int incomplete);
++void qbman_eq_desc_set_orp_hole(struct qbman_eq_desc *d, u16 oprid, u16 seqnum);
+ void qbman_eq_desc_set_token(struct qbman_eq_desc *d, u8 token);
+ void qbman_eq_desc_set_fq(struct qbman_eq_desc *d, u32 fqid);
+ void qbman_eq_desc_set_qd(struct qbman_eq_desc *d, u32 qdid,
+ 			  u32 qd_bin, u32 qd_prio);
+ 
++int qbman_orp_drop(struct qbman_swp *s, u16 orpid, u16 seqnum);
+ 
+ void qbman_release_desc_clear(struct qbman_release_desc *d);
+ void qbman_release_desc_set_bpid(struct qbman_release_desc *d, u16 bpid);
+diff --git a/drivers/soc/fsl/qixis_ctrl.c b/drivers/soc/fsl/qixis_ctrl.c
+new file mode 100644
+index 000000000..cc4696cf9
+--- /dev/null
++++ b/drivers/soc/fsl/qixis_ctrl.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++/* Freescale QIXIS system controller driver.
++ *
++ * Copyright 2015 Freescale Semiconductor, Inc.
++ * Copyright 2018-2019 NXP
++ */
++
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/mfd/core.h>
++#include <linux/of.h>
++#include <linux/regmap.h>
++
++/* QIXIS MAP */
++struct fsl_qixis_regs {
++	u8		id;		/* Identification Registers */
++	u8		version;	/* Version Register */
++	u8		qixis_ver;	/* QIXIS Version Register */
++	u8		reserved1[0x1f];
++};
++
++struct qixis_priv {
++	struct regmap		*regmap;
++};
++
++static struct regmap_config qixis_regmap_config = {
++	.reg_bits = 8,
++	.val_bits = 8,
++};
++
++static const struct mfd_cell fsl_qixis_devs[] = {
++	{
++		.name = "reg-mux",
++		.of_compatible = "reg-mux",
++	},
++};
++
++static int fsl_qixis_i2c_probe(struct i2c_client *client)
++{
++	struct qixis_priv *priv;
++	int ret = 0;
++	u32 qver;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_BYTE_DATA))
++		return -EOPNOTSUPP;
++
++	priv = devm_kzalloc(&client->dev, sizeof(struct qixis_priv),
++			    GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->regmap = regmap_init_i2c(client, &qixis_regmap_config);
++	regmap_read(priv->regmap, offsetof(struct fsl_qixis_regs, qixis_ver),
++		    &qver);
++	pr_info("Freescale QIXIS Version: 0x%08x\n", qver);
++
++	i2c_set_clientdata(client, priv);
++
++	if (of_device_is_compatible(client->dev.of_node, "simple-mfd"))
++		ret = devm_mfd_add_devices(&client->dev, -1, fsl_qixis_devs,
++					   ARRAY_SIZE(fsl_qixis_devs), NULL, 0,
++					   NULL);
++	if (ret)
++		goto error;
++
++	return ret;
++error:
++	regmap_exit(priv->regmap);
++
++	return ret;
++}
++
++static int fsl_qixis_i2c_remove(struct i2c_client *client)
++{
++	struct qixis_priv *priv;
++
++	priv = i2c_get_clientdata(client);
++	regmap_exit(priv->regmap);
++
++	return 0;
++}
++
++static const struct of_device_id fsl_qixis_i2c_of_match[] = {
++	{ .compatible = "fsl,fpga-qixis-i2c" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, fsl_qixis_i2c_of_match);
++
++static struct i2c_driver fsl_qixis_i2c_driver = {
++	.driver = {
++		.name	= "qixis_ctrl_i2c",
++		.owner	= THIS_MODULE,
++		.of_match_table = of_match_ptr(fsl_qixis_i2c_of_match),
++	},
++	.probe_new	= fsl_qixis_i2c_probe,
++	.remove		= fsl_qixis_i2c_remove,
++};
++module_i2c_driver(fsl_qixis_i2c_driver);
++
++MODULE_AUTHOR("Wang Dongsheng <dongsheng.wang@freescale.com>");
++MODULE_DESCRIPTION("Freescale QIXIS system controller driver");
++MODULE_LICENSE("GPL");
++
+diff --git a/drivers/soc/imx/Kconfig b/drivers/soc/imx/Kconfig
+index 05812f8ae..e2fd6d375 100644
+--- a/drivers/soc/imx/Kconfig
++++ b/drivers/soc/imx/Kconfig
+@@ -19,4 +19,37 @@ config SOC_IMX8M
+ 	  support, it will provide the SoC info like SoC family,
+ 	  ID and revision etc.
+ 
++config IMX8M_BUSFREQ
++	tristate "i.MX8M busfreq"
++	depends on SOC_IMX8M
++	default ARCH_MXC
++
++config SECVIO_SC
++	tristate "NXP SC secvio support"
++	depends on IMX_SCU
++	default y
++	help
++	   If you say yes here you get support for the NXP SNVS security
++	   violation module. It includes the possibility to read information
++	   related to security violations and tampers. It also gives the
++	   possibility to register user callbacks when a security violation
++	   occurs.
++
++config IMX8M_PM_DOMAINS
++	tristate "i.MX8M PM domains"
++	default ARCH_MXC
++	depends on ARCH_MXC || (COMPILE_TEST && OF)
++	depends on PM
++	select PM_GENERIC_DOMAINS
++
++config RPMSG_LIFE_CYCLE
++	tristate "i.MX8ULP Rpmsg Life Cycle Support"
++	depends on ARCH_MXC || COMPILE_TEST
++	depends on RPMSG
++	default ARCH_MXC && ARM64
++	help
++	  If you say yes here you get supoort for the rpmsg life cycle support on
++	  i.MX8ULP for low power mode state coordination between A core & M core to
++	  make sure A core can be put into Low power mode without risk by sending
++	  notify to M core.
+ endmenu
+diff --git a/drivers/soc/imx/Makefile b/drivers/soc/imx/Makefile
+index 078dc918f..b269017f9 100644
+--- a/drivers/soc/imx/Makefile
++++ b/drivers/soc/imx/Makefile
+@@ -5,3 +5,8 @@ endif
+ obj-$(CONFIG_HAVE_IMX_GPC) += gpc.o
+ obj-$(CONFIG_IMX_GPCV2_PM_DOMAINS) += gpcv2.o
+ obj-$(CONFIG_SOC_IMX8M) += soc-imx8m.o
++obj-$(CONFIG_IMX8M_BUSFREQ) += busfreq-imx8mq.o
++obj-y	+= mu/
++obj-${CONFIG_SECVIO_SC} += secvio/
++obj-$(CONFIG_IMX8M_PM_DOMAINS) += imx8m_pm_domains.o
++obj-$(CONFIG_RPMSG_LIFE_CYCLE) += rpmsg_life_cycle.o
+diff --git a/drivers/soc/imx/busfreq-imx8mq.c b/drivers/soc/imx/busfreq-imx8mq.c
+new file mode 100644
+index 000000000..5e3696228
+--- /dev/null
++++ b/drivers/soc/imx/busfreq-imx8mq.c
+@@ -0,0 +1,670 @@
++/*
++ * Copyright 2017-2018 NXP
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/busfreq-imx.h>
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/cpumask.h>
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/proc_fs.h>
++#include <linux/reboot.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/smp.h>
++#include <linux/suspend.h>
++#include <linux/sys_soc.h>
++
++#define FSL_SIP_DDR_DVFS                0xc2000004
++
++#define HIGH_FREQ_3200MTS	0x0
++#define AUDIO_FREQ_400MTS	0x1
++#define LOW_BUS_FREQ_100MTS	0x2
++#define LOW_BUS_FREQ_667MTS	0x1
++#define WAIT_BUS_FREQ_DONE	0xf
++#define DLL_ON_DRATE		667
++
++static struct device *busfreq_dev;
++static int low_bus_freq_mode;
++static int audio_bus_freq_mode;
++static int high_bus_freq_mode;
++static int bus_freq_scaling_initialized;
++static int bus_freq_scaling_is_active;
++static int high_bus_count, audio_bus_count, low_bus_count;
++static int cur_bus_freq_mode;
++static int busfreq_suspended;
++static bool cancel_reduce_bus_freq;
++
++static unsigned int fsp_table[4];
++static unsigned long origin_noc_rate;
++static int low_bus_mode_fsp_index;
++/* no bypass or dll off mode support if lowest fsp > 667mts */
++static bool bypass_support = true;
++
++static struct clk *dram_pll_clk;
++static struct clk *dram_pll;
++static struct clk *sys1_pll_800m;
++static struct clk *sys1_pll_400m;
++static struct clk *sys1_pll_100m;
++static struct clk *sys1_pll_40m;
++static struct clk *dram_alt_src;
++static struct clk *dram_alt_root;
++static struct clk *dram_core_clk;
++static struct clk *dram_apb_src;
++static struct clk *dram_apb_pre_div;
++static struct clk *noc_div;
++static struct clk *main_axi_src;
++static struct clk *ahb_div;
++static struct clk *osc_25m;
++static struct clk *sys2_pll_333m;
++
++static struct delayed_work low_bus_freq_handler;
++static struct delayed_work bus_freq_daemon;
++
++DEFINE_MUTEX(bus_freq_mutex);
++
++static void update_bus_freq(int target_freq)
++{
++	struct arm_smccc_res res;
++	u32 online_cpus = 0;
++	int cpu = 0;
++
++	local_irq_disable();
++
++	for_each_online_cpu(cpu) {
++		online_cpus |= (1 << (cpu * 8));
++	}
++	/* change the ddr freqency */
++	arm_smccc_smc(FSL_SIP_DDR_DVFS, target_freq, online_cpus,
++		0, 0, 0, 0, 0, &res);
++
++	local_irq_enable();
++}
++
++static void reduce_bus_freq(void)
++{
++	u32 rate;
++
++	high_bus_freq_mode = 0;
++
++	/*
++	 * below piece of code has some redundant part, keep
++	 * it at present, we may need update the audio freq
++	 * in the future if needed.
++	 */
++	if (audio_bus_count) {
++		if (cur_bus_freq_mode == BUS_FREQ_HIGH) {
++			if (bypass_support) {
++				/* prepare the necessary clk before frequency change */
++				clk_prepare_enable(sys1_pll_40m);
++				clk_prepare_enable(dram_alt_root);
++				clk_prepare_enable(sys1_pll_100m);
++
++				update_bus_freq(low_bus_mode_fsp_index);
++
++				clk_set_parent(dram_alt_src, sys1_pll_100m);
++				clk_set_parent(dram_core_clk, dram_alt_root);
++				clk_set_parent(dram_apb_src, sys1_pll_40m);
++				clk_set_rate(dram_apb_pre_div, 20000000);
++				clk_disable_unprepare(sys1_pll_100m);
++				clk_disable_unprepare(sys1_pll_40m);
++				clk_disable_unprepare(dram_alt_root);
++			} else {
++				update_bus_freq(low_bus_mode_fsp_index);
++				/*
++				 * the dram_apb and dram_core clk rate is changed
++				 * in ATF side, below two lines of code is just used
++				 * to update the clock tree info in kernel side.
++				 */
++				clk_set_rate(dram_apb_pre_div, 160000000);
++				clk_get_rate(dram_pll);
++			}
++			/* change the NOC rate */
++			if (of_machine_is_compatible("fsl,imx8mq"))
++				clk_set_rate(noc_div, origin_noc_rate / 8);
++			else
++				clk_set_rate(noc_div, origin_noc_rate / 5);
++
++			rate = clk_get_rate(ahb_div);
++			if (rate == 0) {
++				WARN_ON(1);
++				return;
++			}
++			clk_set_rate(ahb_div, rate / 6);
++			clk_set_parent(main_axi_src, osc_25m);
++		}
++
++		low_bus_freq_mode = 0;
++		audio_bus_freq_mode = 1;
++		cur_bus_freq_mode = BUS_FREQ_AUDIO;
++	} else {
++		if (cur_bus_freq_mode == BUS_FREQ_HIGH) {
++			if (bypass_support) {
++				/* prepare the necessary clk before frequency change */
++				clk_prepare_enable(sys1_pll_40m);
++				clk_prepare_enable(dram_alt_root);
++				clk_prepare_enable(sys1_pll_100m);
++
++				update_bus_freq(low_bus_mode_fsp_index);
++
++				clk_set_parent(dram_alt_src, sys1_pll_100m);
++				clk_set_parent(dram_core_clk, dram_alt_root);
++				clk_set_parent(dram_apb_src, sys1_pll_40m);
++				clk_set_rate(dram_apb_pre_div, 20000000);
++				clk_disable_unprepare(sys1_pll_100m);
++				clk_disable_unprepare(sys1_pll_40m);
++				clk_disable_unprepare(dram_alt_root);
++			} else {
++				update_bus_freq(low_bus_mode_fsp_index);
++				/*
++				 * the dram_apb and dram_core clk rate is changed
++				 * in ATF side, below two lines of code is just used
++				 * to update the clock tree info in kernel side.
++				 */
++				clk_set_rate(dram_apb_pre_div, 160000000);
++				clk_get_rate(dram_pll);
++			}
++
++			/* change the NOC rate */
++			if (of_machine_is_compatible("fsl,imx8mq"))
++				clk_set_rate(noc_div, origin_noc_rate / 8);
++			else
++				clk_set_rate(noc_div, origin_noc_rate / 5);
++
++			rate = clk_get_rate(ahb_div);
++			if (rate == 0) {
++				WARN_ON(1);
++				return;
++			}
++			clk_set_rate(ahb_div, rate / 6);
++			clk_set_parent(main_axi_src, osc_25m);
++		}
++
++		low_bus_freq_mode = 1;
++		audio_bus_freq_mode = 0;
++		cur_bus_freq_mode = BUS_FREQ_LOW;
++	}
++
++	if (audio_bus_freq_mode)
++		printk(KERN_DEBUG "ddrc freq set to audio bus mode\n");
++	if (low_bus_freq_mode)
++		printk(KERN_DEBUG "ddrc freq set to low bus mode\n");
++}
++
++static void reduce_bus_freq_handler(struct work_struct *work)
++{
++	mutex_lock(&bus_freq_mutex);
++
++	if (!cancel_reduce_bus_freq)
++		reduce_bus_freq();
++
++	mutex_unlock(&bus_freq_mutex);
++}
++
++static int set_low_bus_freq(void)
++{
++	if (busfreq_suspended)
++		return 0;
++
++	if (!bus_freq_scaling_initialized || !bus_freq_scaling_is_active)
++		return 0;
++
++	cancel_reduce_bus_freq = false;
++
++	/*
++	 * check to see if we need to got from low bus
++	 * freq mode to audio bus freq mode.
++	 * If so, the change needs to be done immediately.
++	 */
++	if (audio_bus_count && low_bus_freq_mode)
++		reduce_bus_freq();
++	else
++		schedule_delayed_work(&low_bus_freq_handler,
++					usecs_to_jiffies(1000000));
++
++	return 0;
++}
++
++static inline void cancel_low_bus_freq_handler(void)
++{
++	cancel_delayed_work(&low_bus_freq_handler);
++	cancel_reduce_bus_freq = true;
++}
++
++static int set_high_bus_freq(int high_bus_freq)
++{
++	if (bus_freq_scaling_initialized || bus_freq_scaling_is_active)
++		cancel_low_bus_freq_handler();
++
++	if (busfreq_suspended)
++		return 0;
++
++	if (!bus_freq_scaling_initialized || !bus_freq_scaling_is_active)
++		return 0;
++
++	if (high_bus_freq_mode)
++		return 0;
++
++	if (bypass_support) {
++		/*  enable the clks needed in frequency */
++		clk_prepare_enable(sys1_pll_800m);
++		clk_prepare_enable(dram_pll_clk);
++
++		/* switch the DDR freqeuncy */
++		update_bus_freq(HIGH_FREQ_3200MTS);
++
++		/* correct the clock tree info */
++		clk_set_parent(dram_apb_src, sys1_pll_800m);
++		clk_set_rate(dram_apb_pre_div, 160000000);
++		clk_set_parent(dram_core_clk, dram_pll_clk);
++		clk_disable_unprepare(sys1_pll_800m);
++		clk_disable_unprepare(dram_pll_clk);
++	} else {
++		/* switch the DDR freqeuncy */
++		update_bus_freq(HIGH_FREQ_3200MTS);
++
++		clk_set_rate(dram_apb_pre_div, 200000000);
++		clk_get_rate(dram_pll);
++	}
++
++	clk_set_rate(noc_div, origin_noc_rate);
++	clk_set_rate(ahb_div, 133333333);
++	clk_set_parent(main_axi_src, sys2_pll_333m);
++
++	high_bus_freq_mode = 1;
++	audio_bus_freq_mode = 0;
++	low_bus_freq_mode = 0;
++	cur_bus_freq_mode = BUS_FREQ_HIGH;
++
++	if (high_bus_freq_mode)
++		printk(KERN_DEBUG "ddrc freq set to high bus mode\n");
++
++	return 0;
++}
++
++void request_bus_freq(enum bus_freq_mode mode)
++{
++	mutex_lock(&bus_freq_mutex);
++
++	if (mode == BUS_FREQ_HIGH)
++		high_bus_count++;
++	else if (mode == BUS_FREQ_AUDIO)
++		audio_bus_count++;
++	else if (mode == BUS_FREQ_LOW)
++		low_bus_count++;
++
++	if (busfreq_suspended || !bus_freq_scaling_initialized ||
++		!bus_freq_scaling_is_active) {
++		mutex_unlock(&bus_freq_mutex);
++		return;
++	}
++
++	cancel_low_bus_freq_handler();
++
++	if ((mode == BUS_FREQ_HIGH) && (!high_bus_freq_mode)) {
++		set_high_bus_freq(1);
++		mutex_unlock(&bus_freq_mutex);
++		return;
++	}
++
++	if ((mode == BUS_FREQ_AUDIO) && (!high_bus_freq_mode) &&
++		 (!audio_bus_freq_mode)) {
++		set_low_bus_freq();
++		mutex_unlock(&bus_freq_mutex);
++		return;
++	}
++
++	mutex_unlock(&bus_freq_mutex);
++}
++EXPORT_SYMBOL(request_bus_freq);
++
++void release_bus_freq(enum bus_freq_mode mode)
++{
++	mutex_lock(&bus_freq_mutex);
++	if (mode == BUS_FREQ_HIGH) {
++		if (high_bus_count == 0) {
++			dev_err(busfreq_dev, "high bus count mismatch!\n");
++			dump_stack();
++			mutex_unlock(&bus_freq_mutex);
++			return;
++		}
++		high_bus_count--;
++	} else if (mode == BUS_FREQ_AUDIO) {
++		if (audio_bus_count == 0) {
++			dev_err(busfreq_dev, "audio bus count mismatch!\n");
++			dump_stack();
++			mutex_unlock(&bus_freq_mutex);
++			return;
++		}
++		audio_bus_count--;
++	} else if (mode == BUS_FREQ_LOW) {
++		if (low_bus_count == 0) {
++			dev_err(busfreq_dev, "low bus count mismatch!\n");
++			dump_stack();
++			mutex_unlock(&bus_freq_mutex);
++			return;
++		}
++		low_bus_count--;
++	}
++
++	if (busfreq_suspended || !bus_freq_scaling_initialized ||
++		!bus_freq_scaling_is_active) {
++		mutex_unlock(&bus_freq_mutex);
++		return;
++	}
++
++	if ((!audio_bus_freq_mode) && (high_bus_count == 0) &&
++		(audio_bus_count != 0)) {
++		set_low_bus_freq();
++		mutex_unlock(&bus_freq_mutex);
++		return;
++	}
++
++	if ((!low_bus_freq_mode) && (high_bus_count == 0) &&
++		(audio_bus_count == 0)) {
++		set_low_bus_freq();
++		mutex_unlock(&bus_freq_mutex);
++		return;
++	}
++
++	mutex_unlock(&bus_freq_mutex);
++}
++EXPORT_SYMBOL(release_bus_freq);
++
++int get_bus_freq_mode(void)
++{
++	return cur_bus_freq_mode;
++}
++EXPORT_SYMBOL(get_bus_freq_mode);
++
++static void bus_freq_daemon_handler(struct work_struct *work)
++{
++	mutex_lock(&bus_freq_mutex);
++	if ((!low_bus_freq_mode) && (high_bus_count == 0) &&
++		(audio_bus_count == 0))
++		set_low_bus_freq();
++	mutex_unlock(&bus_freq_mutex);
++}
++
++static ssize_t bus_freq_scaling_enable_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	if (bus_freq_scaling_is_active)
++		return sprintf(buf, "Bus frequency scaling is enabled\n");
++	else
++		return sprintf(buf, "Bus frequency scaling is disabled\n");
++}
++
++static ssize_t bus_freq_scaling_enable_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t size)
++{
++	if (strncmp(buf, "1", 1) == 0) {
++		bus_freq_scaling_is_active = 1;
++		set_high_bus_freq(1);
++		/*
++		 * We set bus freq to higher at the beginning,
++		 * so we use this daemon thread to make sure system
++		 * can enter low bus mode if there is no high bus request pending
++		 */
++		schedule_delayed_work(&bus_freq_daemon,
++			usecs_to_jiffies(5000000));
++	} else if (strncmp(buf, "0", 1) == 0) {
++		if (bus_freq_scaling_is_active)
++			set_high_bus_freq(1);
++		bus_freq_scaling_is_active = 0;
++	}
++	return size;
++}
++
++static int bus_freq_pm_notify(struct notifier_block *nb, unsigned long event,
++	void *dummy)
++{
++	mutex_lock(&bus_freq_mutex);
++
++	if (event == PM_SUSPEND_PREPARE) {
++		high_bus_count++;
++		set_high_bus_freq(1);
++		busfreq_suspended = 1;
++	} else if (event == PM_POST_SUSPEND) {
++		busfreq_suspended = 0;
++		high_bus_count--;
++		schedule_delayed_work(&bus_freq_daemon,
++			usecs_to_jiffies(5000000));
++	}
++
++	mutex_unlock(&bus_freq_mutex);
++
++	return NOTIFY_OK;
++}
++
++static int busfreq_reboot_notifier_event(struct notifier_block *this,
++						 unsigned long event, void *ptr)
++{
++	/* System is rebooting. Set the system into high_bus_freq_mode. */
++	request_bus_freq(BUS_FREQ_HIGH);
++
++	return 0;
++}
++
++static struct notifier_block imx_bus_freq_pm_notifier = {
++	.notifier_call = bus_freq_pm_notify,
++};
++
++static struct notifier_block imx_busfreq_reboot_notifier = {
++	.notifier_call = busfreq_reboot_notifier_event,
++};
++
++static DEVICE_ATTR(enable, 0644, bus_freq_scaling_enable_show,
++			bus_freq_scaling_enable_store);
++
++static int imx8mq_init_busfreq_clk(struct platform_device *pdev)
++{
++	dram_pll_clk = devm_clk_get(&pdev->dev, "dram_pll");
++	sys1_pll_800m = devm_clk_get(&pdev->dev, "sys1_pll_800m");
++	sys1_pll_400m = devm_clk_get(&pdev->dev, "sys1_pll_400m");
++	sys1_pll_100m = devm_clk_get(&pdev->dev, "sys1_pll_100m");
++	sys1_pll_40m = devm_clk_get(&pdev->dev, "sys1_pll_40m");
++	dram_alt_src = devm_clk_get(&pdev->dev, "dram_alt_src");
++	dram_alt_root = devm_clk_get(&pdev->dev, "dram_alt_root");
++	dram_core_clk = devm_clk_get(&pdev->dev, "dram_core");
++	dram_apb_src = devm_clk_get(&pdev->dev, "dram_apb_src");
++	dram_apb_pre_div = devm_clk_get(&pdev->dev, "dram_apb_pre_div");
++	noc_div = devm_clk_get(&pdev->dev, "noc_div");
++	ahb_div = devm_clk_get(&pdev->dev, "ahb_div");
++	main_axi_src = devm_clk_get(&pdev->dev, "main_axi_src");
++	osc_25m = devm_clk_get(&pdev->dev, "osc_25m");
++	sys2_pll_333m = devm_clk_get(&pdev->dev, "sys2_pll_333m");
++
++	if (IS_ERR(dram_pll_clk) || IS_ERR(sys1_pll_400m) || IS_ERR(sys1_pll_100m) ||
++	    IS_ERR(sys1_pll_40m) || IS_ERR(dram_alt_src) || IS_ERR(dram_alt_root) ||
++	    IS_ERR(dram_core_clk) || IS_ERR(dram_apb_src) || IS_ERR(dram_apb_pre_div)
++	    || IS_ERR(noc_div) || IS_ERR(main_axi_src) || IS_ERR(ahb_div)
++	    || IS_ERR(osc_25m) || IS_ERR(sys2_pll_333m)) {
++		dev_err(&pdev->dev, "failed to get busfreq clk\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int imx8mm_init_busfreq_clk(struct platform_device *pdev)
++{
++	dram_pll = devm_clk_get(&pdev->dev, "dram_pll_div");
++	dram_pll_clk = devm_clk_get(&pdev->dev, "dram_pll");
++	dram_alt_src = devm_clk_get(&pdev->dev, "dram_alt_src");
++	dram_alt_root = devm_clk_get(&pdev->dev, "dram_alt_root");
++	dram_core_clk = devm_clk_get(&pdev->dev, "dram_core");
++	dram_apb_src = devm_clk_get(&pdev->dev, "dram_apb_src");
++	dram_apb_pre_div = devm_clk_get(&pdev->dev, "dram_apb_pre_div");
++	sys1_pll_800m = devm_clk_get(&pdev->dev, "sys_pll1_800m");
++	sys1_pll_100m = devm_clk_get(&pdev->dev, "sys_pll1_100m");
++	sys1_pll_40m = devm_clk_get(&pdev->dev, "sys_pll1_40m");
++	noc_div = devm_clk_get(&pdev->dev, "noc_div");
++	ahb_div = devm_clk_get(&pdev->dev, "ahb_div");
++	main_axi_src = devm_clk_get(&pdev->dev, "main_axi_src");
++	osc_25m = devm_clk_get(&pdev->dev, "osc_24m");
++	sys2_pll_333m = devm_clk_get(&pdev->dev, "sys_pll2_333m");
++
++	if (IS_ERR(dram_pll_clk) || IS_ERR(dram_alt_src) || IS_ERR(dram_alt_root) ||
++	    IS_ERR(dram_core_clk) || IS_ERR(dram_apb_src) || IS_ERR(dram_apb_pre_div) ||
++	    IS_ERR(sys1_pll_800m) || IS_ERR(sys1_pll_100m) || IS_ERR(sys1_pll_40m) ||
++	    IS_ERR(osc_25m) || IS_ERR(noc_div) || IS_ERR(main_axi_src) || IS_ERR(ahb_div) ||
++	    IS_ERR(sys2_pll_333m)) {
++		dev_err(&pdev->dev, "failed to get busfreq clk\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/*!
++ * This is the probe routine for the bus frequency driver.
++ *
++ * @param   pdev   The platform device structure
++ *
++ * @return         The function returns 0 on success
++ *
++ */
++
++static int busfreq_probe(struct platform_device *pdev)
++{
++	int i, err;
++	struct arm_smccc_res res;
++
++	busfreq_dev = &pdev->dev;
++
++	/* get the clock for DDRC */
++	if (of_machine_is_compatible("fsl,imx8mq"))
++		err = imx8mq_init_busfreq_clk(pdev);
++	else
++		err = imx8mm_init_busfreq_clk(pdev);
++
++	if (err) {
++		dev_err(busfreq_dev, "init clk failed\n");
++		return err;
++	}
++
++	origin_noc_rate = clk_get_rate(noc_div);
++	if (origin_noc_rate == 0) {
++		WARN_ON(1);
++		return -EINVAL;
++	}
++
++	/*
++	 * Get the supported frequency, normally the lowest frequency point
++	 * is used for low bus & audio bus mode.
++	 */
++	for (i = 0; i < 4; i++) {
++		arm_smccc_smc(FSL_SIP_DDR_DVFS, 0x11, i, 0, 0, 0, 0, 0, &res);
++		err = res.a0;
++		if (err < 0)
++			return -EINVAL;
++
++		fsp_table[i] = res.a0;
++	}
++
++	/* get the lowest fsp index */
++	for (i = 0; i < 4; i++)
++		if (fsp_table[i] == 0)
++			break;
++
++	low_bus_mode_fsp_index = i - 1;
++
++	/*
++	 * if lowest fsp data rate higher than 666mts, then no dll off mode or
++	 * bypass mode support.
++	 */
++	if (fsp_table[low_bus_mode_fsp_index] >= DLL_ON_DRATE)
++		bypass_support = false;
++
++	/* create the sysfs file */
++	err = sysfs_create_file(&busfreq_dev->kobj, &dev_attr_enable.attr);
++	if (err) {
++		dev_err(busfreq_dev,
++			"Unable to register sysdev entry for BUSFREQ");
++		return err;
++	}
++
++	high_bus_freq_mode = 1;
++	low_bus_freq_mode = 0;
++	audio_bus_freq_mode = 0;
++	cur_bus_freq_mode = BUS_FREQ_HIGH;
++
++	bus_freq_scaling_is_active = 1;
++	bus_freq_scaling_initialized = 1;
++
++	INIT_DELAYED_WORK(&low_bus_freq_handler, reduce_bus_freq_handler);
++	INIT_DELAYED_WORK(&bus_freq_daemon, bus_freq_daemon_handler);
++	register_pm_notifier(&imx_bus_freq_pm_notifier);
++	register_reboot_notifier(&imx_busfreq_reboot_notifier);
++
++	/* enter low bus mode if no high speed device enabled */
++	schedule_delayed_work(&bus_freq_daemon, msecs_to_jiffies(10000));
++
++	return 0;
++}
++
++static const struct of_device_id imx_busfreq_ids[] = {
++	{ .compatible = "fsl,imx_busfreq", },
++	{ /*sentinel */}
++};
++
++static struct platform_driver busfreq_driver = {
++	.driver = {
++		.name = "imx_busfreq",
++		.owner = THIS_MODULE,
++		.of_match_table = imx_busfreq_ids,
++		},
++	.probe = busfreq_probe,
++};
++
++/*!
++ * Initialise the busfreq_driver.
++ *
++ * @return The function always returns 0.
++ */
++static int __init busfreq_init(void)
++{
++	if (platform_driver_register(&busfreq_driver) != 0)
++		return -ENODEV;
++
++	printk(KERN_INFO "Bus freq driver module loaded\n");
++
++	return 0;
++}
++
++static void __exit busfreq_cleanup(void)
++{
++	sysfs_remove_file(&busfreq_dev->kobj, &dev_attr_enable.attr);
++
++	/* Unregister the device structure */
++	platform_driver_unregister(&busfreq_driver);
++	bus_freq_scaling_initialized = 0;
++}
++
++module_init(busfreq_init);
++module_exit(busfreq_cleanup);
++
++MODULE_AUTHOR("NXP Semiconductor, Inc.");
++MODULE_DESCRIPTION("Busfreq driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/imx/imx8m_pm_domains.c b/drivers/soc/imx/imx8m_pm_domains.c
+new file mode 100644
+index 000000000..914315c02
+--- /dev/null
++++ b/drivers/soc/imx/imx8m_pm_domains.c
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2019 NXP.
++ */
++
++#include <linux/arm-smccc.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/pm_domain.h>
++#include <linux/regulator/consumer.h>
++
++#include <soc/imx/imx_sip.h>
++
++#define MAX_CLK_NUM	6
++#define to_imx8m_pm_domain(_genpd) container_of(_genpd, struct imx8m_pm_domain, pd)
++
++
++struct imx8m_pm_domain {
++	struct device *dev;
++	struct generic_pm_domain pd;
++	u32 domain_index;
++	struct clk *clk[MAX_CLK_NUM];
++	unsigned int num_clks;
++	struct regulator *reg;
++};
++
++enum imx8m_pm_domain_state {
++	PD_STATE_OFF,
++	PD_STATE_ON,
++};
++
++static DEFINE_MUTEX(gpc_pd_mutex);
++
++static int imx8m_pd_power_on(struct generic_pm_domain *genpd)
++{
++	struct imx8m_pm_domain *domain = to_imx8m_pm_domain(genpd);
++	struct arm_smccc_res res;
++	int index, ret = 0;
++
++	/* power on the external supply */
++	if (!IS_ERR(domain->reg)) {
++		ret = regulator_enable(domain->reg);
++		if (ret) {
++			dev_warn(domain->dev, "failed to power up the reg%d\n", ret);
++			return ret;
++		}
++	}
++
++	/* enable the necessary clks needed by the power domain */
++	if (domain->num_clks) {
++		for (index = 0; index < domain->num_clks; index++)
++			clk_prepare_enable(domain->clk[index]);
++	}
++
++	mutex_lock(&gpc_pd_mutex);
++	arm_smccc_smc(IMX_SIP_GPC, IMX_SIP_CONFIG_GPC_PM_DOMAIN, domain->domain_index,
++		      PD_STATE_ON, 0, 0, 0, 0, &res);
++	mutex_unlock(&gpc_pd_mutex);
++
++	return 0;
++}
++
++static int imx8m_pd_power_off(struct generic_pm_domain *genpd)
++{
++	struct imx8m_pm_domain *domain = to_imx8m_pm_domain(genpd);
++	struct arm_smccc_res res;
++	int index, ret = 0;
++
++	mutex_lock(&gpc_pd_mutex);
++	arm_smccc_smc(IMX_SIP_GPC, IMX_SIP_CONFIG_GPC_PM_DOMAIN, domain->domain_index,
++		      PD_STATE_OFF, 0, 0, 0, 0, &res);
++	mutex_unlock(&gpc_pd_mutex);
++
++	/* power off the external supply */
++	if (!IS_ERR(domain->reg)) {
++		ret = regulator_disable(domain->reg);
++		if (ret) {
++			dev_warn(domain->dev, "failed to power off the reg%d\n", ret);
++			return ret;
++		}
++	}
++
++	/* disable clks when power domain is off */
++	if (domain->num_clks) {
++		for (index = 0; index < domain->num_clks; index++)
++			clk_disable_unprepare(domain->clk[index]);
++	}
++
++	return ret;
++};
++
++static int imx8m_pd_get_clocks(struct imx8m_pm_domain *domain)
++{
++	int i, ret;
++
++	for (i = 0; ; i++) {
++		struct clk *clk = of_clk_get(domain->dev->of_node, i);
++		if (IS_ERR(clk))
++			break;
++		if (i >= MAX_CLK_NUM) {
++			dev_err(domain->dev, "more than %d clocks\n",
++				MAX_CLK_NUM);
++			ret = -EINVAL;
++			goto clk_err;
++		}
++		domain->clk[i] = clk;
++	}
++	domain->num_clks = i;
++
++	return 0;
++
++clk_err:
++	while (i--)
++		clk_put(domain->clk[i]);
++
++	return ret;
++}
++
++static void imx8m_pd_put_clocks(struct imx8m_pm_domain *domain)
++{
++	int i;
++
++	for (i = domain->num_clks - 1; i >= 0; i--)
++		clk_put(domain->clk[i]);
++}
++
++static const struct of_device_id imx8m_pm_domain_ids[] = {
++	{.compatible = "fsl,imx8m-pm-domain"},
++	{},
++};
++
++static int imx8m_pm_domain_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct imx8m_pm_domain *domain;
++	struct of_phandle_args parent, child;
++	int ret;
++
++	domain = devm_kzalloc(dev, sizeof(*domain), GFP_KERNEL);
++	if (!domain)
++		return -ENOMEM;
++
++	child.np = np;
++	domain->dev = dev;
++
++	ret = of_property_read_string(np, "domain-name", &domain->pd.name);
++	if (ret) {
++		dev_err(dev, "failed to get the domain name\n");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32(np, "domain-index", &domain->domain_index);
++	if (ret) {
++		dev_err(dev, "failed to get the domain index\n");
++		return -EINVAL;
++	}
++
++	domain->reg = devm_regulator_get_optional(dev, "power");
++	if (IS_ERR(domain->reg)) {
++		if (PTR_ERR(domain->reg) != -ENODEV) {
++			if (PTR_ERR(domain->reg) != -EPROBE_DEFER)
++				dev_err(dev, "failed to get domain's regulator\n");
++			return PTR_ERR(domain->reg);
++		}
++	}
++
++	ret = imx8m_pd_get_clocks(domain);
++	if (ret) {
++		if (ret != -EPROBE_DEFER)
++			dev_err(dev, "failed to get domain's clocks\n");
++		return ret;
++	}
++
++	domain->pd.power_off = imx8m_pd_power_off;
++	domain->pd.power_on = imx8m_pd_power_on;
++	if (of_property_read_bool(np, "active-wakeup"))
++		domain->pd.flags |= GENPD_FLAG_ACTIVE_WAKEUP;
++	if (of_property_read_bool(np, "rpm-always-on"))
++		domain->pd.flags |= GENPD_FLAG_RPM_ALWAYS_ON;
++
++	pm_genpd_init(&domain->pd, NULL, !(domain->pd.flags & GENPD_FLAG_RPM_ALWAYS_ON));
++
++	ret = of_genpd_add_provider_simple(np, &domain->pd);
++	if (ret) {
++		dev_err(dev, "failed to add the domain provider\n");
++		pm_genpd_remove(&domain->pd);
++		imx8m_pd_put_clocks(domain);
++		return ret;
++	}
++
++	/* add it as subdomain if necessary */
++	if (!of_parse_phandle_with_args(np, "parent-domains",
++			"#power-domain-cells", 0, &parent)) {
++		ret = of_genpd_add_subdomain(&parent, &child);
++		of_node_put(parent.np);
++
++		if (ret < 0) {
++			dev_dbg(dev, "failed to add the subdomain: %s: %d",
++				domain->pd.name, ret);
++			of_genpd_del_provider(np);
++			pm_genpd_remove(&domain->pd);
++			imx8m_pd_put_clocks(domain);
++			return -EPROBE_DEFER;
++		}
++	}
++
++	return 0;
++}
++
++static struct platform_driver imx8m_pm_domain_driver = {
++	.driver = {
++		.name	= "imx8m_pm_domain",
++		.owner	= THIS_MODULE,
++		.of_match_table = imx8m_pm_domain_ids,
++	},
++	.probe = imx8m_pm_domain_probe,
++};
++module_platform_driver(imx8m_pm_domain_driver);
++
++MODULE_AUTHOR("NXP");
++MODULE_DESCRIPTION("NXP i.MX8M power domain driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/soc/imx/mu/Makefile b/drivers/soc/imx/mu/Makefile
+new file mode 100644
+index 000000000..922308c3f
+--- /dev/null
++++ b/drivers/soc/imx/mu/Makefile
+@@ -0,0 +1 @@
++obj-y += mx8_mu.o
+diff --git a/drivers/soc/imx/mu/mx8_mu.c b/drivers/soc/imx/mu/mx8_mu.c
+new file mode 100644
+index 000000000..2cd6dc880
+--- /dev/null
++++ b/drivers/soc/imx/mu/mx8_mu.c
+@@ -0,0 +1,187 @@
++/*
++ * Copyright (C) 2016 Freescale Semiconductor, Inc.
++ * Copyright 2017 NXP
++ *
++ * SPDX-License-Identifier:     GPL-2.0+
++ */
++
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/mx8_mu.h>
++#include <linux/of.h>
++
++static int version;
++
++/*!
++ * This function sets the Flag n of the MU.
++ */
++int32_t MU_SetFn(void __iomem *base, uint32_t Fn)
++{
++	uint32_t reg, offset;
++
++	reg = Fn & (~MU_CR_Fn_MASK1);
++	if (reg > 0)
++		return -EINVAL;
++
++	offset = unlikely(version == MU_VER_ID_V10)
++			  ? MU_V10_ACR_OFFSET1 : MU_ACR_OFFSET1;
++
++	reg = readl_relaxed(base + offset);
++	/*  Clear ABFn. */
++	reg &= ~MU_CR_Fn_MASK1;
++	reg |= Fn;
++	writel_relaxed(reg, base + offset);
++
++	return 0;
++}
++
++/*!
++ * This function reads the status from status register.
++ */
++uint32_t MU_ReadStatus(void __iomem *base)
++{
++	uint32_t reg, offset;
++
++	offset = unlikely(version == MU_VER_ID_V10)
++			  ? MU_V10_ASR_OFFSET1 : MU_ASR_OFFSET1;
++
++	reg = readl_relaxed(base + offset);
++
++	return reg;
++}
++
++/*!
++ * This function enables specific RX full interrupt.
++ */
++void MU_EnableRxFullInt(void __iomem *base, uint32_t index)
++{
++	uint32_t reg, offset;
++
++	offset = unlikely(version == MU_VER_ID_V10)
++			  ? MU_V10_ACR_OFFSET1 : MU_ACR_OFFSET1;
++
++	reg = readl_relaxed(base + offset);
++	reg &= ~(MU_CR_GIRn_MASK1 | MU_CR_NMI_MASK1);
++	reg |= MU_CR_RIE0_MASK1 >> index;
++	writel_relaxed(reg, base + offset);
++}
++
++/*!
++ * This function enables specific general purpose interrupt.
++ */
++void MU_EnableGeneralInt(void __iomem *base, uint32_t index)
++{
++	uint32_t reg, offset;
++
++	offset = unlikely(version == MU_VER_ID_V10)
++			  ? MU_V10_ACR_OFFSET1 : MU_ACR_OFFSET1;
++
++	reg = readl_relaxed(base + offset);
++	reg &= ~(MU_CR_GIRn_MASK1 | MU_CR_NMI_MASK1);
++	reg |= MU_CR_GIE0_MASK1 >> index;
++	writel_relaxed(reg, base + offset);
++}
++
++/*
++ * Wait and send message to the other core.
++ */
++void MU_SendMessage(void __iomem *base, uint32_t regIndex, uint32_t msg)
++{
++	uint32_t mask = MU_SR_TE0_MASK1 >> regIndex;
++
++	if (unlikely(version == MU_VER_ID_V10)) {
++		/* Wait TX register to be empty. */
++		while (!(readl_relaxed(base + MU_V10_ASR_OFFSET1) & mask))
++			;
++		writel_relaxed(msg, base + MU_V10_ATR0_OFFSET1
++			       + (regIndex * 4));
++	} else {
++		/* Wait TX register to be empty. */
++		while (!(readl_relaxed(base + MU_ASR_OFFSET1) & mask))
++			;
++		writel_relaxed(msg, base + MU_ATR0_OFFSET1  + (regIndex * 4));
++	}
++}
++
++/*
++ * Wait and send message to the other core with timeout mechanism.
++ */
++void MU_SendMessageTimeout(void __iomem *base, uint32_t regIndex, uint32_t msg,
++		uint32_t t)
++{
++	uint32_t mask = MU_SR_TE0_MASK1 >> regIndex;
++	uint32_t timeout = t;
++
++	if (unlikely(version == MU_VER_ID_V10)) {
++		/* Wait TX register to be empty. */
++		while (!(readl_relaxed(base + MU_V10_ASR_OFFSET1) & mask)) {
++			udelay(10);
++			if (timeout-- == 0)
++				return;
++		};
++
++		writel_relaxed(msg, base + MU_V10_ATR0_OFFSET1
++			       + (regIndex * 4));
++	} else {
++		/* Wait TX register to be empty. */
++		while (!(readl_relaxed(base + MU_ASR_OFFSET1) & mask)) {
++			udelay(10);
++			if (timeout-- == 0)
++				return;
++		};
++
++		writel_relaxed(msg, base + MU_ATR0_OFFSET1  + (regIndex * 4));
++	}
++}
++
++/*
++ * Wait to receive message from the other core.
++ */
++void MU_ReceiveMsg(void __iomem *base, uint32_t regIndex, uint32_t *msg)
++{
++	uint32_t mask = MU_SR_RF0_MASK1 >> regIndex;
++
++	if (unlikely(version == MU_VER_ID_V10)) {
++		/* Wait RX register to be full. */
++		while (!(readl_relaxed(base + MU_V10_ASR_OFFSET1) & mask))
++			;
++		*msg = readl_relaxed(base + MU_V10_ARR0_OFFSET1
++				     + (regIndex * 4));
++	} else {
++		/* Wait RX register to be full. */
++		while (!(readl_relaxed(base + MU_ASR_OFFSET1) & mask))
++			;
++		*msg = readl_relaxed(base + MU_ARR0_OFFSET1 + (regIndex * 4));
++	}
++}
++
++
++
++void MU_Init(void __iomem *base)
++{
++	uint32_t reg, offset;
++
++	version = readl_relaxed(base) >> 16;
++
++	offset = unlikely(version == MU_VER_ID_V10)
++			  ? MU_V10_ACR_OFFSET1 : MU_ACR_OFFSET1;
++
++	reg = readl_relaxed(base + offset);
++	/* Clear GIEn, TIEn, GIRn and ABFn. */
++	reg &= ~(MU_CR_GIEn_MASK1 | MU_CR_TIEn_MASK1
++		 | MU_CR_GIRn_MASK1 | MU_CR_NMI_MASK1 | MU_CR_Fn_MASK1);
++
++	/*
++	 * i.MX6SX and i.MX7D have multi-core power management which need
++	 * to use RIE interrupts.
++	 */
++	if (!(of_machine_is_compatible("fsl,imx6sx") ||
++		of_machine_is_compatible("fsl,imx7d")))
++		reg &= ~MU_CR_RIEn_MASK1;
++
++	writel_relaxed(reg, base + offset);
++}
++
++/**@}*/
++
+diff --git a/drivers/soc/imx/rpmsg_life_cycle.c b/drivers/soc/imx/rpmsg_life_cycle.c
+new file mode 100644
+index 000000000..e3d540f15
+--- /dev/null
++++ b/drivers/soc/imx/rpmsg_life_cycle.c
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright 2021 NXP
++ */
++
++#include <linux/cpu.h>
++#include <linux/imx_rpmsg.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/reboot.h>
++#include <linux/rpmsg.h>
++
++#define PM_RPMSG_TYPE		0
++
++struct pm_rpmsg_data {
++	struct imx_rpmsg_head header;
++	u8 data;
++	u8 reserved;
++} __packed;
++
++enum pm_rpmsg_cmd {
++	PM_RPMSG_MODE,
++};
++
++enum pm_rpmsg_power_mode {
++	PM_RPMSG_SHUTDOWN = 7,
++};
++
++static struct rpmsg_device *life_cycle_rpdev;
++
++static int rpmsg_life_cycle_notifier(struct notifier_block *nb,
++		unsigned long action, void *unused)
++{
++	int ret;
++#ifdef CONFIG_HOTPLUG_CPU
++	int cpu;
++#endif
++	struct pm_rpmsg_data msg;
++
++	/* return early if it is RESTART case */
++	if (action == SYS_RESTART)
++		return NOTIFY_DONE;
++
++	/*
++	 * unplug the non-boot cpu to make sure A35 cluster can be
++	 * put into DPD mode without risk.
++	 */
++
++#ifdef CONFIG_HOTPLUG_CPU
++	for_each_online_cpu(cpu) {
++		if (cpu == cpumask_first(cpu_online_mask))
++			continue;
++		ret = remove_cpu(cpu);
++		if (ret) {
++			pr_info("unplug the non-boot cpu failed:%d\n", ret);
++			return NOTIFY_BAD;
++		}
++	}
++#endif
++	msg.header.cate = IMX_RMPSG_LIFECYCLE;
++	msg.header.major = IMX_RMPSG_MAJOR;
++	msg.header.minor = IMX_RMPSG_MINOR;
++	msg.header.type = PM_RPMSG_TYPE;
++	msg.header.cmd = PM_RPMSG_MODE;
++	msg.data = PM_RPMSG_SHUTDOWN;
++
++	/* No ACK from M core */
++	ret = rpmsg_send(life_cycle_rpdev->ept, &msg, sizeof(struct pm_rpmsg_data));
++
++	if (ret) {
++		pr_info("rpmsg send failed:%d\n", ret);
++		return NOTIFY_BAD;
++	}
++
++	return NOTIFY_DONE;
++};
++
++static struct notifier_block rpmsg_life_cycle_nb = {
++	.notifier_call = rpmsg_life_cycle_notifier,
++};
++
++static int rpmsg_life_cycle_cb(struct rpmsg_device *rpdev, void *data, int len,
++				void *priv, u32 src)
++{
++	return 0;
++}
++
++static int rpmsg_life_cycle_probe(struct rpmsg_device *rpdev)
++{
++
++	life_cycle_rpdev = rpdev;
++
++	dev_info(&rpdev->dev, "new channel: 0x%x -> 0x%x!\n",
++			rpdev->src, rpdev->dst);
++
++	return register_reboot_notifier(&rpmsg_life_cycle_nb);
++}
++
++static struct rpmsg_device_id rpmsg_life_cycle_id_table[] = {
++	{ .name = "rpmsg-life-cycle-channel" },
++	{ },
++};
++
++static struct rpmsg_driver rpmsg_life_cycle_driver = {
++	.drv.name = 	"rpmsg_life_cycle",
++	.drv.owner	= THIS_MODULE,
++	.id_table	= rpmsg_life_cycle_id_table,
++	.probe		= rpmsg_life_cycle_probe,
++	.callback	= rpmsg_life_cycle_cb,
++};
++
++static int __init rpmsg_life_cycle_init(void)
++{
++	return register_rpmsg_driver(&rpmsg_life_cycle_driver);
++};
++module_init(rpmsg_life_cycle_init);
++
++MODULE_AUTHOR("NXP Semiconductor");
++MODULE_DESCRIPTION("NXP rpmsg life cycle driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/soc/imx/secvio/Makefile b/drivers/soc/imx/secvio/Makefile
+new file mode 100644
+index 000000000..d5a89ba24
+--- /dev/null
++++ b/drivers/soc/imx/secvio/Makefile
+@@ -0,0 +1,3 @@
++obj-y +=  imx-secvio-sc.o
++obj-$(CONFIG_DEBUG_FS) += imx-secvio-debugfs.o
++obj-$(CONFIG_AUDIT) += imx-secvio-audit.o
+diff --git a/drivers/soc/imx/secvio/imx-secvio-audit.c b/drivers/soc/imx/secvio/imx-secvio-audit.c
+new file mode 100644
+index 000000000..e3c513114
+--- /dev/null
++++ b/drivers/soc/imx/secvio/imx-secvio-audit.c
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2019 NXP
++ *
++ */
++
++#include <linux/audit.h>
++
++#include <soc/imx/imx-secvio-sc.h>
++
++int report_to_audit_notify(struct notifier_block *nb, unsigned long status,
++			   void *notif_info)
++{
++	int ret = 0;
++	struct audit_buffer *ab;
++	struct secvio_sc_notifier_info *info = notif_info;
++
++	ab = audit_log_start(audit_context(), GFP_KERNEL, AUDIT_INTEGRITY_RULE);
++	if (!ab) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
++	audit_log_format(ab, " hpsvs=0x%.08x lps=0x%.08x lptds=0x%.08x",
++			 info->hpsvs, info->lps, info->lptds);
++	audit_log_task_info(ab);
++	audit_log_end(ab);
++
++exit:
++	return ret;
++}
+diff --git a/drivers/soc/imx/secvio/imx-secvio-debugfs.c b/drivers/soc/imx/secvio/imx-secvio-debugfs.c
+new file mode 100644
+index 000000000..a7ce1a98e
+--- /dev/null
++++ b/drivers/soc/imx/secvio/imx-secvio-debugfs.c
+@@ -0,0 +1,283 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2019 NXP
++ *
++ */
++
++/*
++ * The module exposes 3 files in debugfs:
++ *  - secvio/info:
++ *      * Read: It returns the value of the fuses and SNVS registers which are
++ *              readable and related to secvio and tampers
++ *      * Write: A write of the format "<hex id> [<hex value 0> <hex value 1>
++ *               <hex value 2> <hex value 3> <hex value 4>](<nb values>)"
++ *               will write the SNVS register having the provided id with the
++ *               values provided (cf SECO ducumentation)
++ *  - secvio/enable: State of the IRQ
++ *  - secvio/check: Check the state of the security violation and tampers
++ *                  and calls notifier
++ *  - secvio/clear: Clear the state of all secvio and tampers
++ */
++
++/* Includes */
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/nvmem-consumer.h>
++
++#include <linux/firmware/imx/svc/misc.h>
++#include <linux/firmware/imx/svc/seco.h>
++
++#include <soc/imx/imx-secvio-sc.h>
++#include "imx-secvio-sc-int.h"
++
++int fuse_reader(struct device *dev, u32 id, u32 *value, u8 mul)
++{
++	struct imx_secvio_sc_data *data = dev_get_drvdata(dev);
++	u32 size_to_read = mul * sizeof(u32);
++	int ret;
++
++	ret = nvmem_device_read(data->nvmem, id, size_to_read, value);
++	if (ret < 0) {
++		dev_err(data->dev, "Failed to read fuse %d: %d\n", id, ret);
++		return ret;
++	}
++
++	if (ret != size_to_read) {
++		dev_err(data->dev, "Read only %d instead of %d\n", ret,
++			size_to_read);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++int snvs_reader(struct device *dev, u32 id, u32 *value, u8 mul)
++{
++	int ret;
++	u32 *v1, *v2, *v3, *v4, *v5;
++
++	v1 = NULL;
++	v2 = NULL;
++	v3 = NULL;
++	v4 = NULL;
++	v5 = NULL;
++
++	switch (mul) {
++	case 5:
++		v5 = &value[4];
++		fallthrough;
++	case 4:
++		v4 = &value[3];
++		fallthrough;
++	case 3:
++		v3 = &value[2];
++		fallthrough;
++	case 2:
++		v2 = &value[1];
++		fallthrough;
++	case 1:
++		v1 = &value[0];
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	ret = call_secvio_config(dev, id, SECVIO_CONFIG_READ, v1, v2, v3, v4,
++				 v5, mul);
++	if (ret < 0)
++		dev_err(dev, "Failed to read snvs reg %d: %d\n", id, ret);
++
++	return ret;
++}
++
++int snvs_dgo_reader(struct device *dev, u32 id, u32 *value, u8 mul)
++{
++	struct imx_secvio_sc_data *data = dev_get_drvdata(dev);
++	int ret;
++
++	if (mul != 1)
++		return -EINVAL;
++
++	ret = imx_sc_seco_secvio_dgo_config(data->ipc_handle, id,
++					    SECVIO_CONFIG_READ, value);
++	if (ret)
++		dev_err(dev, "Failed to read snvs dgo reg %d: %d\n", id, ret);
++
++	return ret;
++}
++
++static const struct imx_secvio_info_entry {
++	int (*reader)(struct device *dev, u32 id, u32 *value, u8 mul);
++	const char *type;
++	const char *name;
++	u32 id;
++	u8 mul;
++} gs_imx_secvio_info_list[] = {
++	{fuse_reader, "fuse", "trim", 30, 1},
++	{fuse_reader, "fuse", "trim2", 31, 1},
++	{fuse_reader, "fuse", "ctrim1", 260, 1},
++	{fuse_reader, "fuse", "ctrim2", 261, 1},
++	{fuse_reader, "fuse", "ctrim3", 262, 1},
++	{fuse_reader, "fuse", "ctrim4", 263, 1},
++	{fuse_reader, "fuse", "OSC_CAP", 768, 1},
++
++	{snvs_reader, "snvs", "HPLR",    0x0, 1},
++	{snvs_reader, "snvs", "LPLR",    0x34, 1},
++	{snvs_reader, "snvs", "HPSICR",  0xc, 1},
++	{snvs_reader, "snvs", "HPSVCR",  0x10, 1},
++	{snvs_reader, "snvs", "HPSVS",   0x18, 1},
++	{snvs_reader, "snvs", "LPSVC",   0x40, 1},
++	{snvs_reader, "snvs", "LPTDC",   0x48, 2},
++	{snvs_reader, "snvs", "LPSR",    0x4c, 1},
++	{snvs_reader, "snvs", "LPTDS",   0xa4, 1},
++	{snvs_reader, "snvs", "LPTGFC",  0x44, 3},
++	{snvs_reader, "snvs", "LPATCTL", 0xe0, 1},
++	{snvs_reader, "snvs", "LPATCLK", 0xe4, 1},
++	{snvs_reader, "snvs", "LPATRC1", 0xe8, 2},
++	{snvs_reader, "snvs", "LPMKC",   0x3c, 1},
++	{snvs_reader, "snvs", "LPSMC",   0x5c, 2},
++	{snvs_reader, "snvs", "LPPGD",   0x64, 1},
++	{snvs_reader, "snvs", "HPVID",   0xf8, 2},
++
++	{snvs_dgo_reader, "dgo", "Offset",  0x0, 1},
++	{snvs_dgo_reader, "dgo", "PUP/PD",  0x10, 1},
++	{snvs_dgo_reader, "dgo", "Anatest", 0x20, 1},
++	{snvs_dgo_reader, "dgo", "T trim",  0x30, 1},
++	{snvs_dgo_reader, "dgo", "Misc",    0x40, 1},
++	{snvs_dgo_reader, "dgo", "Vmon",    0x50, 1},
++};
++
++struct imx_secvio_sc_info_seq_data {
++	struct device *dev;
++	const struct imx_secvio_info_entry *list;
++	int size;
++};
++
++static void *imx_secvio_sc_info_seq_start(struct seq_file *m, loff_t *pos)
++{
++	struct imx_secvio_sc_info_seq_data *data = m->private;
++
++	/* Check we are not out of bound */
++	if (*pos >= data->size)
++		return NULL;
++
++	return (void *)pos;
++}
++
++static void *imx_secvio_sc_info_seq_next(struct seq_file *m, void *v, loff_t *pos)
++{
++	/* Increment the counter */
++	++*pos;
++
++	/* call the start function which will check the index */
++	return imx_secvio_sc_info_seq_start(m, pos);
++}
++
++static void imx_secvio_sc_info_seq_stop(struct seq_file *m, void *v)
++{
++}
++
++static int imx_secvio_sc_info_seq_show(struct seq_file *m, void *v)
++{
++	struct imx_secvio_sc_info_seq_data *data = m->private;
++	const struct imx_secvio_info_entry *e;
++	int ret;
++	u32 vals[5];
++	int idx;
++
++	idx = *(loff_t *)v;
++	e = &data->list[idx];
++
++	/* Read the values */
++	ret = e->reader(data->dev, e->id, (u32 *)&vals, e->mul);
++	if (ret) {
++		dev_err(data->dev, "Fail to read %s %s (idx %d)\n", e->type,
++			e->name, e->id);
++		return 0;
++	}
++
++	seq_printf(m, "%5s/%-10s(%.3d):", e->type, e->name, e->id);
++
++	/* Loop over the values */
++	for (idx = 0; idx < e->mul; idx++)
++		seq_printf(m, " %.8x", vals[idx]);
++
++	seq_puts(m, "\n");
++
++	return 0;
++}
++
++static const struct seq_operations imx_secvio_sc_info_seq_ops = {
++	.start = imx_secvio_sc_info_seq_start,
++	.next  = imx_secvio_sc_info_seq_next,
++	.stop  = imx_secvio_sc_info_seq_stop,
++	.show  = imx_secvio_sc_info_seq_show,
++};
++
++static int imx_secvio_sc_info_open(struct inode *inode, struct file *file)
++{
++	struct imx_secvio_sc_info_seq_data *data;
++
++	data = __seq_open_private(file, &imx_secvio_sc_info_seq_ops, sizeof(*data));
++	if (!data)
++		return -ENOMEM;
++
++	data->dev = inode->i_private;
++	data->list = gs_imx_secvio_info_list;
++	data->size = ARRAY_SIZE(gs_imx_secvio_info_list);
++
++	return 0;
++}
++
++static const struct file_operations imx_secvio_sc_info_ops = {
++	.owner = THIS_MODULE,
++	.open = imx_secvio_sc_info_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release_private,
++};
++
++static void if_debugfs_remove_recursive(void *dentry)
++{
++	debugfs_remove_recursive(dentry);
++}
++
++int imx_secvio_sc_debugfs(struct device *dev)
++{
++	struct imx_secvio_sc_data *data = dev_get_drvdata(dev);
++	struct dentry *dir;
++	int ret = 0;
++
++	/* Create a folder */
++	dir = debugfs_create_dir(dev_name(dev), NULL);
++	if (IS_ERR(dir)) {
++		dev_err(dev, "Failed to create dfs dir\n");
++		ret = PTR_ERR(dir);
++		goto exit;
++	}
++	data->dfs = dir;
++
++	ret = devm_add_action(dev, if_debugfs_remove_recursive, data->dfs);
++	if (ret) {
++		dev_err(dev, "Failed to add managed action to disable IRQ\n");
++		goto remove_fs;
++	}
++
++	/* Create the file to read info and write to reg */
++	dir = debugfs_create_file("info", 0x666, data->dfs, dev,
++				  &imx_secvio_sc_info_ops);
++	if (IS_ERR(dir)) {
++		dev_err(dev, "Failed to add info to debugfs\n");
++		ret = PTR_ERR(dir);
++		goto exit;
++	}
++
++exit:
++	return ret;
++
++remove_fs:
++	debugfs_remove_recursive(data->dfs);
++	goto exit;
++}
+diff --git a/drivers/soc/imx/secvio/imx-secvio-sc-int.h b/drivers/soc/imx/secvio/imx-secvio-sc-int.h
+new file mode 100644
+index 000000000..3152ec246
+--- /dev/null
++++ b/drivers/soc/imx/secvio/imx-secvio-sc-int.h
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Copyright 2019 NXP
++ */
++
++#ifndef SECVIO_SC_H
++#define SECVIO_SC_H
++
++/* Includes */
++#include <linux/kernel.h>
++#include <linux/notifier.h>
++#include <linux/semaphore.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/miscdevice.h>
++
++/* Access for sc_seco_secvio_config API */
++#define SECVIO_CONFIG_READ  0
++#define SECVIO_CONFIG_WRITE 1
++
++/* Internal Structure */
++struct imx_secvio_sc_data {
++	struct device *dev;
++
++	struct imx_sc_ipc *ipc_handle;
++
++	struct notifier_block irq_nb;
++	struct notifier_block report_nb;
++	struct notifier_block audit_nb;
++
++	struct nvmem_device *nvmem;
++
++	struct miscdevice miscdev;
++
++#ifdef CONFIG_DEBUG_FS
++	struct dentry *dfs;
++#endif
++
++	u32 version;
++};
++
++/* Function declarations */
++extern
++int call_secvio_config(struct device *dev, u8 id, u8 access, u32 *data0,
++		       u32 *data1, u32 *data2, u32 *data3, u32 *data4, u8 size);
++
++extern
++int int_imx_secvio_sc_get_state(struct device *dev,
++				struct secvio_sc_notifier_info *info);
++
++extern
++int int_imx_secvio_sc_clear_state(struct device *dev, u32 hpsvs, u32 lps,
++				  u32 lptds);
++
++extern
++int int_imx_secvio_sc_enable_irq(struct device *dev);
++
++extern
++int int_imx_secvio_sc_disable_irq(struct device *dev);
++
++#ifdef CONFIG_DEBUG_FS
++extern
++int imx_secvio_sc_debugfs(struct device *dev);
++#else
++static inline
++int imx_secvio_sc_debugfs(struct device *dev)
++{
++	return 0;
++}
++#endif /* CONFIG_DEBUG_FS */
++
++#ifdef CONFIG_AUDIT
++int report_to_audit_notify(struct notifier_block *nb, unsigned long status,
++			   void *notif_info);
++#else /* CONFIG_AUDIT */
++static inline
++int report_to_audit_notify(struct notifier_block *nb, unsigned long status,
++			   void *notif_info)
++{
++	return 0;
++}
++#endif /* CONFIG_AUDIT */
++
++#endif /* SECVIO_SC_H */
+diff --git a/drivers/soc/imx/secvio/imx-secvio-sc.c b/drivers/soc/imx/secvio/imx-secvio-sc.c
+new file mode 100644
+index 000000000..ccf4c1a6f
+--- /dev/null
++++ b/drivers/soc/imx/secvio/imx-secvio-sc.c
+@@ -0,0 +1,675 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2019 NXP
++ *
++ */
++
++/*
++ * The i.MX8QXP SoC contains the Secure Non-Volatile Storage (SNVS) block. This
++ * block can detect specific hardware attacks. Due to the presence of the SECO,
++ * this block can only be accessible using the SCFW API.
++ *
++ * This module interact with the SCU which relay request to/from the SNVS block
++ * to detect if security violation occurred.
++ *
++ * The module exports an API to add processing when a SV is detected:
++ *  - register_imx_secvio_sc_notifier
++ *  - unregister_imx_secvio_sc_notifier
++ *  - imx_secvio_sc_check_state
++ *  - int_imx_secvio_sc_clear_state
++ *  - imx_secvio_sc_enable_irq
++ *  - imx_secvio_sc_disable_irq
++ */
++
++/* Includes */
++#include <linux/kernel.h>
++#include <linux/device.h>
++#include <linux/notifier.h>
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/miscdevice.h>
++
++#include <linux/firmware/imx/ipc.h>
++#include <linux/firmware/imx/sci.h>
++#include <linux/firmware/imx/svc/seco.h>
++#include <linux/firmware/imx/svc/rm.h>
++#include <dt-bindings/firmware/imx/rsrc.h>
++
++#include <soc/imx/imx-secvio-sc.h>
++#include "imx-secvio-sc-int.h"
++
++/* Definitions */
++
++/* Reference on the driver_device */
++static struct device *gs_imx_secvio_sc_dev;
++
++/* Register IDs for sc_seco_secvio_config API */
++#define HPSVS_ID 0x18
++#define LPS_ID 0x4c
++#define LPTDS_ID 0xa4
++#define HPVIDR_ID 0xf8
++
++#define SECO_MINOR_VERSION_SUPPORT_SECVIO_TAMPER 0x53
++#define SECO_VERSION_MINOR_MASK GENMASK(15, 0)
++
++/* Notifier list for new CB */
++static BLOCKING_NOTIFIER_HEAD(imx_secvio_sc_notifier_chain);
++
++int register_imx_secvio_sc_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(&imx_secvio_sc_notifier_chain,
++						nb);
++}
++EXPORT_SYMBOL(register_imx_secvio_sc_notifier);
++
++int unregister_imx_secvio_sc_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(&imx_secvio_sc_notifier_chain,
++						  nb);
++}
++EXPORT_SYMBOL(unregister_imx_secvio_sc_notifier);
++
++static void if_imx_scu_irq_register_notifier(void *nb)
++{
++	imx_scu_irq_register_notifier(nb);
++}
++
++static void if_unregister_imx_secvio_sc_notifier(void *nb)
++{
++	unregister_imx_secvio_sc_notifier(nb);
++}
++
++static
++int imx_secvio_sc_notifier_call_chain(struct secvio_sc_notifier_info *info)
++{
++	return blocking_notifier_call_chain(&imx_secvio_sc_notifier_chain, 0,
++					    (void *)info);
++}
++
++int int_imx_secvio_sc_get_state(struct device *dev,
++				struct secvio_sc_notifier_info *info)
++{
++	struct secvio_sc_notifier_info _info = {0};
++	struct secvio_sc_notifier_info *p_info;
++	int ret = 0, ret2 = 0;
++
++	p_info = info ? info : &_info;
++
++	/* Read secvio status */
++	ret = call_secvio_config(dev, HPSVS_ID, SECVIO_CONFIG_READ,
++				 &p_info->hpsvs, NULL, NULL, NULL, NULL, 1);
++	if (ret) {
++		ret2 = ret;
++		dev_err(dev, "Cannot read secvio status: %d\n", ret);
++	}
++	p_info->hpsvs &= HPSVS__ALL_SV__MASK;
++
++	/* Read tampers status */
++	ret = call_secvio_config(dev, LPS_ID, SECVIO_CONFIG_READ,
++				 &p_info->lps, NULL, NULL, NULL, NULL, 1);
++	if (ret) {
++		ret2 = ret;
++		dev_err(dev, "Cannot read tamper 1 status: %d\n", ret);
++	}
++	p_info->lps &= LPS__ALL_TP__MASK;
++
++	ret = call_secvio_config(dev, LPTDS_ID, SECVIO_CONFIG_READ,
++				 &p_info->lptds, NULL, NULL, NULL, NULL, 1);
++	if (ret) {
++		ret2 = ret;
++		dev_err(dev, "Cannot read  tamper 2 status: %d\n", ret);
++	}
++	p_info->lptds &= LPTDS__ALL_TP__MASK;
++
++	dev_dbg(dev, "Status: %.8x, %.8x, %.8x\n", p_info->hpsvs,
++		p_info->lps, p_info->lptds);
++
++	return ret2;
++}
++
++inline int imx_secvio_sc_get_state(struct secvio_sc_notifier_info *info)
++{
++	return int_imx_secvio_sc_get_state(gs_imx_secvio_sc_dev, info);
++}
++EXPORT_SYMBOL(imx_secvio_sc_get_state);
++
++int int_imx_secvio_sc_check_state(struct device *dev)
++{
++	struct secvio_sc_notifier_info info = {0};
++	int ret = 0;
++
++	ret = int_imx_secvio_sc_get_state(dev, &info);
++	if (ret) {
++		dev_err(dev, "Failed to get secvio state\n");
++		goto exit;
++	}
++
++	/* Call chain of CB registered to this module if status detected */
++	if (info.hpsvs || info.lps || info.lptds)
++		if (imx_secvio_sc_notifier_call_chain(&info))
++			dev_warn(dev,
++				 "Issues when calling the notifier chain\n");
++
++exit:
++	return ret;
++}
++
++inline int imx_secvio_sc_check_state(void)
++{
++	return int_imx_secvio_sc_check_state(gs_imx_secvio_sc_dev);
++}
++EXPORT_SYMBOL(imx_secvio_sc_check_state);
++
++static int imx_secvio_sc_notify(struct notifier_block *nb,
++				unsigned long event, void *group)
++{
++	struct imx_secvio_sc_data *data =
++				container_of(nb, struct imx_secvio_sc_data,
++					     irq_nb);
++	struct device *dev = data->dev;
++	int ret = 0;
++
++	/* Filter event for us */
++	if (!((event & IMX_SC_IRQ_SECVIO) &&
++	      (*(u8 *)group == IMX_SC_IRQ_GROUP_WAKE)))
++		goto exit;
++
++	dev_warn(dev, "secvio security violation detected\n");
++
++	ret = int_imx_secvio_sc_check_state(dev);
++
++	/* Re-enable interrupt */
++	ret = int_imx_secvio_sc_enable_irq(dev);
++	if (ret)
++		dev_err(dev, "Failed to enable IRQ\n");
++
++exit:
++	return ret;
++}
++
++int int_imx_secvio_sc_clear_state(struct device *dev, u32 hpsvs, u32 lps,
++				  u32 lptds)
++{
++	int ret = 0;
++
++	if (!dev)
++		return -EINVAL;
++
++	ret = call_secvio_config(dev, HPSVS_ID, SECVIO_CONFIG_WRITE, &hpsvs,
++				 NULL, NULL, NULL, NULL, 1);
++	if (ret) {
++		dev_err(dev, "Cannot clear secvio status: %d\n", ret);
++		goto exit;
++	}
++
++	ret = call_secvio_config(dev, LPS_ID, SECVIO_CONFIG_WRITE, &lps, NULL,
++				 NULL, NULL, NULL, 1);
++	if (ret) {
++		dev_err(dev, "Cannot clear tamper 1 status: %d\n", ret);
++		goto exit;
++	}
++
++	ret = call_secvio_config(dev, LPTDS_ID, SECVIO_CONFIG_WRITE, &lptds,
++				 NULL, NULL, NULL, NULL, 1);
++	if (ret) {
++		dev_err(dev, "Cannot clear tamper 2 status: %d\n", ret);
++		goto exit;
++	}
++
++exit:
++	return ret;
++}
++
++inline int imx_secvio_sc_clear_state(u32 hpsvs, u32 lps, u32 lptds)
++{
++	return int_imx_secvio_sc_clear_state(gs_imx_secvio_sc_dev, hpsvs, lps,
++					     lptds);
++}
++EXPORT_SYMBOL(imx_secvio_sc_clear_state);
++
++static int report_to_user_notify(struct notifier_block *nb,
++				 unsigned long status, void *notif_info)
++{
++	struct secvio_sc_notifier_info *info = notif_info;
++	struct imx_secvio_sc_data *data =
++				container_of(nb, struct imx_secvio_sc_data,
++					     report_nb);
++	struct device *dev = data->dev;
++
++	/* Information about the security violation */
++	if (info->hpsvs & HPSVS__LP_SEC_VIO__MASK)
++		dev_info(dev, "SNVS secvio: LPSV\n");
++	if (info->hpsvs & HPSVS__SW_LPSV__MASK)
++		dev_info(dev, "SNVS secvio: SW LPSV\n");
++	if (info->hpsvs & HPSVS__SW_FSV__MASK)
++		dev_info(dev, "SNVS secvio: SW FSV\n");
++	if (info->hpsvs & HPSVS__SW_SV__MASK)
++		dev_info(dev, "SNVS secvio: SW SV\n");
++	if (info->hpsvs & HPSVS__SV5__MASK)
++		dev_info(dev, "SNVS secvio: SV 5\n");
++	if (info->hpsvs & HPSVS__SV4__MASK)
++		dev_info(dev, "SNVS secvio: SV 4\n");
++	if (info->hpsvs & HPSVS__SV3__MASK)
++		dev_info(dev, "SNVS secvio: SV 3\n");
++	if (info->hpsvs & HPSVS__SV2__MASK)
++		dev_info(dev, "SNVS secvio: SV 2\n");
++	if (info->hpsvs & HPSVS__SV1__MASK)
++		dev_info(dev, "SNVS secvio: SV 1\n");
++	if (info->hpsvs & HPSVS__SV0__MASK)
++		dev_info(dev, "SNVS secvio: SV 0\n");
++
++	/* Information about the tampers */
++	if (info->lps & LPS__ESVD__MASK)
++		dev_info(dev, "SNVS tamper: External SV\n");
++	if (info->lps & LPS__ET2D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 2\n");
++	if (info->lps & LPS__ET1D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 1\n");
++	if (info->lps & LPS__WMT2D__MASK)
++		dev_info(dev, "SNVS tamper: Wire Mesh 2\n");
++	if (info->lps & LPS__WMT1D__MASK)
++		dev_info(dev, "SNVS tamper: Wire Mesh 1\n");
++	if (info->lps & LPS__VTD__MASK)
++		dev_info(dev, "SNVS tamper: Voltage\n");
++	if (info->lps & LPS__TTD__MASK)
++		dev_info(dev, "SNVS tamper: Temperature\n");
++	if (info->lps & LPS__CTD__MASK)
++		dev_info(dev, "SNVS tamper: Clock\n");
++	if (info->lps & LPS__PGD__MASK)
++		dev_info(dev, "SNVS tamper: Power Glitch\n");
++	if (info->lps & LPS__MCR__MASK)
++		dev_info(dev, "SNVS tamper: Monotonic Counter rollover\n");
++	if (info->lps & LPS__SRTCR__MASK)
++		dev_info(dev, "SNVS tamper: Secure RTC rollover\n");
++	if (info->lps & LPS__LPTA__MASK)
++		dev_info(dev, "SNVS tamper: Time alarm\n");
++
++	if (info->lptds & LPTDS__ET10D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 10\n");
++	if (info->lptds & LPTDS__ET9D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 9\n");
++	if (info->lptds & LPTDS__ET8D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 8\n");
++	if (info->lptds & LPTDS__ET7D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 7\n");
++	if (info->lptds & LPTDS__ET6D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 6\n");
++	if (info->lptds & LPTDS__ET5D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 5\n");
++	if (info->lptds & LPTDS__ET4D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 4\n");
++	if (info->lptds & LPTDS__ET3D__MASK)
++		dev_info(dev, "SNVS tamper: Tamper 3\n");
++
++	return 0;
++}
++
++int call_secvio_config(struct device *dev, u8 id, u8 access, u32 *data0,
++		       u32 *data1, u32 *data2, u32 *data3, u32 *data4, u8 size)
++{
++	int ret = 0;
++	struct imx_secvio_sc_data *data;
++
++	if (!dev)
++		return -EINVAL;
++
++	data = dev_get_drvdata(dev);
++
++	ret = imx_sc_seco_secvio_config(data->ipc_handle, id, access, data0,
++					data1, data2, data3, data4, size);
++	if (ret)
++		dev_err(dev, "Fail %s secvio config %d",
++			((access) ? "write" : "read"), ret);
++
++	return ret;
++}
++
++int int_imx_secvio_sc_enable_irq(struct device *dev)
++{
++	int ret = 0, ret2;
++	u32 irq_status;
++	struct imx_secvio_sc_data *data;
++
++	if (!dev)
++		return -EINVAL;
++
++	data = dev_get_drvdata(dev);
++
++	/* Enable the IRQ */
++	ret = imx_scu_irq_group_enable(IMX_SC_IRQ_GROUP_WAKE, IMX_SC_IRQ_SECVIO,
++				       true);
++	if (ret) {
++		dev_err(dev, "Cannot enable SCU IRQ: %d\n", ret);
++		goto exit;
++	}
++
++	/* Enable interrupt */
++	ret = imx_sc_seco_secvio_enable(data->ipc_handle);
++	if (ret) {
++		dev_err(dev, "Cannot enable SNVS irq: %d\n", ret);
++		goto exit;
++	};
++
++	/* Unmask interrupt */
++	ret = imx_scu_irq_get_status(IMX_SC_IRQ_GROUP_WAKE, &irq_status);
++	if (ret) {
++		dev_err(dev, "Cannot unmask irq: %d\n", ret);
++		goto exit;
++	};
++
++exit:
++	if (ret) {
++		ret2 = int_imx_secvio_sc_disable_irq(dev);
++		if (ret2)
++			dev_warn(dev, "Failed to disable the IRQ\n");
++	}
++
++	return ret;
++}
++
++int int_imx_secvio_sc_disable_irq(struct device *dev)
++{
++	int ret = 0;
++	struct imx_secvio_sc_data *data;
++
++	if (!dev)
++		return -EINVAL;
++
++	data = dev_get_drvdata(dev);
++
++	/* Disable the IRQ */
++	ret = imx_scu_irq_group_enable(IMX_SC_IRQ_GROUP_WAKE, IMX_SC_IRQ_SECVIO,
++				       false);
++	if (ret) {
++		dev_err(dev, "Cannot disable SCU IRQ: %d\n", ret);
++		goto exit;
++	}
++
++exit:
++	return ret;
++}
++
++static void if_imx_secvio_sc_disable_irq(void *dev)
++{
++	int_imx_secvio_sc_disable_irq(dev);
++}
++
++static int imx_secvio_sc_open(struct inode *node, struct file *filp)
++{
++	filp->private_data = node->i_private;
++
++	return 0;
++}
++
++static long imx_secvio_sc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct device *dev = file->private_data;
++	struct secvio_sc_notifier_info info;
++	int ret;
++
++	switch (cmd) {
++	case IMX_SECVIO_SC_GET_STATE:
++		ret = int_imx_secvio_sc_get_state(dev, &info);
++		if (ret) {
++			dev_err(dev, "Fail to get state\n");
++			goto exit;
++		}
++
++		ret = copy_to_user((void *)arg, &info, sizeof(info));
++		if (ret) {
++			dev_err(dev, "Fail to copy info to user\n");
++			ret = -EFAULT;
++			goto exit;
++		}
++		break;
++	case IMX_SECVIO_SC_CHECK_STATE:
++		ret = int_imx_secvio_sc_check_state(dev);
++		if (ret) {
++			dev_err(dev, "Fail to check state\n");
++			goto exit;
++		}
++		break;
++	case IMX_SECVIO_SC_CLEAR_STATE:
++		ret = copy_from_user(&info, (void *)arg, sizeof(info));
++		if (ret) {
++			dev_err(dev, "Fail to copy info from user\n");
++			ret = -EFAULT;
++			goto exit;
++		}
++
++		ret = int_imx_secvio_sc_clear_state(dev, info.hpsvs, info.lps,
++						    info.lptds);
++		if (ret) {
++			dev_err(dev, "Fail to clear state\n");
++			goto exit;
++		}
++		break;
++	default:
++		ret = -ENOIOCTLCMD;
++	}
++
++exit:
++	return ret;
++}
++
++const static struct file_operations imx_secvio_sc_fops = {
++	.owner = THIS_MODULE,
++	.open = imx_secvio_sc_open,
++	.unlocked_ioctl = imx_secvio_sc_ioctl,
++};
++
++static void if_misc_deregister(void *miscdevice)
++{
++	misc_deregister(miscdevice);
++}
++
++static int imx_secvio_sc_setup(struct device *dev)
++{
++	struct imx_secvio_sc_data *data;
++	u32 seco_version = 0;
++	bool own_secvio;
++	u32 irq_status;
++	int ret = 0;
++
++	if (!devres_open_group(dev, NULL, GFP_KERNEL)) {
++		ret = -ENOMEM;
++		goto exit;
++	}
++
++	/* Allocate private data */
++	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
++	if (!data) {
++		ret = -ENOMEM;
++		dev_err(dev, "Failed to allocate mem for data\n");
++		goto clean;
++	}
++
++	data->dev = dev;
++
++	dev_set_drvdata(dev, data);
++
++	data->nvmem = devm_nvmem_device_get(dev, NULL);
++	if (IS_ERR(data->nvmem)) {
++		ret = PTR_ERR(data->nvmem);
++
++		if (ret != -EPROBE_DEFER)
++			dev_err(dev, "Failed to retrieve nvmem\n");
++
++		goto clean;
++	}
++
++	/* Get a handle */
++	ret = imx_scu_get_handle(&data->ipc_handle);
++	if (ret) {
++		dev_err(dev, "cannot get handle to scu: %d\n", ret);
++		goto clean;
++	};
++
++	/* Check the version of the SECO */
++	ret = imx_sc_seco_build_info(data->ipc_handle, &seco_version, NULL);
++	if (ret) {
++		dev_err(dev, "Failed to get seco version\n");
++		goto clean;
++	}
++
++	if ((seco_version & SECO_VERSION_MINOR_MASK) <
++	     SECO_MINOR_VERSION_SUPPORT_SECVIO_TAMPER) {
++		dev_err(dev, "SECO version %.8x doesn't support all secvio\n",
++			seco_version);
++		ret = -EOPNOTSUPP;
++		goto clean;
++	}
++
++	/* Init debug FS */
++	ret = imx_secvio_sc_debugfs(dev);
++	if (ret) {
++		dev_err(dev, "Failed to set debugfs\n");
++		goto clean;
++	}
++
++	/* Check we own the SECVIO */
++	ret = imx_sc_rm_is_resource_owned(data->ipc_handle, IMX_SC_R_SECVIO);
++	if (ret < 0) {
++		dev_err(dev, "Failed to retrieve secvio ownership\n");
++		goto clean;
++	}
++
++	own_secvio = ret > 0;
++	if (!own_secvio) {
++		dev_err(dev, "Secvio resource is not owned\n");
++		ret = -EPERM;
++		goto clean;
++	}
++
++	/* Check IRQ exists and enable it */
++	ret = imx_scu_irq_get_status(IMX_SC_IRQ_GROUP_WAKE, &irq_status);
++	if (ret) {
++		dev_err(dev, "Cannot get IRQ state: %d\n", ret);
++		goto clean;
++	}
++
++	ret = int_imx_secvio_sc_enable_irq(dev);
++	if (ret) {
++		dev_err(dev, "Failed to enable IRQ\n");
++		goto clean;
++	}
++
++	ret = devm_add_action_or_reset(dev, if_imx_secvio_sc_disable_irq, dev);
++	if (ret) {
++		dev_err(dev, "Failed to add managed action to disable IRQ\n");
++		goto clean;
++	}
++
++	/* Register the notifier for IRQ from SNVS */
++	data->irq_nb.notifier_call = imx_secvio_sc_notify;
++	ret = imx_scu_irq_register_notifier(&data->irq_nb);
++	if (ret) {
++		dev_err(dev, "Failed to register IRQ notification handler\n");
++		goto clean;
++	}
++
++	ret = devm_add_action_or_reset(dev, if_imx_scu_irq_register_notifier,
++				       &data->irq_nb);
++	if (ret) {
++		dev_err(dev, "Failed to add action to remove irq notif\n");
++		goto clean;
++	}
++
++	/* Register the notification for reporting to user */
++	data->report_nb.notifier_call = report_to_user_notify;
++	ret = register_imx_secvio_sc_notifier(&data->report_nb);
++	if (ret) {
++		dev_err(dev, "Failed to register report notif handler\n");
++		goto clean;
++	}
++
++	ret = devm_add_action_or_reset(dev, if_unregister_imx_secvio_sc_notifier,
++				       &data->report_nb);
++	if (ret) {
++		dev_err(dev, "Failed to add action to remove report notif\n");
++		goto clean;
++	}
++
++	/* Register the notification to report to audit FW */
++	data->audit_nb.notifier_call = report_to_audit_notify;
++	ret = register_imx_secvio_sc_notifier(&data->audit_nb);
++	if (ret) {
++		dev_err(dev, "Failed to register report audit handler\n");
++		goto clean;
++	}
++
++	ret = devm_add_action(dev, if_unregister_imx_secvio_sc_notifier,
++			      &data->audit_nb);
++	if (ret) {
++		dev_err(dev, "Failed to add action to remove audit notif\n");
++		goto clean;
++	}
++
++	/* Register misc device for IOCTL */
++	data->miscdev.name = devm_kstrdup(dev, "secvio-sc", GFP_KERNEL);
++	data->miscdev.minor = MISC_DYNAMIC_MINOR;
++	data->miscdev.fops = &imx_secvio_sc_fops;
++	data->miscdev.parent = dev;
++	ret = misc_register(&data->miscdev);
++	if (ret) {
++		dev_err(dev, "failed to register misc device\n");
++		goto exit;
++	}
++
++	ret = devm_add_action_or_reset(dev, if_misc_deregister, &data->miscdev);
++	if (ret) {
++		dev_err(dev, "Failed to add action to unregister miscdev\n");
++		goto clean;
++	}
++
++	gs_imx_secvio_sc_dev = dev;
++
++	/* Process current state of the secvio and tampers */
++	int_imx_secvio_sc_check_state(dev);
++
++	devres_remove_group(dev, NULL);
++
++	goto exit;
++
++clean:
++	devres_release_group(dev, NULL);
++
++exit:
++	return ret;
++}
++
++static int imx_secvio_sc_probe(struct platform_device *pdev)
++{
++	int ret;
++	struct device *dev = &pdev->dev;
++
++	ret = imx_secvio_sc_setup(dev);
++	if (ret && ret != -EPROBE_DEFER)
++		dev_err(dev, "Failed to setup\n");
++
++	return ret;
++}
++
++static const struct of_device_id imx_secvio_sc_dt_ids[] = {
++	{ .compatible = "fsl,imx-sc-secvio", },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx_secvio_sc_dt_ids);
++
++static struct platform_driver imx_secvio_sc_driver = {
++	.driver = {
++		.owner = THIS_MODULE,
++		.name	= "imx-secvio-sc",
++		.of_match_table = imx_secvio_sc_dt_ids,
++	},
++	.probe		= imx_secvio_sc_probe,
++};
++module_platform_driver(imx_secvio_sc_driver);
++
++MODULE_AUTHOR("Franck LENORMAND <franck.lenormand@nxp.com>");
++MODULE_DESCRIPTION("NXP i.MX driver to handle SNVS secvio irq sent by SCFW");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/soc/imx/soc-imx.c b/drivers/soc/imx/soc-imx.c
+index 01bfea1cb..d1f24c4ff 100644
+--- a/drivers/soc/imx/soc-imx.c
++++ b/drivers/soc/imx/soc-imx.c
+@@ -87,7 +87,10 @@ static int __init imx_soc_device_init(void)
+ 		break;
+ 	case MXC_CPU_IMX6Q:
+ 		ocotp_compat = "fsl,imx6q-ocotp";
+-		soc_id = "i.MX6Q";
++		if (imx_get_soc_revision() >= IMX_CHIP_REVISION_2_0)
++			soc_id = "i.MX6QP";
++		else
++			soc_id = "i.MX6Q";
+ 		break;
+ 	case MXC_CPU_IMX6UL:
+ 		ocotp_compat = "fsl,imx6ul-ocotp";
+diff --git a/drivers/soc/imx/soc-imx8m.c b/drivers/soc/imx/soc-imx8m.c
+index cc57a384d..0ce3729b3 100644
+--- a/drivers/soc/imx/soc-imx8m.c
++++ b/drivers/soc/imx/soc-imx8m.c
+@@ -3,8 +3,11 @@
+  * Copyright 2019 NXP.
+  */
+ 
++#include <linux/arm-smccc.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
++#include <linux/module.h>
++#include <linux/nvmem-consumer.h>
+ #include <linux/of_address.h>
+ #include <linux/slab.h>
+ #include <linux/sys_soc.h>
+@@ -12,6 +15,8 @@
+ #include <linux/arm-smccc.h>
+ #include <linux/of.h>
+ 
++#include <soc/imx/src.h>
++
+ #define REV_B1				0x21
+ 
+ #define IMX8MQ_SW_INFO_B1		0x40
+@@ -19,6 +24,15 @@
+ 
+ #define IMX_SIP_GET_SOC_INFO		0xc2000006
+ 
++#define IMX_SIP_NOC			0xc2000008
++#define IMX_SIP_NOC_LCDIF		0x0
++#define IMX_SIP_NOC_PRIORITY		0x1
++#define NOC_GPU_PRIORITY		0x10
++#define NOC_DCSS_PRIORITY		0x11
++#define NOC_VPU_PRIORITY		0x12
++#define NOC_CPU_PRIORITY		0x13
++#define NOC_MIX_PRIORITY		0x14
++
+ #define OCOTP_UID_LOW			0x410
+ #define OCOTP_UID_HIGH			0x420
+ 
+@@ -29,7 +43,7 @@
+ 
+ struct imx8_soc_data {
+ 	char *name;
+-	u32 (*soc_revision)(void);
++	u32 (*soc_revision)(struct device *dev);
+ };
+ 
+ static u64 soc_uid;
+@@ -50,7 +64,7 @@ static u32 imx8mq_soc_revision_from_atf(void)
+ static inline u32 imx8mq_soc_revision_from_atf(void) { return 0; };
+ #endif
+ 
+-static u32 __init imx8mq_soc_revision(void)
++static u32 __init imx8mq_soc_revision(struct device *dev)
+ {
+ 	struct device_node *np;
+ 	void __iomem *ocotp_base;
+@@ -75,9 +89,20 @@ static u32 __init imx8mq_soc_revision(void)
+ 			rev = REV_B1;
+ 	}
+ 
+-	soc_uid = readl_relaxed(ocotp_base + OCOTP_UID_HIGH);
+-	soc_uid <<= 32;
+-	soc_uid |= readl_relaxed(ocotp_base + OCOTP_UID_LOW);
++	if (dev) {
++		int ret;
++
++		ret = nvmem_cell_read_u64(dev, "soc_unique_id", &soc_uid);
++		if (ret) {
++			iounmap(ocotp_base);
++			of_node_put(np);
++			return ret;
++		}
++	} else {
++		soc_uid = readl_relaxed(ocotp_base + OCOTP_UID_HIGH);
++		soc_uid <<= 32;
++		soc_uid |= readl_relaxed(ocotp_base + OCOTP_UID_LOW);
++	}
+ 
+ 	iounmap(ocotp_base);
+ 	of_node_put(np);
+@@ -107,7 +132,7 @@ static void __init imx8mm_soc_uid(void)
+ 	of_node_put(np);
+ }
+ 
+-static u32 __init imx8mm_soc_revision(void)
++static u32 __init imx8mm_soc_revision(struct device *dev)
+ {
+ 	struct device_node *np;
+ 	void __iomem *anatop_base;
+@@ -125,7 +150,15 @@ static u32 __init imx8mm_soc_revision(void)
+ 	iounmap(anatop_base);
+ 	of_node_put(np);
+ 
+-	imx8mm_soc_uid();
++	if (dev) {
++		int ret;
++
++		ret = nvmem_cell_read_u64(dev, "soc_unique_id", &soc_uid);
++		if (ret)
++			return ret;
++	} else {
++		imx8mm_soc_uid();
++	}
+ 
+ 	return rev;
+ }
+@@ -150,7 +183,7 @@ static const struct imx8_soc_data imx8mp_soc_data = {
+ 	.soc_revision = imx8mm_soc_revision,
+ };
+ 
+-static __maybe_unused const struct of_device_id imx8_soc_match[] = {
++static __maybe_unused const struct of_device_id imx8_machine_match[] = {
+ 	{ .compatible = "fsl,imx8mq", .data = &imx8mq_soc_data, },
+ 	{ .compatible = "fsl,imx8mm", .data = &imx8mm_soc_data, },
+ 	{ .compatible = "fsl,imx8mn", .data = &imx8mn_soc_data, },
+@@ -158,12 +191,37 @@ static __maybe_unused const struct of_device_id imx8_soc_match[] = {
+ 	{ }
+ };
+ 
++static __maybe_unused const struct of_device_id imx8_soc_match[] = {
++	{ .compatible = "fsl,imx8mq-soc", .data = &imx8mq_soc_data, },
++	{ .compatible = "fsl,imx8mm-soc", .data = &imx8mm_soc_data, },
++	{ .compatible = "fsl,imx8mn-soc", .data = &imx8mn_soc_data, },
++	{ .compatible = "fsl,imx8mp-soc", .data = &imx8mp_soc_data, },
++	{ }
++};
++
+ #define imx8_revision(soc_rev) \
+ 	soc_rev ? \
+ 	kasprintf(GFP_KERNEL, "%d.%d", (soc_rev >> 4) & 0xf,  soc_rev & 0xf) : \
+ 	"unknown"
+ 
+-static int __init imx8_soc_init(void)
++static void imx8mq_noc_init(void)
++{
++	struct arm_smccc_res res;
++
++	pr_info("Config NOC for VPU and CPU\n");
++
++	arm_smccc_smc(IMX_SIP_NOC, IMX_SIP_NOC_PRIORITY, NOC_CPU_PRIORITY,
++			0x80000300, 0, 0, 0, 0, &res);
++	if (res.a0)
++		pr_err("Config NOC for CPU fail!\n");
++
++	arm_smccc_smc(IMX_SIP_NOC, IMX_SIP_NOC_PRIORITY, NOC_VPU_PRIORITY,
++			0x80000300, 0, 0, 0, 0, &res);
++	if (res.a0)
++		pr_err("Config NOC for VPU fail!\n");
++}
++
++static int imx8_soc_info(struct platform_device *pdev)
+ {
+ 	struct soc_device_attribute *soc_dev_attr;
+ 	struct soc_device *soc_dev;
+@@ -182,7 +240,10 @@ static int __init imx8_soc_init(void)
+ 	if (ret)
+ 		goto free_soc;
+ 
+-	id = of_match_node(imx8_soc_match, of_root);
++	if (pdev)
++		id = of_match_node(imx8_soc_match, pdev->dev.of_node);
++	else
++		id = of_match_node(imx8_machine_match, of_root);
+ 	if (!id) {
+ 		ret = -ENODEV;
+ 		goto free_soc;
+@@ -191,8 +252,16 @@ static int __init imx8_soc_init(void)
+ 	data = id->data;
+ 	if (data) {
+ 		soc_dev_attr->soc_id = data->name;
+-		if (data->soc_revision)
+-			soc_rev = data->soc_revision();
++		if (data->soc_revision) {
++			if (pdev) {
++				soc_rev = data->soc_revision(&pdev->dev);
++				ret = soc_rev;
++				if (ret < 0)
++					goto free_soc;
++			} else {
++				soc_rev = data->soc_revision(NULL);
++			}
++		}
+ 	}
+ 
+ 	soc_dev_attr->revision = imx8_revision(soc_rev);
+@@ -219,6 +288,9 @@ static int __init imx8_soc_init(void)
+ 	if (IS_ENABLED(CONFIG_ARM_IMX_CPUFREQ_DT))
+ 		platform_device_register_simple("imx-cpufreq-dt", -1, NULL, 0);
+ 
++	if (of_machine_is_compatible("fsl,imx8mq"))
++		imx8mq_noc_init();
++
+ 	return 0;
+ 
+ free_serial_number:
+@@ -230,4 +302,49 @@ static int __init imx8_soc_init(void)
+ 	kfree(soc_dev_attr);
+ 	return ret;
+ }
++
++/* Retain device_initcall is for backward compatibility with DTS. */
++static int __init imx8_soc_init(void)
++{
++	if (of_find_matching_node_and_match(NULL, imx8_soc_match, NULL))
++		return 0;
++
++	return imx8_soc_info(NULL);
++}
+ device_initcall(imx8_soc_init);
++
++static struct platform_driver imx8_soc_info_driver = {
++	.probe = imx8_soc_info,
++	.driver = {
++		.name = "imx8_soc_info",
++		.of_match_table = imx8_soc_match,
++	},
++};
++
++module_platform_driver(imx8_soc_info_driver);
++MODULE_LICENSE("GPL v2");
++
++#define FSL_SIP_SRC                    0xc2000005
++#define FSL_SIP_SRC_M4_START           0x00
++#define FSL_SIP_SRC_M4_STARTED         0x01
++
++/* To indicate M4 enabled or not on i.MX8MQ */
++static bool m4_is_enabled;
++bool imx_src_is_m4_enabled(void)
++{
++	return m4_is_enabled;
++}
++
++int check_m4_enabled(void)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(FSL_SIP_SRC, FSL_SIP_SRC_M4_STARTED, 0,
++		      0, 0, 0, 0, 0, &res);
++		      m4_is_enabled = !!res.a0;
++
++	if (m4_is_enabled)
++		printk("M4 is started\n");
++
++	return 0;
++}
+diff --git a/drivers/spi/spi-fsl-lpspi.c b/drivers/spi/spi-fsl-lpspi.c
+index 5d98611dd..1ac7b2940 100644
+--- a/drivers/spi/spi-fsl-lpspi.c
++++ b/drivers/spi/spi-fsl-lpspi.c
+@@ -302,6 +302,12 @@ static int fsl_lpspi_set_bitrate(struct fsl_lpspi_data *fsl_lpspi)
+ 
+ 	perclk_rate = clk_get_rate(fsl_lpspi->clk_per);
+ 
++	if (!config.speed_hz) {
++		dev_err(fsl_lpspi->dev,
++			"error: the transmission speed provided is 0!\n");
++		return -EINVAL;
++	}
++
+ 	if (config.speed_hz > perclk_rate / 2) {
+ 		dev_err(fsl_lpspi->dev,
+ 		      "per-clk should be at least two times of transfer speed");
+@@ -906,9 +912,12 @@ static int fsl_lpspi_probe(struct platform_device *pdev)
+ 	ret = fsl_lpspi_dma_init(&pdev->dev, fsl_lpspi, controller);
+ 	if (ret == -EPROBE_DEFER)
+ 		goto out_pm_get;
+-
+ 	if (ret < 0)
+ 		dev_err(&pdev->dev, "dma setup error %d, use pio\n", ret);
++	else
++		/* disable LPSPI module IRQ when enable DMA mode successfully,
++		 * to prevent the unexpected LPSPI module IRQ events*/
++		disable_irq(irq);
+ 
+ 	ret = devm_spi_register_controller(&pdev->dev, controller);
+ 	if (ret < 0) {
+diff --git a/drivers/spi/spi-fsl-qspi.c b/drivers/spi/spi-fsl-qspi.c
+index 9851551eb..68434d3f3 100644
+--- a/drivers/spi/spi-fsl-qspi.c
++++ b/drivers/spi/spi-fsl-qspi.c
+@@ -876,6 +876,10 @@ static int fsl_qspi_probe(struct platform_device *pdev)
+ 
+ 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+ 					"QuadSPI-memory");
++	if (!res) {
++		ret = -ENOMEM;
++		goto err_put_ctrl;
++	}
+ 	q->memmap_phy = res->start;
+ 	/* Since there are 4 cs, map size required is 4 times ahb_buf_size */
+ 	q->ahb_addr = devm_ioremap(dev, q->memmap_phy,
+diff --git a/drivers/spi/spi-imx.c b/drivers/spi/spi-imx.c
+index 0e3bc0b0a..5ab0ec63c 100644
+--- a/drivers/spi/spi-imx.c
++++ b/drivers/spi/spi-imx.c
+@@ -33,6 +33,7 @@ module_param(use_dma, bool, 0644);
+ MODULE_PARM_DESC(use_dma, "Enable usage of DMA when available (default)");
+ 
+ #define MXC_RPM_TIMEOUT		2000 /* 2000ms */
++#define MXC_SPI_DEFAULT_SPEED	500000 /* 500KHz */
+ 
+ #define MXC_CSPIRXDATA		0x00
+ #define MXC_CSPITXDATA		0x04
+@@ -59,6 +60,7 @@ enum spi_imx_devtype {
+ 	IMX35_CSPI,	/* CSPI on all i.mx except above */
+ 	IMX51_ECSPI,	/* ECSPI on i.mx51 */
+ 	IMX53_ECSPI,	/* ECSPI on i.mx53 and later */
++	IMX6UL_ECSPI,	/* ERR009165 fix from i.mx6ul */
+ };
+ 
+ struct spi_imx_data;
+@@ -130,7 +132,8 @@ static inline int is_imx35_cspi(struct spi_imx_data *d)
+ 
+ static inline int is_imx51_ecspi(struct spi_imx_data *d)
+ {
+-	return d->devtype_data->devtype == IMX51_ECSPI;
++	return d->devtype_data->devtype == IMX51_ECSPI ||
++	       d->devtype_data->devtype == IMX6UL_ECSPI;
+ }
+ 
+ static inline int is_imx53_ecspi(struct spi_imx_data *d)
+@@ -385,7 +388,12 @@ static void spi_imx_buf_tx_swap(struct spi_imx_data *spi_imx)
+ 
+ static void mx53_ecspi_rx_slave(struct spi_imx_data *spi_imx)
+ {
+-	u32 val = be32_to_cpu(readl(spi_imx->base + MXC_CSPIRXDATA));
++	u32 val = readl(spi_imx->base + MXC_CSPIRXDATA);
++
++	if (spi_imx->bits_per_word <= 8)
++		val = be32_to_cpu(val);
++	else if (spi_imx->bits_per_word <= 16)
++		val = (val << 16) | (val >> 16);
+ 
+ 	if (spi_imx->rx_buf) {
+ 		int n_bytes = spi_imx->slave_burst % sizeof(val);
+@@ -414,7 +422,11 @@ static void mx53_ecspi_tx_slave(struct spi_imx_data *spi_imx)
+ 	if (spi_imx->tx_buf) {
+ 		memcpy(((u8 *)&val) + sizeof(val) - n_bytes,
+ 		       spi_imx->tx_buf, n_bytes);
+-		val = cpu_to_be32(val);
++		if (spi_imx->bits_per_word <= 8)
++			val = cpu_to_be32(val);
++		else if (spi_imx->bits_per_word <= 16)
++			val = (val << 16) | (val >> 16);
++
+ 		spi_imx->tx_buf += n_bytes;
+ 	}
+ 
+@@ -480,11 +492,24 @@ static void mx51_ecspi_intctrl(struct spi_imx_data *spi_imx, int enable)
+ 
+ static void mx51_ecspi_trigger(struct spi_imx_data *spi_imx)
+ {
+-	u32 reg;
+-
+-	reg = readl(spi_imx->base + MX51_ECSPI_CTRL);
+-	reg |= MX51_ECSPI_CTRL_XCH;
++	u32 reg = readl(spi_imx->base + MX51_ECSPI_CTRL);
++	/*
++	 * To workaround ERR008517, SDMA script need use XCH instead of SMC
++	 * just like PIO mode and it fix on i.mx6ul
++	 */
++	if (!spi_imx->usedma)
++		reg |= MX51_ECSPI_CTRL_XCH;
++	else if (spi_imx->devtype_data->devtype == IMX6UL_ECSPI)
++		reg |= MX51_ECSPI_CTRL_SMC;
++	else
++		reg &= ~MX51_ECSPI_CTRL_SMC;
+ 	writel(reg, spi_imx->base + MX51_ECSPI_CTRL);
++
++	if (spi_imx->usedma) {
++		reg = readl(spi_imx->base + MX51_ECSPI_DMA);
++		reg |= MX51_ECSPI_DMA_TEDEN | MX51_ECSPI_DMA_RXDEN;
++		writel(reg, spi_imx->base + MX51_ECSPI_DMA);
++	}
+ }
+ 
+ static void mx51_disable_dma(struct spi_imx_data *spi_imx)
+@@ -544,7 +569,7 @@ static int mx51_ecspi_prepare_message(struct spi_imx_data *spi_imx,
+ 	 * is not functional for imx53 Soc, config SPI burst completed when
+ 	 * BURST_LENGTH + 1 bits are received
+ 	 */
+-	if (spi_imx->slave_mode && is_imx53_ecspi(spi_imx))
++	if (spi_imx->slave_mode)
+ 		cfg &= ~MX51_ECSPI_CONFIG_SBBCTRL(spi->chip_select);
+ 	else
+ 		cfg |= MX51_ECSPI_CONFIG_SBBCTRL(spi->chip_select);
+@@ -609,7 +634,7 @@ static int mx51_ecspi_prepare_transfer(struct spi_imx_data *spi_imx,
+ 
+ 	/* Clear BL field and set the right value */
+ 	ctrl &= ~MX51_ECSPI_CTRL_BL_MASK;
+-	if (spi_imx->slave_mode && is_imx53_ecspi(spi_imx))
++	if (spi_imx->slave_mode)
+ 		ctrl |= (spi_imx->slave_burst * 8 - 1)
+ 			<< MX51_ECSPI_CTRL_BL_OFFSET;
+ 	else
+@@ -619,11 +644,21 @@ static int mx51_ecspi_prepare_transfer(struct spi_imx_data *spi_imx,
+ 	/* set clock speed */
+ 	ctrl &= ~(0xf << MX51_ECSPI_CTRL_POSTDIV_OFFSET |
+ 		  0xf << MX51_ECSPI_CTRL_PREDIV_OFFSET);
+-	ctrl |= mx51_ecspi_clkdiv(spi_imx, spi_imx->spi_bus_clk, &clk);
+-	spi_imx->spi_bus_clk = clk;
++	if (!spi_imx->slave_mode) {
++		ctrl |= mx51_ecspi_clkdiv(spi_imx, spi_imx->spi_bus_clk, &clk);
++		spi_imx->spi_bus_clk = clk;
++	}
+ 
+-	if (spi_imx->usedma)
+-		ctrl |= MX51_ECSPI_CTRL_SMC;
++	/*
++	 * ERR009165: work in XHC mode instead of SMC as PIO on the chips
++	 * before i.mx6ul.
++	 */
++	if (spi_imx->usedma) {
++		if (spi_imx->devtype_data->devtype == IMX6UL_ECSPI)
++			ctrl |= MX51_ECSPI_CTRL_SMC;
++		else
++			ctrl &= ~MX51_ECSPI_CTRL_SMC;
++	}
+ 
+ 	writel(ctrl, spi_imx->base + MX51_ECSPI_CTRL);
+ 
+@@ -632,14 +667,17 @@ static int mx51_ecspi_prepare_transfer(struct spi_imx_data *spi_imx,
+ 
+ static void mx51_setup_wml(struct spi_imx_data *spi_imx)
+ {
++	u32 tx_wml = 0;
++
++	if (spi_imx->devtype_data->devtype == IMX6UL_ECSPI)
++		tx_wml = spi_imx->wml;
+ 	/*
+ 	 * Configure the DMA register: setup the watermark
+ 	 * and enable DMA request.
+ 	 */
+ 	writel(MX51_ECSPI_DMA_RX_WML(spi_imx->wml - 1) |
+-		MX51_ECSPI_DMA_TX_WML(spi_imx->wml) |
++		MX51_ECSPI_DMA_TX_WML(tx_wml) |
+ 		MX51_ECSPI_DMA_RXT_WML(spi_imx->wml) |
+-		MX51_ECSPI_DMA_TEDEN | MX51_ECSPI_DMA_RXDEN |
+ 		MX51_ECSPI_DMA_RXTDEN, spi_imx->base + MX51_ECSPI_DMA);
+ }
+ 
+@@ -719,9 +757,11 @@ static int mx31_prepare_transfer(struct spi_imx_data *spi_imx,
+ 	unsigned int reg = MX31_CSPICTRL_ENABLE | MX31_CSPICTRL_MASTER;
+ 	unsigned int clk;
+ 
+-	reg |= spi_imx_clkdiv_2(spi_imx->spi_clk, spi_imx->spi_bus_clk, &clk) <<
+-		MX31_CSPICTRL_DR_SHIFT;
+-	spi_imx->spi_bus_clk = clk;
++	if (!spi_imx->slave_mode) {
++		reg |= spi_imx_clkdiv_2(spi_imx->spi_clk, spi_imx->spi_bus_clk, &clk) <<
++			MX31_CSPICTRL_DR_SHIFT;
++		spi_imx->spi_bus_clk = clk;
++	}
+ 
+ 	if (is_imx35_cspi(spi_imx)) {
+ 		reg |= (spi_imx->bits_per_word - 1) << MX35_CSPICTRL_BL_SHIFT;
+@@ -824,9 +864,11 @@ static int mx21_prepare_transfer(struct spi_imx_data *spi_imx,
+ 	unsigned int max = is_imx27_cspi(spi_imx) ? 16 : 18;
+ 	unsigned int clk;
+ 
+-	reg |= spi_imx_clkdiv_1(spi_imx->spi_clk, spi_imx->spi_bus_clk, max, &clk)
+-		<< MX21_CSPICTRL_DR_SHIFT;
+-	spi_imx->spi_bus_clk = clk;
++	if (!spi_imx->slave_mode) {
++		reg |= spi_imx_clkdiv_1(spi_imx->spi_clk, spi_imx->spi_bus_clk, max, &clk)
++			<< MX21_CSPICTRL_DR_SHIFT;
++		spi_imx->spi_bus_clk = clk;
++	}
+ 
+ 	reg |= spi_imx->bits_per_word - 1;
+ 
+@@ -898,9 +940,11 @@ static int mx1_prepare_transfer(struct spi_imx_data *spi_imx,
+ 	unsigned int reg = MX1_CSPICTRL_ENABLE | MX1_CSPICTRL_MASTER;
+ 	unsigned int clk;
+ 
+-	reg |= spi_imx_clkdiv_2(spi_imx->spi_clk, spi_imx->spi_bus_clk, &clk) <<
+-		MX1_CSPICTRL_DR_SHIFT;
+-	spi_imx->spi_bus_clk = clk;
++	if (!spi_imx->slave_mode) {
++		reg |= spi_imx_clkdiv_2(spi_imx->spi_clk, spi_imx->spi_bus_clk, &clk) <<
++			MX1_CSPICTRL_DR_SHIFT;
++		spi_imx->spi_bus_clk = clk;
++	}
+ 
+ 	reg |= spi_imx->bits_per_word - 1;
+ 
+@@ -1028,6 +1072,22 @@ static struct spi_imx_devtype_data imx53_ecspi_devtype_data = {
+ 	.devtype = IMX53_ECSPI,
+ };
+ 
++static struct spi_imx_devtype_data imx6ul_ecspi_devtype_data = {
++	.intctrl = mx51_ecspi_intctrl,
++	.prepare_message = mx51_ecspi_prepare_message,
++	.prepare_transfer = mx51_ecspi_prepare_transfer,
++	.trigger = mx51_ecspi_trigger,
++	.rx_available = mx51_ecspi_rx_available,
++	.reset = mx51_ecspi_reset,
++	.setup_wml = mx51_setup_wml,
++	.fifo_size = 64,
++	.has_dmamode = true,
++	.dynamic_burst = true,
++	.has_slavemode = true,
++	.disable = mx51_ecspi_disable,
++	.devtype = IMX6UL_ECSPI,
++};
++
+ static const struct platform_device_id spi_imx_devtype[] = {
+ 	{
+ 		.name = "imx1-cspi",
+@@ -1050,6 +1110,9 @@ static const struct platform_device_id spi_imx_devtype[] = {
+ 	}, {
+ 		.name = "imx53-ecspi",
+ 		.driver_data = (kernel_ulong_t) &imx53_ecspi_devtype_data,
++	}, {
++		.name = "imx6ul-ecspi",
++		.driver_data = (kernel_ulong_t) &imx6ul_ecspi_devtype_data,
+ 	}, {
+ 		/* sentinel */
+ 	}
+@@ -1063,6 +1126,7 @@ static const struct of_device_id spi_imx_dt_ids[] = {
+ 	{ .compatible = "fsl,imx35-cspi", .data = &imx35_cspi_devtype_data, },
+ 	{ .compatible = "fsl,imx51-ecspi", .data = &imx51_ecspi_devtype_data, },
+ 	{ .compatible = "fsl,imx53-ecspi", .data = &imx53_ecspi_devtype_data, },
++	{ .compatible = "fsl,imx6ul-ecspi", .data = &imx6ul_ecspi_devtype_data, },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, spi_imx_dt_ids);
+@@ -1177,6 +1241,8 @@ static int spi_imx_dma_configure(struct spi_master *master)
+ 	tx.dst_addr = spi_imx->base_phys + MXC_CSPITXDATA;
+ 	tx.dst_addr_width = buswidth;
+ 	tx.dst_maxburst = spi_imx->wml;
++	tx.peripheral_config = NULL;
++	tx.peripheral_size = 0;
+ 	ret = dmaengine_slave_config(master->dma_tx, &tx);
+ 	if (ret) {
+ 		dev_err(spi_imx->dev, "TX dma configuration failed with %d\n", ret);
+@@ -1187,6 +1253,8 @@ static int spi_imx_dma_configure(struct spi_master *master)
+ 	rx.src_addr = spi_imx->base_phys + MXC_CSPIRXDATA;
+ 	rx.src_addr_width = buswidth;
+ 	rx.src_maxburst = spi_imx->wml;
++	rx.peripheral_config = NULL;
++	rx.peripheral_size = 0;
+ 	ret = dmaengine_slave_config(master->dma_rx, &rx);
+ 	if (ret) {
+ 		dev_err(spi_imx->dev, "RX dma configuration failed with %d\n", ret);
+@@ -1249,7 +1317,7 @@ static int spi_imx_setupxfer(struct spi_device *spi,
+ 	else
+ 		spi_imx->usedma = false;
+ 
+-	if (is_imx53_ecspi(spi_imx) && spi_imx->slave_mode) {
++	if (spi_imx->slave_mode) {
+ 		spi_imx->rx = mx53_ecspi_rx_slave;
+ 		spi_imx->tx = mx53_ecspi_tx_slave;
+ 		spi_imx->slave_burst = t->len;
+@@ -1280,10 +1348,6 @@ static int spi_imx_sdma_init(struct device *dev, struct spi_imx_data *spi_imx,
+ {
+ 	int ret;
+ 
+-	/* use pio mode for i.mx6dl chip TKT238285 */
+-	if (of_machine_is_compatible("fsl,imx6dl"))
+-		return 0;
+-
+ 	spi_imx->wml = spi_imx->devtype_data->fifo_size / 2;
+ 
+ 	/* Prepare for TX DMA: */
+@@ -1415,6 +1479,8 @@ static int spi_imx_dma_transfer(struct spi_imx_data *spi_imx,
+ 
+ 	transfer_timeout = spi_imx_calculate_timeout(spi_imx, transfer->len);
+ 
++	spi_imx->devtype_data->trigger(spi_imx);
++
+ 	/* Wait SDMA to finish the data transfer.*/
+ 	timeout = wait_for_completion_timeout(&spi_imx->dma_tx_completion,
+ 						transfer_timeout);
+@@ -1479,7 +1545,7 @@ static int spi_imx_pio_transfer_slave(struct spi_device *spi,
+ 	struct spi_imx_data *spi_imx = spi_master_get_devdata(spi->master);
+ 	int ret = transfer->len;
+ 
+-	if (is_imx53_ecspi(spi_imx) &&
++	if ((is_imx51_ecspi(spi_imx) || is_imx53_ecspi(spi_imx)) &&
+ 	    transfer->len > MX53_MAX_TRANSFER_BYTES) {
+ 		dev_err(&spi->dev, "Transaction too big, max size is %d bytes\n",
+ 			MX53_MAX_TRANSFER_BYTES);
+@@ -1522,8 +1588,6 @@ static int spi_imx_transfer(struct spi_device *spi,
+ {
+ 	struct spi_imx_data *spi_imx = spi_master_get_devdata(spi->master);
+ 
+-	transfer->effective_speed_hz = spi_imx->spi_bus_clk;
+-
+ 	/* flush rxfifo before transfer */
+ 	while (spi_imx->devtype_data->rx_available(spi_imx))
+ 		readl(spi_imx->base + MXC_CSPIRXDATA);
+@@ -1531,6 +1595,8 @@ static int spi_imx_transfer(struct spi_device *spi,
+ 	if (spi_imx->slave_mode)
+ 		return spi_imx_pio_transfer_slave(spi, transfer);
+ 
++	transfer->effective_speed_hz = spi_imx->spi_bus_clk;
++
+ 	if (spi_imx->usedma)
+ 		return spi_imx_dma_transfer(spi_imx, transfer);
+ 
+@@ -1632,6 +1698,7 @@ static int spi_imx_probe(struct platform_device *pdev)
+ 	spi_imx->bitbang.master = master;
+ 	spi_imx->dev = &pdev->dev;
+ 	spi_imx->slave_mode = slave_mode;
++	spi_imx->spi_bus_clk = MXC_SPI_DEFAULT_SPEED;
+ 
+ 	spi_imx->devtype_data = devtype_data;
+ 
+diff --git a/drivers/spi/spi-mem.c b/drivers/spi/spi-mem.c
+index 4682f49dc..2c584c15b 100644
+--- a/drivers/spi/spi-mem.c
++++ b/drivers/spi/spi-mem.c
+@@ -137,8 +137,8 @@ static int spi_check_buswidth_req(struct spi_mem *mem, u8 buswidth, bool tx)
+ 	return -ENOTSUPP;
+ }
+ 
+-bool spi_mem_default_supports_op(struct spi_mem *mem,
+-				 const struct spi_mem_op *op)
++static bool spi_mem_check_buswidth(struct spi_mem *mem,
++				   const struct spi_mem_op *op)
+ {
+ 	if (spi_check_buswidth_req(mem, op->cmd.buswidth, true))
+ 		return false;
+@@ -156,13 +156,29 @@ bool spi_mem_default_supports_op(struct spi_mem *mem,
+ 				   op->data.dir == SPI_MEM_DATA_OUT))
+ 		return false;
+ 
++	return true;
++}
++
++bool spi_mem_dtr_supports_op(struct spi_mem *mem,
++			     const struct spi_mem_op *op)
++{
++	if (op->cmd.nbytes != 2)
++		return false;
++
++	return spi_mem_check_buswidth(mem, op);
++}
++EXPORT_SYMBOL_GPL(spi_mem_dtr_supports_op);
++
++bool spi_mem_default_supports_op(struct spi_mem *mem,
++				 const struct spi_mem_op *op)
++{
+ 	if (op->cmd.dtr || op->addr.dtr || op->dummy.dtr || op->data.dtr)
+ 		return false;
+ 
+ 	if (op->cmd.nbytes != 1)
+ 		return false;
+ 
+-	return true;
++	return spi_mem_check_buswidth(mem, op);
+ }
+ EXPORT_SYMBOL_GPL(spi_mem_default_supports_op);
+ 
+diff --git a/drivers/spi/spi-nxp-fspi.c b/drivers/spi/spi-nxp-fspi.c
+index bcc0b5a3a..4da1109dc 100644
+--- a/drivers/spi/spi-nxp-fspi.c
++++ b/drivers/spi/spi-nxp-fspi.c
+@@ -48,18 +48,24 @@
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/pm_qos.h>
+ #include <linux/sizes.h>
+ 
+ #include <linux/spi/spi.h>
+ #include <linux/spi/spi-mem.h>
+ 
++#include <linux/pm_runtime.h>
++
++/* runtime pm timeout */
++#define FSPI_RPM_TIMEOUT 50 /* 50ms */
++
+ /*
+  * The driver only uses one single LUT entry, that is updated on
+  * each call of exec_op(). Index 0 is preset at boot with a basic
+- * read operation, so let's use the last entry (31).
++ * read operation, so let's use the last entry (15).
+  */
+-#define	SEQID_LUT			31
++#define	SEQID_LUT			15
+ 
+ /* Registers used by the driver */
+ #define FSPI_MCR0			0x00
+@@ -210,9 +216,13 @@
+ 
+ #define FSPI_DLLACR			0xC0
+ #define FSPI_DLLACR_OVRDEN		BIT(8)
++#define FSPI_DLLACR_SLVDLY(x)          ((x) << 3)
++#define FSPI_DLLACR_DLLEN              BIT(0)
+ 
+ #define FSPI_DLLBCR			0xC4
+ #define FSPI_DLLBCR_OVRDEN		BIT(8)
++#define FSPI_DLLBCR_SLVDLY(x)          ((x) << 3)
++#define FSPI_DLLBCR_DLLEN              BIT(0)
+ 
+ #define FSPI_STS0			0xE0
+ #define FSPI_STS0_DLPHB(x)		((x) << 8)
+@@ -311,6 +321,12 @@
+ #define NXP_FSPI_MAX_CHIPSELECT		4
+ #define NXP_FSPI_MIN_IOMAP	SZ_4M
+ 
++/* access memory via IPS only due to this errata */
++#define NXP_FSPI_QUIRK_ERR050601	BIT(0)
++
++/* Disable Octal DTR */
++#define NXP_FSPI_QUIRK_DISABLE_DTR	BIT(1)
++
+ struct nxp_fspi_devtype_data {
+ 	unsigned int rxfifo;
+ 	unsigned int txfifo;
+@@ -323,7 +339,7 @@ static const struct nxp_fspi_devtype_data lx2160a_data = {
+ 	.rxfifo = SZ_512,       /* (64  * 64 bits)  */
+ 	.txfifo = SZ_1K,        /* (128 * 64 bits)  */
+ 	.ahb_buf_size = SZ_2K,  /* (256 * 64 bits)  */
+-	.quirks = 0,
++	.quirks = NXP_FSPI_QUIRK_DISABLE_DTR,
+ 	.little_endian = true,  /* little-endian    */
+ };
+ 
+@@ -343,6 +359,14 @@ static const struct nxp_fspi_devtype_data imx8qxp_data = {
+ 	.little_endian = true,  /* little-endian    */
+ };
+ 
++static const struct nxp_fspi_devtype_data imx8dxl_data = {
++	.rxfifo = SZ_512,       /* (64  * 64 bits)  */
++	.txfifo = SZ_1K,        /* (128 * 64 bits)  */
++	.ahb_buf_size = SZ_2K,  /* (256 * 64 bits)  */
++	.quirks = NXP_FSPI_QUIRK_ERR050601,
++	.little_endian = true,  /* little-endian    */
++};
++
+ struct nxp_fspi {
+ 	void __iomem *iobase;
+ 	void __iomem *ahb_addr;
+@@ -350,6 +374,7 @@ struct nxp_fspi {
+ 	u32 memmap_phy_size;
+ 	u32 memmap_start;
+ 	u32 memmap_len;
++	u32 dll_slvdly;
+ 	struct clk *clk, *clk_en;
+ 	struct device *dev;
+ 	struct completion c;
+@@ -357,8 +382,22 @@ struct nxp_fspi {
+ 	struct mutex lock;
+ 	struct pm_qos_request pm_qos_req;
+ 	int selected;
++#define FSPI_INITILIZED	(1 << 0)
++#define FSPI_RXCLKSRC_3	(1 << 1)
++#define FSPI_DTR_ODD_ADDR	(1 << 2)
++	int flags;
+ };
+ 
++static inline int nxp_fspi_ips_access_only(struct nxp_fspi *f)
++{
++	return f->devtype_data->quirks & NXP_FSPI_QUIRK_ERR050601;
++}
++
++static inline int nxp_fspi_disable_dtr(struct nxp_fspi *f)
++{
++	return f->devtype_data->quirks & NXP_FSPI_QUIRK_DISABLE_DTR;
++}
++
+ /*
+  * R/W functions for big- or little-endian registers:
+  * The FSPI controller's endianness is independent of
+@@ -460,6 +499,10 @@ static bool nxp_fspi_supports_op(struct spi_mem *mem,
+ 	    op->data.nbytes > f->devtype_data->txfifo)
+ 		return false;
+ 
++	if (!nxp_fspi_disable_dtr(f) &&
++		op->cmd.dtr && op->addr.dtr && op->dummy.dtr && op->data.dtr)
++		return spi_mem_dtr_supports_op(mem, op);
++
+ 	return spi_mem_default_supports_op(mem, op);
+ }
+ 
+@@ -508,12 +551,21 @@ static void nxp_fspi_prepare_lut(struct nxp_fspi *f,
+ 	int lutidx = 1, i;
+ 
+ 	/* cmd */
+-	lutval[0] |= LUT_DEF(0, LUT_CMD, LUT_PAD(op->cmd.buswidth),
+-			     op->cmd.opcode);
++	if (op->cmd.dtr) {
++		lutval[0] |= LUT_DEF(0, LUT_CMD_DDR, LUT_PAD(op->cmd.buswidth),
++					op->cmd.opcode >> 8);
++		lutval[lutidx / 2] |= LUT_DEF(lutidx, LUT_CMD_DDR,
++					      LUT_PAD(op->cmd.buswidth),
++					      op->cmd.opcode & 0x00ff);
++		lutidx++;
++	} else {
++		lutval[0] |= LUT_DEF(0, LUT_CMD, LUT_PAD(op->cmd.buswidth),
++				     op->cmd.opcode);
++	}
+ 
+ 	/* addr bytes */
+ 	if (op->addr.nbytes) {
+-		lutval[lutidx / 2] |= LUT_DEF(lutidx, LUT_ADDR,
++		lutval[lutidx / 2] |= LUT_DEF(lutidx, op->addr.dtr ? LUT_ADDR_DDR : LUT_ADDR,
+ 					      LUT_PAD(op->addr.buswidth),
+ 					      op->addr.nbytes * 8);
+ 		lutidx++;
+@@ -521,7 +573,7 @@ static void nxp_fspi_prepare_lut(struct nxp_fspi *f,
+ 
+ 	/* dummy bytes, if needed */
+ 	if (op->dummy.nbytes) {
+-		lutval[lutidx / 2] |= LUT_DEF(lutidx, LUT_DUMMY,
++		lutval[lutidx / 2] |= LUT_DEF(lutidx, op->dummy.dtr ? LUT_DUMMY_DDR : LUT_DUMMY,
+ 		/*
+ 		 * Due to FlexSPI controller limitation number of PAD for dummy
+ 		 * buswidth needs to be programmed as equal to data buswidth.
+@@ -536,7 +588,8 @@ static void nxp_fspi_prepare_lut(struct nxp_fspi *f,
+ 	if (op->data.nbytes) {
+ 		lutval[lutidx / 2] |= LUT_DEF(lutidx,
+ 					      op->data.dir == SPI_MEM_DATA_IN ?
+-					      LUT_NXP_READ : LUT_NXP_WRITE,
++					      (op->data.dtr ? LUT_READ_DDR : LUT_NXP_READ) :
++					      (op->data.dtr ? LUT_WRITE_DDR : LUT_NXP_WRITE),
+ 					      LUT_PAD(op->data.buswidth),
+ 					      0);
+ 		lutidx++;
+@@ -750,22 +803,42 @@ static void nxp_fspi_read_rxfifo(struct nxp_fspi *f,
+ {
+ 	void __iomem *base = f->iobase;
+ 	int i, ret;
+-	int len = op->data.nbytes;
++	int len, cnt;
+ 	u8 *buf = (u8 *) op->data.buf.in;
+ 
++	/* DTR with ODD address need read one more byte */
++	len = (f->flags & FSPI_DTR_ODD_ADDR) ? op-> data.nbytes + 1 : op->data.nbytes;
++
+ 	/*
+ 	 * Default value of water mark level is 8 bytes, hence in single
+ 	 * read request controller can read max 8 bytes of data.
+ 	 */
+-	for (i = 0; i < ALIGN_DOWN(len, 8); i += 8) {
++	cnt = ALIGN_DOWN(len, 8);
++
++	for (i = 0; i < cnt;) {
+ 		/* Wait for RXFIFO available */
+ 		ret = fspi_readl_poll_tout(f, f->iobase + FSPI_INTR,
+ 					   FSPI_INTR_IPRXWA, 0,
+ 					   POLL_TOUT, true);
+ 		WARN_ON(ret);
+ 
+-		*(u32 *)(buf + i) = fspi_readl(f, base + FSPI_RFDR);
+-		*(u32 *)(buf + i + 4) = fspi_readl(f, base + FSPI_RFDR + 4);
++		if (f->flags & FSPI_DTR_ODD_ADDR && !i) {
++			/*
++			 * DTR read always start from 2bytes alignment address,
++			 * if read from an odd address A, it actually read from
++			 * address A-1, need to abandon the first byte here
++			 */
++			u8 tmp[8];
++			*(u32 *)tmp = fspi_readl(f, base + FSPI_RFDR);
++			*(u32 *)(tmp + 4) = fspi_readl(f, base + FSPI_RFDR + 4);
++			memcpy(buf, tmp + 1, 7);
++			i += 7;
++			f->flags &= ~FSPI_DTR_ODD_ADDR;
++		} else {
++			*(u32 *)(buf + i) = fspi_readl(f, base + FSPI_RFDR);
++			*(u32 *)(buf + i + 4) = fspi_readl(f, base + FSPI_RFDR + 4);
++			i += 8;
++		}
+ 		/* move the FIFO pointer */
+ 		fspi_writel(f, FSPI_INTR_IPRXWA, base + FSPI_INTR);
+ 	}
+@@ -775,13 +848,13 @@ static void nxp_fspi_read_rxfifo(struct nxp_fspi *f,
+ 		int size, j;
+ 
+ 		buf = op->data.buf.in + i;
++		len -= i;
+ 		/* Wait for RXFIFO available */
+ 		ret = fspi_readl_poll_tout(f, f->iobase + FSPI_INTR,
+ 					   FSPI_INTR_IPRXWA, 0,
+ 					   POLL_TOUT, true);
+ 		WARN_ON(ret);
+ 
+-		len = op->data.nbytes - i;
+ 		for (j = 0; j < op->data.nbytes - i; j += 4) {
+ 			tmp = fspi_readl(f, base + FSPI_RFDR + j);
+ 			size = min(len, 4);
+@@ -812,15 +885,31 @@ static int nxp_fspi_do_op(struct nxp_fspi *f, const struct spi_mem_op *op)
+ 	init_completion(&f->c);
+ 
+ 	fspi_writel(f, op->addr.val, base + FSPI_IPCR0);
++
+ 	/*
+ 	 * Always start the sequence at the same index since we update
+ 	 * the LUT at each exec_op() call. And also specify the DATA
+ 	 * length, since it's has not been specified in the LUT.
++	 *
++	 * OCTAL DTR read always start from 2bytes alignment address,
++	 * if read from an odd address A, it actually read from
++	 * address A-1, need to read one more byte to get all
++	 * data needed.
+ 	 */
+-	fspi_writel(f, op->data.nbytes |
+-		 (SEQID_LUT << FSPI_IPCR1_SEQID_SHIFT) |
+-		 (seqnum << FSPI_IPCR1_SEQNUM_SHIFT),
+-		 base + FSPI_IPCR1);
++
++	if ((op->addr.val & 1) && (op->data.dir == SPI_MEM_DATA_IN) &&
++	    op->cmd.dtr && op->addr.dtr && op->dummy.dtr && op->data.dtr) {
++		f->flags |= FSPI_DTR_ODD_ADDR;
++		fspi_writel(f, (op->data.nbytes + 1) |
++			 (SEQID_LUT << FSPI_IPCR1_SEQID_SHIFT) |
++			 (seqnum << FSPI_IPCR1_SEQNUM_SHIFT),
++			 base + FSPI_IPCR1);
++	} else {
++		fspi_writel(f, op->data.nbytes |
++			 (SEQID_LUT << FSPI_IPCR1_SEQID_SHIFT) |
++			 (seqnum << FSPI_IPCR1_SEQNUM_SHIFT),
++			 base + FSPI_IPCR1);
++	}
+ 
+ 	/* Trigger the LUT now. */
+ 	fspi_writel(f, FSPI_IPCMD_TRG, base + FSPI_IPCMD);
+@@ -839,10 +928,17 @@ static int nxp_fspi_do_op(struct nxp_fspi *f, const struct spi_mem_op *op)
+ static int nxp_fspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+ {
+ 	struct nxp_fspi *f = spi_controller_get_devdata(mem->spi->master);
++	u32 reg;
+ 	int err = 0;
+ 
+ 	mutex_lock(&f->lock);
+ 
++	err = pm_runtime_get_sync(f->dev);
++	if (err < 0) {
++		dev_err(f->dev, "Failed to enable clock %d\n", __LINE__);
++		goto err_mutex;
++	}
++
+ 	/* Wait for controller being ready. */
+ 	err = fspi_readl_poll_tout(f, f->iobase + FSPI_STS0,
+ 				   FSPI_STS0_ARB_IDLE, 1, POLL_TOUT, true);
+@@ -850,13 +946,37 @@ static int nxp_fspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+ 
+ 	nxp_fspi_select_mem(f, mem->spi);
+ 
++
++	/*
++	 * For 8 bit DTR mode, need to use mode 3 (Flash provided Read strobe
++	 * and input from DQS pad), otherwise read operaton may meet issue
++	 * when clock rate higher than 50MHz. This mode require flash device
++	 * connect the DQS pad on board.
++	 */
++	if (!(f->flags & FSPI_RXCLKSRC_3) &&
++	    op->cmd.dtr && op->addr.dtr && op->dummy.dtr && op->data.dtr) {
++		reg = fspi_readl(f, f->iobase + FSPI_MCR0);
++		reg |= FSPI_MCR0_RXCLKSRC(3);
++		fspi_writel(f, reg, f->iobase + FSPI_MCR0);
++		f->flags |= FSPI_RXCLKSRC_3;
++	} else if ((f->flags & FSPI_RXCLKSRC_3) &&
++		   !op->cmd.dtr && !op->addr.dtr &&
++		   !op->dummy.dtr && !op->data.dtr) {
++		reg = fspi_readl(f, f->iobase + FSPI_MCR0);
++		reg &= ~FSPI_MCR0_RXCLKSRC(3);
++		fspi_writel(f, reg, f->iobase + FSPI_MCR0);
++		f->flags &= ~FSPI_RXCLKSRC_3;
++	}
++
+ 	nxp_fspi_prepare_lut(f, op);
+ 	/*
+ 	 * If we have large chunks of data, we read them through the AHB bus
+ 	 * by accessing the mapped memory. In all other cases we use
+-	 * IP commands to access the flash.
++	 * IP commands to access the flash, but ahb read won't be used for dxl
++	 * since IC errta.
+ 	 */
+-	if (op->data.nbytes > (f->devtype_data->rxfifo - 4) &&
++	if (!nxp_fspi_ips_access_only(f) &&
++	    op->data.nbytes > (f->devtype_data->rxfifo - 4) &&
+ 	    op->data.dir == SPI_MEM_DATA_IN) {
+ 		err = nxp_fspi_read_ahb(f, op);
+ 	} else {
+@@ -869,8 +989,14 @@ static int nxp_fspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+ 	/* Invalidate the data in the AHB buffer. */
+ 	nxp_fspi_invalid(f);
+ 
++	pm_runtime_mark_last_busy(f->dev);
++	pm_runtime_put_autosuspend(f->dev);
++
+ 	mutex_unlock(&f->lock);
++	return err;
+ 
++err_mutex:
++	mutex_unlock(&f->lock);
+ 	return err;
+ }
+ 
+@@ -886,6 +1012,10 @@ static int nxp_fspi_adjust_op_size(struct spi_mem *mem, struct spi_mem_op *op)
+ 			op->data.nbytes = f->devtype_data->ahb_buf_size;
+ 		else if (op->data.nbytes > (f->devtype_data->rxfifo - 4))
+ 			op->data.nbytes = ALIGN_DOWN(op->data.nbytes, 8);
++		/* dxl won't use ahb to access data, limit to rxfifo size */
++		if (nxp_fspi_ips_access_only(f) &&
++		    op->data.nbytes > f->devtype_data->rxfifo)
++			op->data.nbytes = f->devtype_data->rxfifo;
+ 	}
+ 
+ 	return 0;
+@@ -922,6 +1052,13 @@ static int nxp_fspi_default_setup(struct nxp_fspi *f)
+ 	fspi_writel(f, FSPI_DLLACR_OVRDEN, base + FSPI_DLLACR);
+ 	fspi_writel(f, FSPI_DLLBCR_OVRDEN, base + FSPI_DLLBCR);
+ 
++	if (f->dll_slvdly) {
++		fspi_writel(f, FSPI_DLLACR_DLLEN | FSPI_DLLACR_SLVDLY(f->dll_slvdly),
++			    base + FSPI_DLLACR);
++		fspi_writel(f, FSPI_DLLBCR_DLLEN | FSPI_DLLBCR_SLVDLY(f->dll_slvdly),
++			    base + FSPI_DLLBCR);
++	}
++
+ 	/* enable module */
+ 	fspi_writel(f, FSPI_MCR0_AHB_TIMEOUT(0xFF) |
+ 		    FSPI_MCR0_IP_TIMEOUT(0xFF) | (u32) FSPI_MCR0_OCTCOMB_EN,
+@@ -1062,12 +1199,17 @@ static int nxp_fspi_probe(struct platform_device *pdev)
+ 			ret = PTR_ERR(f->clk);
+ 			goto err_put_ctrl;
+ 		}
++	}
+ 
+-		ret = nxp_fspi_clk_prep_enable(f);
+-		if (ret) {
+-			dev_err(dev, "can not enable the clock\n");
+-			goto err_put_ctrl;
+-		}
++	pm_runtime_enable(dev);
++	pm_runtime_set_autosuspend_delay(dev, FSPI_RPM_TIMEOUT);
++	pm_runtime_use_autosuspend(dev);
++
++	/* enable clock */
++	ret = pm_runtime_get_sync(f->dev);
++	if (ret < 0) {
++		dev_err(f->dev, "Failed to enable clock %d\n", __LINE__);
++		goto err_put_ctrl;
+ 	}
+ 
+ 	/* Clear potential interrupts */
+@@ -1087,6 +1229,9 @@ static int nxp_fspi_probe(struct platform_device *pdev)
+ 		goto err_disable_clk;
+ 	}
+ 
++	/* check if need to set the slave delay line */
++	of_property_read_u32(np, "nxp,fspi-dll-slvdly", &f->dll_slvdly);
++
+ 	mutex_init(&f->lock);
+ 
+ 	ctlr->bus_num = -1;
+@@ -1101,13 +1246,19 @@ static int nxp_fspi_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_destroy_mutex;
+ 
++	pm_runtime_mark_last_busy(f->dev);
++	pm_runtime_put_autosuspend(f->dev);
++
++	/* indicate the controller has been initialized */
++	f->flags |= FSPI_INITILIZED;
++
+ 	return 0;
+ 
+ err_destroy_mutex:
+ 	mutex_destroy(&f->lock);
+ 
+ err_disable_clk:
+-	nxp_fspi_clk_disable_unprep(f);
++	pm_runtime_disable(dev);
+ 
+ err_put_ctrl:
+ 	spi_controller_put(ctlr);
+@@ -1133,24 +1284,83 @@ static int nxp_fspi_remove(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static int nxp_fspi_suspend(struct device *dev)
++#ifdef CONFIG_PM
++static int nxp_fspi_initialized(struct nxp_fspi *f)
++{
++	return f->flags & FSPI_INITILIZED;
++}
++
++static int nxp_fspi_need_reinit(struct nxp_fspi *f)
+ {
++	/* we always use the controller in combination mode, so we check this */
++	/* register bit to determine if the controller once lost power, such as */
++	/* suspend/resume, and need to be re-init */
++
++	return !(readl(f->iobase + FSPI_MCR0) & FSPI_MCR0_OCTCOMB_EN);
++}
++
++
++static int nxp_fspi_runtime_suspend(struct device *dev)
++{
++	struct nxp_fspi *f = dev_get_drvdata(dev);
++
++	nxp_fspi_clk_disable_unprep(f);
++
+ 	return 0;
+ }
+ 
+-static int nxp_fspi_resume(struct device *dev)
++static int nxp_fspi_runtime_resume(struct device *dev)
+ {
+ 	struct nxp_fspi *f = dev_get_drvdata(dev);
+ 
+-	nxp_fspi_default_setup(f);
++	nxp_fspi_clk_prep_enable(f);
++
++	if (nxp_fspi_initialized(f) && nxp_fspi_need_reinit(f))
++		nxp_fspi_default_setup(f);
+ 
+ 	return 0;
+ }
+ 
++static int nxp_fspi_suspend(struct device *dev)
++{
++	int ret;
++
++	ret = pinctrl_pm_select_sleep_state(dev);
++	if (ret) {
++		dev_err(dev, "select flexspi sleep pinctrl failed!\n");
++		return ret;
++	}
++
++	return pm_runtime_force_suspend(dev);
++}
++
++static int nxp_fspi_resume(struct device *dev)
++{
++	int ret;
++
++	ret = pm_runtime_force_resume(dev);
++	if (ret)
++		return ret;
++
++	ret = pinctrl_pm_select_default_state(dev);
++	if (ret)
++		dev_err(dev, "select flexspi default pinctrl failed!\n");
++
++	return ret;
++}
++
++static const struct dev_pm_ops nxp_fspi_pm_ops = {
++	SET_RUNTIME_PM_OPS(nxp_fspi_runtime_suspend, nxp_fspi_runtime_resume, NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(nxp_fspi_suspend, nxp_fspi_resume)
++};
++
++#endif /* CONFIG_PM */
++
+ static const struct of_device_id nxp_fspi_dt_ids[] = {
+ 	{ .compatible = "nxp,lx2160a-fspi", .data = (void *)&lx2160a_data, },
+ 	{ .compatible = "nxp,imx8mm-fspi", .data = (void *)&imx8mm_data, },
+ 	{ .compatible = "nxp,imx8qxp-fspi", .data = (void *)&imx8qxp_data, },
++	{ .compatible = "nxp,imx8dxl-fspi", .data = (void *)&imx8dxl_data, },
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, nxp_fspi_dt_ids);
+@@ -1163,11 +1373,6 @@ static const struct acpi_device_id nxp_fspi_acpi_ids[] = {
+ MODULE_DEVICE_TABLE(acpi, nxp_fspi_acpi_ids);
+ #endif
+ 
+-static const struct dev_pm_ops nxp_fspi_pm_ops = {
+-	.suspend	= nxp_fspi_suspend,
+-	.resume		= nxp_fspi_resume,
+-};
+-
+ static struct platform_driver nxp_fspi_driver = {
+ 	.driver = {
+ 		.name	= "nxp-fspi",
+diff --git a/drivers/tee/optee/call.c b/drivers/tee/optee/call.c
+index f8f1594be..421259cd0 100644
+--- a/drivers/tee/optee/call.c
++++ b/drivers/tee/optee/call.c
+@@ -15,6 +15,10 @@
+ #include "optee_private.h"
+ #include "optee_smc.h"
+ 
++#if defined(CONFIG_HAVE_IMX_BUSFREQ)
++#include <linux/busfreq-imx.h>
++#endif
++
+ struct optee_call_waiter {
+ 	struct list_head list_node;
+ 	struct completion c;
+@@ -133,8 +137,19 @@ u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
+ 
+ 	param.a0 = OPTEE_SMC_CALL_WITH_ARG;
+ 	reg_pair_from_64(&param.a1, &param.a2, parg);
++
+ 	/* Initialize waiter */
+ 	optee_cq_wait_init(&optee->call_queue, &w);
++
++#if defined(CONFIG_HAVE_IMX_BUSFREQ)
++	/*
++	 * Request Busfreq to HIGH to prevent DDR self-refresh while
++	 * executing Secure stuff
++	 */
++	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_IMX_BUSFREQ)
++		request_bus_freq(BUS_FREQ_HIGH);
++#endif
++
+ 	while (true) {
+ 		struct arm_smccc_res res;
+ 
+@@ -163,6 +178,15 @@ u32 optee_do_call_with_arg(struct tee_context *ctx, phys_addr_t parg)
+ 	}
+ 
+ 	optee_rpc_finalize_call(&call_ctx);
++
++#if defined(CONFIG_HAVE_IMX_BUSFREQ)
++	/*
++	 * Release Busfreq from HIGH
++	 */
++	if (optee->sec_caps & OPTEE_SMC_SEC_CAP_IMX_BUSFREQ)
++		release_bus_freq(BUS_FREQ_HIGH);
++#endif
++
+ 	/*
+ 	 * We're done with our thread in secure world, if there's any
+ 	 * thread waiters wake up one.
+@@ -568,8 +592,10 @@ void optee_free_pages_list(void *list, size_t num_entries)
+ static bool is_normal_memory(pgprot_t p)
+ {
+ #if defined(CONFIG_ARM)
+-	return (((pgprot_val(p) & L_PTE_MT_MASK) == L_PTE_MT_WRITEALLOC) ||
+-		((pgprot_val(p) & L_PTE_MT_MASK) == L_PTE_MT_WRITEBACK));
++	u32 attr = pgprot_val(p) & L_PTE_MT_MASK;
++
++	return (attr == L_PTE_MT_WRITEALLOC) || (attr == L_PTE_MT_WRITEBACK) ||
++		(attr == L_PTE_MT_WRITETHROUGH);
+ #elif defined(CONFIG_ARM64)
+ 	return (pgprot_val(p) & PTE_ATTRINDX_MASK) == PTE_ATTRINDX(MT_NORMAL);
+ #else
+diff --git a/drivers/tee/optee/core.c b/drivers/tee/optee/core.c
+index f255a96ae..bfbd9ec60 100644
+--- a/drivers/tee/optee/core.c
++++ b/drivers/tee/optee/core.c
+@@ -688,6 +688,10 @@ static int optee_probe(struct platform_device *pdev)
+ 		goto err;
+ 	}
+ 
++#if defined(CONFIG_HAVE_IMX_BUSFREQ)
++	if (of_find_compatible_node(NULL, NULL, "fsl,imx_busfreq"))
++		sec_caps |= OPTEE_SMC_SEC_CAP_IMX_BUSFREQ;
++#endif
+ 	optee->invoke_fn = invoke_fn;
+ 	optee->sec_caps = sec_caps;
+ 
+diff --git a/drivers/tee/optee/optee_smc.h b/drivers/tee/optee/optee_smc.h
+index 777ad54d4..4018c3979 100644
+--- a/drivers/tee/optee/optee_smc.h
++++ b/drivers/tee/optee/optee_smc.h
+@@ -218,6 +218,8 @@ struct optee_smc_get_shm_config_result {
+ /* Secure world supports Shared Memory with a NULL buffer reference */
+ #define OPTEE_SMC_SEC_CAP_MEMREF_NULL		BIT(4)
+ 
++#define OPTEE_SMC_SEC_CAP_IMX_BUSFREQ		BIT(31)
++
+ #define OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES	9
+ #define OPTEE_SMC_EXCHANGE_CAPABILITIES \
+ 	OPTEE_SMC_FAST_CALL_VAL(OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES)
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index 7edc8dc6b..ca42eb604 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -282,6 +282,13 @@ config K3_THERMAL
+ 
+ 	  This includes temperature reading functionality.
+ 
++config DEVICE_THERMAL
++	tristate "generic device cooling support"
++	help
++	  Support for device cooling.
++	  It supports notification of crossing passive trip for devices,
++	  devices need to do their own actions to cool down the SOC.
++
+ config MAX77620_THERMAL
+ 	tristate "Temperature sensor driver for Maxim MAX77620 PMIC"
+ 	depends on MFD_MAX77620
+diff --git a/drivers/thermal/Makefile b/drivers/thermal/Makefile
+index b64dd50a6..1cfa5c06a 100644
+--- a/drivers/thermal/Makefile
++++ b/drivers/thermal/Makefile
+@@ -46,6 +46,7 @@ obj-$(CONFIG_TANGO_THERMAL)	+= tango_thermal.o
+ obj-$(CONFIG_IMX_THERMAL)	+= imx_thermal.o
+ obj-$(CONFIG_IMX_SC_THERMAL)	+= imx_sc_thermal.o
+ obj-$(CONFIG_IMX8MM_THERMAL)	+= imx8mm_thermal.o
++obj-$(CONFIG_DEVICE_THERMAL)	+= device_cooling.o
+ obj-$(CONFIG_MAX77620_THERMAL)	+= max77620_thermal.o
+ obj-$(CONFIG_QORIQ_THERMAL)	+= qoriq_thermal.o
+ obj-$(CONFIG_DA9062_THERMAL)	+= da9062-thermal.o
+diff --git a/drivers/thermal/device_cooling.c b/drivers/thermal/device_cooling.c
+new file mode 100644
+index 000000000..c2f7653cb
+--- /dev/null
++++ b/drivers/thermal/device_cooling.c
+@@ -0,0 +1,152 @@
++/*
++ * Copyright (C) 2013-2015 Freescale Semiconductor, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/thermal.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++
++struct devfreq_cooling_device {
++	int id;
++	struct thermal_cooling_device *cool_dev;
++	unsigned int devfreq_state;
++};
++
++static DEFINE_IDR(devfreq_idr);
++static DEFINE_MUTEX(devfreq_cooling_lock);
++
++#define	MAX_STATE	1
++
++static BLOCKING_NOTIFIER_HEAD(devfreq_cooling_chain_head);
++
++int register_devfreq_cooling_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_register(
++		&devfreq_cooling_chain_head, nb);
++}
++EXPORT_SYMBOL_GPL(register_devfreq_cooling_notifier);
++
++int unregister_devfreq_cooling_notifier(struct notifier_block *nb)
++{
++	return blocking_notifier_chain_unregister(
++		&devfreq_cooling_chain_head, nb);
++}
++EXPORT_SYMBOL_GPL(unregister_devfreq_cooling_notifier);
++
++static int devfreq_cooling_notifier_call_chain(unsigned long val)
++{
++	return (blocking_notifier_call_chain(
++		&devfreq_cooling_chain_head, val, NULL)
++		== NOTIFY_BAD) ? -EINVAL : 0;
++}
++
++static int devfreq_set_cur_state(struct thermal_cooling_device *cdev,
++				 unsigned long state)
++{
++	struct devfreq_cooling_device *devfreq_device = cdev->devdata;
++	int ret;
++
++	ret = devfreq_cooling_notifier_call_chain(state);
++	if (ret)
++		return -EINVAL;
++
++	devfreq_device->devfreq_state = state;
++
++	return 0;
++}
++
++static int devfreq_get_max_state(struct thermal_cooling_device *cdev,
++				 unsigned long *state)
++{
++	*state = MAX_STATE;
++
++	return 0;
++}
++
++static int devfreq_get_cur_state(struct thermal_cooling_device *cdev,
++				 unsigned long *state)
++{
++	struct devfreq_cooling_device *devfreq_device = cdev->devdata;
++
++	*state = devfreq_device->devfreq_state;
++
++	return 0;
++}
++
++static struct thermal_cooling_device_ops const devfreq_cooling_ops = {
++	.get_max_state = devfreq_get_max_state,
++	.get_cur_state = devfreq_get_cur_state,
++	.set_cur_state = devfreq_set_cur_state,
++};
++
++static int get_idr(struct idr *idr, int *id)
++{
++	int ret;
++
++	mutex_lock(&devfreq_cooling_lock);
++	ret = idr_alloc(idr, NULL, 0, 0, GFP_KERNEL);
++	mutex_unlock(&devfreq_cooling_lock);
++	if (unlikely(ret < 0))
++		return ret;
++	*id = ret;
++
++	return 0;
++}
++
++static void release_idr(struct idr *idr, int id)
++{
++	mutex_lock(&devfreq_cooling_lock);
++	idr_remove(idr, id);
++	mutex_unlock(&devfreq_cooling_lock);
++}
++
++struct thermal_cooling_device *devfreq_cooling_register(void)
++{
++	struct thermal_cooling_device *cool_dev;
++	struct devfreq_cooling_device *devfreq_dev = NULL;
++	char dev_name[THERMAL_NAME_LENGTH];
++	int ret = 0;
++
++	devfreq_dev = kzalloc(sizeof(struct devfreq_cooling_device),
++			      GFP_KERNEL);
++	if (!devfreq_dev)
++		return ERR_PTR(-ENOMEM);
++
++	ret = get_idr(&devfreq_idr, &devfreq_dev->id);
++	if (ret) {
++		kfree(devfreq_dev);
++		return ERR_PTR(-EINVAL);
++	}
++
++	snprintf(dev_name, sizeof(dev_name), "thermal-devfreq-%d",
++		 devfreq_dev->id);
++
++	cool_dev = thermal_cooling_device_register(dev_name, devfreq_dev,
++						   &devfreq_cooling_ops);
++	if (!cool_dev) {
++		release_idr(&devfreq_idr, devfreq_dev->id);
++		kfree(devfreq_dev);
++		return ERR_PTR(-EINVAL);
++	}
++	devfreq_dev->cool_dev = cool_dev;
++	devfreq_dev->devfreq_state = 0;
++
++	return cool_dev;
++}
++EXPORT_SYMBOL_GPL(devfreq_cooling_register);
++
++void devfreq_cooling_unregister(struct thermal_cooling_device *cdev)
++{
++	struct devfreq_cooling_device *devfreq_dev = cdev->devdata;
++
++	thermal_cooling_device_unregister(devfreq_dev->cool_dev);
++	release_idr(&devfreq_idr, devfreq_dev->id);
++	kfree(devfreq_dev);
++}
++EXPORT_SYMBOL_GPL(devfreq_cooling_unregister);
+diff --git a/drivers/thermal/imx8mm_thermal.c b/drivers/thermal/imx8mm_thermal.c
+index a1e4f9bb4..fd1bf2d14 100644
+--- a/drivers/thermal/imx8mm_thermal.c
++++ b/drivers/thermal/imx8mm_thermal.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
++#include <linux/device_cooling.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+@@ -34,10 +35,13 @@
+ #define VER1_TEMP_LOW_LIMIT	10000
+ #define VER2_TEMP_LOW_LIMIT	-40000
+ #define VER2_TEMP_HIGH_LIMIT	125000
++#define IMX_TEMP_PASSIVE_COOL_DELTA 10000
+ 
+ #define TMU_VER1		0x1
+ #define TMU_VER2		0x2
+ 
++#define MAX_SENSOR_NUMBER	2
++
+ struct thermal_soc_data {
+ 	u32 num_sensors;
+ 	u32 version;
+@@ -48,6 +52,9 @@ struct tmu_sensor {
+ 	struct imx8mm_tmu *priv;
+ 	u32 hw_id;
+ 	struct thermal_zone_device *tzd;
++	struct thermal_cooling_device *cdev;
++	int temp_passive;
++	int temp_critical;
+ };
+ 
+ struct imx8mm_tmu {
+@@ -57,6 +64,13 @@ struct imx8mm_tmu {
+ 	struct tmu_sensor sensors[];
+ };
+ 
++/* The driver support 1 passive trip point and 1 critical trip point */
++enum imx_thermal_trip {
++	IMX_TRIP_PASSIVE,
++	IMX_TRIP_CRITICAL,
++	IMX_TRIP_NUM,
++};
++
+ static int imx8mm_tmu_get_temp(void *data, int *temp)
+ {
+ 	struct tmu_sensor *sensor = data;
+@@ -78,6 +92,9 @@ static int imx8mp_tmu_get_temp(void *data, int *temp)
+ 	unsigned long val;
+ 	bool ready;
+ 
++	if (sensor->hw_id > (MAX_SENSOR_NUMBER - 1))
++		return -EINVAL;
++
+ 	val = readl_relaxed(tmu->base + TRITSR);
+ 	ready = test_bit(probe_status_offset(sensor->hw_id), &val);
+ 	if (!ready)
+@@ -103,8 +120,41 @@ static int tmu_get_temp(void *data, int *temp)
+ 	return tmu->socdata->get_temp(data, temp);
+ }
+ 
++static int tmu_get_trend(void *p, int trip, enum thermal_trend *trend)
++{
++	int trip_temp;
++	struct tmu_sensor *sensor = p;
++
++	if (!sensor->tzd)
++		return 0;
++
++	trip_temp = (trip == IMX_TRIP_PASSIVE) ? sensor->temp_passive : sensor->temp_critical;
++
++	if (sensor->tzd->temperature >= (trip_temp - IMX_TEMP_PASSIVE_COOL_DELTA))
++		*trend = THERMAL_TREND_RAISE_FULL;
++	else
++		*trend = THERMAL_TREND_DROP_FULL;
++
++	return 0;
++}
++
++static int tmu_set_trip_temp(void *p, int trip, int temp)
++{
++	struct tmu_sensor *sensor = p;
++
++	if (trip == IMX_TRIP_CRITICAL)
++		sensor->temp_critical = temp;
++
++	if (trip == IMX_TRIP_PASSIVE)
++		sensor->temp_passive = temp;
++
++	return 0;
++}
++
+ static struct thermal_zone_of_device_ops tmu_tz_ops = {
+ 	.get_temp = tmu_get_temp,
++	.get_trend = tmu_get_trend,
++	.set_trip_temp = tmu_set_trip_temp,
+ };
+ 
+ static void imx8mm_tmu_enable(struct imx8mm_tmu *tmu, bool enable)
+@@ -128,6 +178,7 @@ static void imx8mm_tmu_probe_sel_all(struct imx8mm_tmu *tmu)
+ static int imx8mm_tmu_probe(struct platform_device *pdev)
+ {
+ 	const struct thermal_soc_data *data;
++	const struct thermal_trip *trips;
+ 	struct imx8mm_tmu *tmu;
+ 	int ret;
+ 	int i;
+@@ -172,6 +223,35 @@ static int imx8mm_tmu_probe(struct platform_device *pdev)
+ 			return PTR_ERR(tmu->sensors[i].tzd);
+ 		}
+ 		tmu->sensors[i].hw_id = i;
++
++		tmu->sensors[i].cdev = devfreq_cooling_register();
++		if (IS_ERR(tmu->sensors[i].cdev)) {
++			ret = PTR_ERR(tmu->sensors[i].cdev);
++			if (ret != -EPROBE_DEFER)
++				dev_err(&pdev->dev,
++					"failed to register devfreq cooling device %d\n", ret);
++			return ret;
++		}
++
++		ret = thermal_zone_bind_cooling_device(tmu->sensors[i].tzd,
++			IMX_TRIP_PASSIVE,
++			tmu->sensors[i].cdev,
++			THERMAL_NO_LIMIT,
++			THERMAL_NO_LIMIT,
++			THERMAL_WEIGHT_DEFAULT);
++		if (ret) {
++			dev_err(&pdev->dev,
++				"binding zone %s with cdev %s failed:%d\n",
++				tmu->sensors[i].tzd->type, tmu->sensors[i].cdev->type, ret);
++			devfreq_cooling_unregister(tmu->sensors[i].cdev);
++			return ret;
++		}
++
++		trips = of_thermal_get_trip_points(tmu->sensors[i].tzd);
++
++		/* get the thermal trip temp */
++		tmu->sensors[i].temp_passive = trips[0].temperature;
++		tmu->sensors[i].temp_critical = trips[1].temperature;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, tmu);
+diff --git a/drivers/thermal/imx_sc_thermal.c b/drivers/thermal/imx_sc_thermal.c
+index 8d76dbfde..4d2cf3dc6 100644
+--- a/drivers/thermal/imx_sc_thermal.c
++++ b/drivers/thermal/imx_sc_thermal.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <dt-bindings/firmware/imx/rsrc.h>
++#include <linux/device_cooling.h>
+ #include <linux/err.h>
+ #include <linux/firmware/imx/sci.h>
+ #include <linux/module.h>
+@@ -17,12 +18,27 @@
+ #include "thermal_hwmon.h"
+ 
+ #define IMX_SC_MISC_FUNC_GET_TEMP	13
++#define IMX_SC_TEMP_PASSIVE_COOL_DELTA	10000
+ 
+ static struct imx_sc_ipc *thermal_ipc_handle;
+ 
+ struct imx_sc_sensor {
+ 	struct thermal_zone_device *tzd;
+ 	u32 resource_id;
++	struct thermal_cooling_device *cdev;
++	int temp_passive;
++	int temp_critical;
++};
++
++struct imx_sc_thermal_data {
++	struct imx_sc_sensor *sensor;
++};
++
++/* The driver support 1 passive trip point and 1 critical trip point */
++enum imx_thermal_trip {
++	IMX_TRIP_PASSIVE,
++	IMX_TRIP_CRITICAL,
++	IMX_TRIP_NUM,
+ };
+ 
+ struct req_get_temp {
+@@ -60,9 +76,14 @@ static int imx_sc_thermal_get_temp(void *data, int *temp)
+ 
+ 	ret = imx_scu_call_rpc(thermal_ipc_handle, &msg, true);
+ 	if (ret) {
+-		dev_err(&sensor->tzd->device, "read temp sensor %d failed, ret %d\n",
+-			sensor->resource_id, ret);
+-		return ret;
++		/*
++		 * if the SS power domain is down, read temp will fail, so
++		 * we can print error once and return 0 directly.
++		 */
++		pr_err_once("read temp sensor %d failed, could be SS powered off, ret %d\n",
++			     sensor->resource_id, ret);
++		*temp = 0;
++		return 0;
+ 	}
+ 
+ 	*temp = msg.data.resp.celsius * 1000 + msg.data.resp.tenths * 100;
+@@ -70,14 +91,50 @@ static int imx_sc_thermal_get_temp(void *data, int *temp)
+ 	return 0;
+ }
+ 
++static int imx_sc_thermal_get_trend(void *p, int trip, enum thermal_trend *trend)
++{
++	int trip_temp;
++	struct imx_sc_sensor *sensor = p;
++
++	if (!sensor->tzd)
++		return 0;
++
++	trip_temp = (trip == IMX_TRIP_PASSIVE) ? sensor->temp_passive :
++					     sensor->temp_critical;
++
++	if (sensor->tzd->temperature >=
++		(trip_temp - IMX_SC_TEMP_PASSIVE_COOL_DELTA))
++		*trend = THERMAL_TREND_RAISE_FULL;
++	else
++		*trend = THERMAL_TREND_DROP_FULL;
++
++	return 0;
++}
++
++static int imx_sc_thermal_set_trip_temp(void *p, int trip, int temp)
++{
++	struct imx_sc_sensor *sensor = p;
++
++	if (trip == IMX_TRIP_CRITICAL)
++		sensor->temp_critical = temp;
++
++	if (trip == IMX_TRIP_PASSIVE)
++		sensor->temp_passive = temp;
++
++	return 0;
++}
++
+ static const struct thermal_zone_of_device_ops imx_sc_thermal_ops = {
+ 	.get_temp = imx_sc_thermal_get_temp,
++	.get_trend = imx_sc_thermal_get_trend,
++	.set_trip_temp = imx_sc_thermal_set_trip_temp,
+ };
+ 
+ static int imx_sc_thermal_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np, *child, *sensor_np;
+ 	struct imx_sc_sensor *sensor;
++	const struct thermal_trip *trip;
+ 	int ret;
+ 
+ 	ret = imx_scu_get_handle(&thermal_ipc_handle);
+@@ -122,6 +179,32 @@ static int imx_sc_thermal_probe(struct platform_device *pdev)
+ 
+ 		if (devm_thermal_add_hwmon_sysfs(sensor->tzd))
+ 			dev_warn(&pdev->dev, "failed to add hwmon sysfs attributes\n");
++
++		trip = of_thermal_get_trip_points(sensor->tzd);
++		sensor->temp_passive = trip[0].temperature;
++		sensor->temp_critical = trip[1].temperature;
++
++		sensor->cdev = devfreq_cooling_register();
++		if (IS_ERR(sensor->cdev)) {
++			dev_err(&pdev->dev,
++				"failed to register devfreq cooling device: %d\n",
++				ret);
++			return ret;
++		}
++
++		ret = thermal_zone_bind_cooling_device(sensor->tzd,
++			IMX_TRIP_PASSIVE,
++			sensor->cdev,
++			THERMAL_NO_LIMIT,
++			THERMAL_NO_LIMIT,
++			THERMAL_WEIGHT_DEFAULT);
++		if (ret) {
++			dev_err(&sensor->tzd->device,
++				"binding zone %s with cdev %s failed:%d\n",
++				sensor->tzd->type, sensor->cdev->type, ret);
++			devfreq_cooling_unregister(sensor->cdev);
++			return ret;
++		}
+ 	}
+ 
+ 	of_node_put(sensor_np);
+diff --git a/drivers/thermal/qoriq_thermal.c b/drivers/thermal/qoriq_thermal.c
+index 73049f9be..94214272e 100644
+--- a/drivers/thermal/qoriq_thermal.c
++++ b/drivers/thermal/qoriq_thermal.c
+@@ -3,6 +3,7 @@
+ // Copyright 2016 Freescale Semiconductor, Inc.
+ 
+ #include <linux/clk.h>
++#include <linux/device_cooling.h>
+ #include <linux/err.h>
+ #include <linux/io.h>
+ #include <linux/module.h>
+@@ -27,6 +28,7 @@
+ #define TMSARA_V2		0xe
+ #define TMU_VER1		0x1
+ #define TMU_VER2		0x2
++#define TMU_TEMP_PASSIVE_COOL_DELTA	10000
+ 
+ #define REGS_TMR	0x000	/* Mode Register */
+ #define TMR_DISABLE	0x0
+@@ -68,6 +70,10 @@
+  */
+ struct qoriq_sensor {
+ 	int				id;
++	struct thermal_zone_device	*tzd;
++	int				temp_passive;
++	int				temp_critical;
++	struct thermal_cooling_device	*cdev;
+ };
+ 
+ struct qoriq_tmu_data {
+@@ -77,6 +83,12 @@ struct qoriq_tmu_data {
+ 	struct qoriq_sensor	sensor[SITES_MAX];
+ };
+ 
++enum tmu_trip {
++	TMU_TRIP_PASSIVE,
++	TMU_TRIP_CRITICAL,
++	TMU_TRIP_NUM,
++};
++
+ static struct qoriq_tmu_data *qoriq_sensor_to_data(struct qoriq_sensor *s)
+ {
+ 	return container_of(s, struct qoriq_tmu_data, sensor[s->id]);
+@@ -122,14 +134,51 @@ static int tmu_get_temp(void *p, int *temp)
+ 	return 0;
+ }
+ 
++static int tmu_get_trend(void *p, int trip, enum thermal_trend *trend)
++{
++	struct qoriq_sensor *qsensor = p;
++	int trip_temp;
++
++	if (!qsensor->tzd)
++		return 0;
++
++	trip_temp = (trip == TMU_TRIP_PASSIVE) ? qsensor->temp_passive :
++					     qsensor->temp_critical;
++
++	if (qsensor->tzd->temperature >=
++		(trip_temp - TMU_TEMP_PASSIVE_COOL_DELTA))
++		*trend = THERMAL_TREND_RAISE_FULL;
++	else
++		*trend = THERMAL_TREND_DROP_FULL;
++
++	return 0;
++}
++
++static int tmu_set_trip_temp(void *p, int trip,
++			     int temp)
++{
++	struct qoriq_sensor *qsensor = p;
++
++	if (trip == TMU_TRIP_CRITICAL)
++		qsensor->temp_critical = temp;
++
++	if (trip == TMU_TRIP_PASSIVE)
++		qsensor->temp_passive = temp;
++
++	return 0;
++}
++
+ static const struct thermal_zone_of_device_ops tmu_tz_ops = {
+ 	.get_temp = tmu_get_temp,
++	.get_trend = tmu_get_trend,
++	.set_trip_temp = tmu_set_trip_temp,
+ };
+ 
+ static int qoriq_tmu_register_tmu_zone(struct device *dev,
+ 				       struct qoriq_tmu_data *qdata)
+ {
+ 	int id;
++	const struct thermal_trip *trip;
+ 
+ 	if (qdata->ver == TMU_VER1) {
+ 		regmap_write(qdata->regmap, REGS_TMR,
+@@ -158,10 +207,40 @@ static int qoriq_tmu_register_tmu_zone(struct device *dev,
+ 			return ret;
+ 		}
+ 
++		sensor->tzd = tzd;
++
+ 		if (devm_thermal_add_hwmon_sysfs(tzd))
+ 			dev_warn(dev,
+ 				 "Failed to add hwmon sysfs attributes\n");
+-
++		/* first thermal zone takes care of system-wide device cooling */
++		if (id == 0) {
++			sensor->cdev = devfreq_cooling_register();
++			if (IS_ERR(sensor->cdev)) {
++				ret = PTR_ERR(sensor->cdev);
++				pr_err("failed to register devfreq cooling device: %d\n",
++					ret);
++				return ret;
++			}
++
++			ret = thermal_zone_bind_cooling_device(sensor->tzd,
++				TMU_TRIP_PASSIVE,
++				sensor->cdev,
++				THERMAL_NO_LIMIT,
++				THERMAL_NO_LIMIT,
++				THERMAL_WEIGHT_DEFAULT);
++			if (ret) {
++				pr_err("binding zone %s with cdev %s failed:%d\n",
++					sensor->tzd->type,
++					sensor->cdev->type,
++					ret);
++				devfreq_cooling_unregister(sensor->cdev);
++				return ret;
++			}
++
++			trip = of_thermal_get_trip_points(sensor->tzd);
++			sensor->temp_passive = trip[0].temperature;
++			sensor->temp_critical = trip[1].temperature;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/thermal/thermal_core.c b/drivers/thermal/thermal_core.c
+index 17de8a9b9..06a978858 100644
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@ -42,7 +42,8 @@ static atomic_t in_suspend;
+ static bool power_off_triggered;
+ 
+ static struct thermal_governor *def_governor;
+-
++extern char * saved_command_line;
++static bool ignore_tmp = false;
+ /*
+  * Governor section: set of functions to handle thermal governors
+  *
+@@ -395,7 +396,7 @@ static void handle_critical_trips(struct thermal_zone_device *tz,
+ 	if (tz->ops->notify)
+ 		tz->ops->notify(tz, trip, trip_type);
+ 
+-	if (trip_type == THERMAL_TRIP_CRITICAL) {
++	if (trip_type == THERMAL_TRIP_CRITICAL && !ignore_tmp) {
+ 		dev_emerg(&tz->device,
+ 			  "critical temperature reached (%d C), shutting down\n",
+ 			  tz->temperature / 1000);
+@@ -1666,6 +1667,12 @@ static int __init thermal_init(void)
+ 		pr_warn("Thermal: Can not register suspend notifier, return %d\n",
+ 			result);
+ 
++	if (strstr(saved_command_line, "ignore_tmp")){
++		ignore_tmp=true;
++		pr_warn("Thermal: ignore temp\n");
++			
++	}
++
+ 	return 0;
+ 
+ unregister_class:

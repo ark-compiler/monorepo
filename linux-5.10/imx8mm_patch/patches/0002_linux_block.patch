@@ -1,0 +1,106 @@
+commit 523de3019f56ab52b857e7b4ae6f03a605ef96ba
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Thu Jun 16 17:11:53 2022 +0800
+
+    linux_block
+    
+    Change-Id: I38ecc75058b0e884b1a7b85a700d3ec794b93c75
+
+diff --git a/block/blk-map.c b/block/blk-map.c
+index ede73f4f7..61e94a5a6 100644
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -488,7 +488,7 @@ static struct bio *bio_copy_kern(struct request_queue *q, void *data,
+ 		if (bytes > len)
+ 			bytes = len;
+ 
+-		page = alloc_page(q->bounce_gfp | __GFP_ZERO | gfp_mask);
++		page = alloc_page(q->bounce_gfp | gfp_mask);
+ 		if (!page)
+ 			goto cleanup;
+ 
+@@ -668,6 +668,12 @@ int blk_rq_unmap_user(struct bio *bio)
+ }
+ EXPORT_SYMBOL(blk_rq_unmap_user);
+ 
++#ifdef CONFIG_AHCI_IMX
++extern void *sg_io_buffer_hack;
++#else
++#define sg_io_buffer_hack NULL
++#endif
++
+ /**
+  * blk_rq_map_kern - map kernel data to a request, for passthrough requests
+  * @q:		request queue where request should be inserted
+@@ -694,7 +700,12 @@ int blk_rq_map_kern(struct request_queue *q, struct request *rq, void *kbuf,
+ 	if (!len || !kbuf)
+ 		return -EINVAL;
+ 
++#ifdef CONFIG_AHCI_IMX
++	if ((kbuf != sg_io_buffer_hack) && (!blk_rq_aligned(q, addr, len)
++			|| object_is_on_stack(kbuf)))
++#else
+ 	if (!blk_rq_aligned(q, addr, len) || object_is_on_stack(kbuf))
++#endif
+ 		bio = bio_copy_kern(q, kbuf, len, gfp_mask, reading);
+ 	else
+ 		bio = bio_map_kern(q, kbuf, len, gfp_mask);
+diff --git a/block/scsi_ioctl.c b/block/scsi_ioctl.c
+index c9f009cc0..bc596b8f9 100644
+--- a/block/scsi_ioctl.c
++++ b/block/scsi_ioctl.c
+@@ -243,6 +243,12 @@ static int blk_fill_sghdr_rq(struct request_queue *q, struct request *rq,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_AHCI_IMX
++extern void *sg_io_buffer_hack;
++#else
++#define sg_io_buffer_hack NULL
++#endif
++
+ static int blk_complete_sghdr_rq(struct request *rq, struct sg_io_hdr *hdr,
+ 				 struct bio *bio)
+ {
+@@ -272,7 +278,12 @@ static int blk_complete_sghdr_rq(struct request *rq, struct sg_io_hdr *hdr,
+ 			ret = -EFAULT;
+ 	}
+ 
+-	r = blk_rq_unmap_user(bio);
++	if (sg_io_buffer_hack && !hdr->iovec_count)
++		r = copy_to_user(hdr->dxferp, sg_io_buffer_hack,
++				hdr->dxfer_len);
++	else
++		r = blk_rq_unmap_user(bio);
++
+ 	if (!ret)
+ 		ret = r;
+ 
+@@ -296,6 +307,9 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+ 	if (hdr->dxfer_len > (queue_max_hw_sectors(q) << 9))
+ 		return -EIO;
+ 
++	if (sg_io_buffer_hack && hdr->dxfer_len > 0x10000)
++		return -EIO;
++
+ 	if (hdr->dxfer_len)
+ 		switch (hdr->dxfer_direction) {
+ 		default:
+@@ -341,9 +355,14 @@ static int sg_io(struct request_queue *q, struct gendisk *bd_disk,
+ 
+ 		ret = blk_rq_map_user_iov(q, rq, NULL, &i, GFP_KERNEL);
+ 		kfree(iov);
+-	} else if (hdr->dxfer_len)
+-		ret = blk_rq_map_user(q, rq, NULL, hdr->dxferp, hdr->dxfer_len,
+-				      GFP_KERNEL);
++	} else if (hdr->dxfer_len) {
++		if (sg_io_buffer_hack)
++			ret = blk_rq_map_kern(q, rq, sg_io_buffer_hack,
++					hdr->dxfer_len, GFP_KERNEL);
++		else
++			ret = blk_rq_map_user(q, rq, NULL, hdr->dxferp,
++					hdr->dxfer_len, GFP_KERNEL);
++	}
+ 
+ 	if (ret)
+ 		goto out_free_cdb;

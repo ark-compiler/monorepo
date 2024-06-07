@@ -1,0 +1,338 @@
+diff -Naur a/arch/arm/kernel/vmlinux.lds.S b/arch/arm/kernel/vmlinux.lds.S
+--- a/arch/arm/kernel/vmlinux.lds.S	2022-04-15 21:05:12.061104033 +0800
++++ b/arch/arm/kernel/vmlinux.lds.S	2022-04-20 19:17:58.757083993 +0800
+@@ -131,6 +131,14 @@
+ 		__pv_table_end = .;
+ 	}
+ 
++#ifdef CONFIG_DRIVERS_HDF
++	.init.hdf_table : {
++		_hdf_drivers_start = .;
++		*(.hdf.driver)
++		_hdf_drivers_end = .;
++	}
++#endif
++
+ 	INIT_DATA_SECTION(16)
+ 
+ 	.exit.data : {
+diff -Naur a/arch/arm64/kernel/vmlinux.lds.S b/arch/arm64/kernel/vmlinux.lds.S
+--- a/arch/arm64/kernel/vmlinux.lds.S	2022-04-18 15:08:13.387423111 +0800
++++ b/arch/arm64/kernel/vmlinux.lds.S	2022-04-20 19:17:58.757083993 +0800
+@@ -201,6 +201,15 @@
+ 		INIT_RAM_FS
+ 		*(.init.rodata.* .init.bss)	/* from the EFI stub */
+ 	}
++
++#ifdef CONFIG_DRIVERS_HDF
++	.init.hdf_table : {
++		_hdf_drivers_start = .;
++		*(.hdf.driver)
++		_hdf_drivers_end = .;
++	}
++#endif
++
+ 	.exit.data : {
+ 		EXIT_DATA
+ 	}
+diff -Naur a/drivers/hdf/Makefile b/drivers/hdf/Makefile
+--- a/drivers/hdf/Makefile	1970-01-01 08:00:00.000000000 +0800
++++ b/drivers/hdf/Makefile	2022-04-20 19:17:58.761084044 +0800
+@@ -0,0 +1,2 @@
++export PROJECT_ROOT := ../../../../../
++obj-$(CONFIG_DRIVERS_HDF) += khdf/
+diff -Naur a/drivers/hid/hid-core.c b/drivers/hid/hid-core.c
+--- a/drivers/hid/hid-core.c	2022-04-15 21:05:13.893124179 +0800
++++ b/drivers/hid/hid-core.c	2022-04-20 19:17:58.761084044 +0800
+@@ -33,6 +33,9 @@
+ #include <linux/hid-debug.h>
+ #include <linux/hidraw.h>
+ 
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++#include "hdf_hid_adapter.h"
++#endif
+ #include "hid-ids.h"
+ 
+ /*
+@@ -1522,6 +1525,11 @@
+ 		hidinput_hid_event(hid, field, usage, value);
+ 	if (hid->claimed & HID_CLAIMED_HIDDEV && interrupt && hid->hiddev_hid_event)
+ 		hid->hiddev_hid_event(hid, field, usage, value);
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++	if (hid->input_dev) {
++		HidReportEvent(hid->input_dev, usage->type, usage->code, value);
++	}
++#endif
+ }
+ 
+ /*
+@@ -1928,6 +1936,85 @@
+ 	.show = show_country,
+ };
+ 
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++static bool check_mouse(char *name)
++{
++	int i;
++	static char *option[]={"Mouse", "mouse", "MOUSE", "Razer"};
++	for (i = 0; i < 4; i++) {
++		if (strstr(name, option[i]))
++			return true;
++	}
++	return false;
++}
++static bool check_kbd(char *name)
++{
++	int i;
++	static char *option[]={"Keyboard", "keyboard"};
++	for (i = 0; i < 2; i++) {
++		if (strstr(name, option[i]))
++			return true;
++	}
++	return false;
++}
++static bool check_rocker(char *name)
++{
++	int i;
++	static char *option[]={"Thrustmaster"};
++	for (i = 0; i < 1; i++) {
++		if (strstr(name, option[i]))
++			return true;
++	}
++	return false;
++}
++static bool check_encoder(char *name)
++{
++	if (strcmp(name, "Wired KeyBoard") == 0) {
++		return true;
++	}
++	return false;
++}
++static bool check_trackball(char *name)
++{
++	int i;
++	static char *option[]={"Trackball"};
++	for (i = 0; i < 1; i++) {
++		if (strstr(name, option[i]))
++			return true;
++	}
++	return false;
++}
++static void notify_connect_event(struct hid_device *hdev)
++{
++	bool check;
++	int type = -1;
++	HidInfo *dev = (HidInfo *)kmalloc(sizeof(HidInfo), GFP_KERNEL);
++	if (dev == NULL) {
++		printk("%s: malloc failed", __func__);
++		return;
++	}
++	type = check_mouse(hdev->name)?HID_TYPE_MOUSE:type;
++	type = check_kbd(hdev->name)?HID_TYPE_KEYBOARD:type;
++	type = check_rocker(hdev->name)?HID_TYPE_ROCKER:type;
++	type = check_encoder(hdev->name)?HID_TYPE_ENCODER:type;
++	type = check_trackball(hdev->name)?HID_TYPE_TRACKBALL:type;
++	if (type < 0) {
++		kfree(dev);
++		dev = NULL;
++		return;
++	}
++
++	dev->devType = type;
++	dev->devName = hdev->name;
++	hdev->input_dev = HidRegisterHdfInputDev(dev);
++	if (hdev->input_dev == NULL) {
++		printk("%s: RegisterInputDevice failed\n", __func__);
++	}
++	kfree(dev);
++	dev = NULL;
++}
++#endif
++
+ int hid_connect(struct hid_device *hdev, unsigned int connect_mask)
+ {
+ 	static const char *types[] = { "Device", "Pointer", "Mouse", "Device",
+@@ -2020,6 +2107,9 @@
+ 	hid_info(hdev, "%s: %s HID v%x.%02x %s [%s] on %s\n",
+ 		 buf, bus, hdev->version >> 8, hdev->version & 0xff,
+ 		 type, hdev->name, hdev->phys);
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++	notify_connect_event(hdev);
++#endif
+ 
+ 	return 0;
+ }
+@@ -2035,6 +2125,10 @@
+ 	if (hdev->claimed & HID_CLAIMED_HIDRAW)
+ 		hidraw_disconnect(hdev);
+ 	hdev->claimed = 0;
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++	if (hdev->input_dev)
++		HidUnregisterHdfInputDev(hdev->input_dev);
++#endif
+ }
+ EXPORT_SYMBOL_GPL(hid_disconnect);
+ 
+@@ -2119,6 +2213,11 @@
+  */
+ void hid_hw_close(struct hid_device *hdev)
+ {
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++	if (hdev->input_dev) {
++		return;
++	}
++#endif
+ 	mutex_lock(&hdev->ll_open_lock);
+ 	if (!--hdev->ll_open_count)
+ 		hdev->ll_driver->close(hdev);
+diff -Naur a/drivers/hid/hid-input.c b/drivers/hid/hid-input.c
+--- a/drivers/hid/hid-input.c	2022-04-15 21:05:13.893124179 +0800
++++ b/drivers/hid/hid-input.c	2022-04-20 19:17:58.761084044 +0800
+@@ -20,6 +20,10 @@
+ #include <linux/hid.h>
+ #include <linux/hid-debug.h>
+ 
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++#include "hdf_hid_adapter.h"
++#endif
++
+ #include "hid-ids.h"
+ 
+ #define unk	KEY_UNKNOWN
+@@ -1416,7 +1420,15 @@
+ 		return;
+ 
+ 	list_for_each_entry(hidinput, &hid->inputs, list)
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++	{
++#endif
+ 		input_sync(hidinput->input);
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++		if(hid->input_dev)
++			HidReportEvent(hid->input_dev, EV_SYN, SYN_REPORT, 0);
++	}
++#endif
+ }
+ EXPORT_SYMBOL_GPL(hidinput_report_event);
+ 
+@@ -1867,6 +1879,42 @@
+ 						 report->field[i]->usage + j);
+ }
+ 
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++static void transfer_info(struct input_dev *dev)
++{
++	int i;
++	HidInfo *info = (HidInfo *)kmalloc(sizeof(HidInfo),GFP_KERNEL);
++	if (info == NULL) {
++		printk("%s: malloc failed\n",__func__);
++		return;
++	}
++	info->devName = dev->name;
++	memcpy(info->devProp, dev->propbit, sizeof(unsigned long) * BITS_TO_LONGS(INPUT_PROP_CNT));
++	memcpy(info->eventType, dev->evbit, sizeof(unsigned long) * BITS_TO_LONGS(EV_CNT));
++	memcpy(info->keyCode, dev->keybit, sizeof(unsigned long) * BITS_TO_LONGS(KEY_CNT));
++	memcpy(info->relCode, dev->relbit, sizeof(unsigned long) * BITS_TO_LONGS(REL_CNT));
++	memcpy(info->absCode, dev->absbit, sizeof(unsigned long) * BITS_TO_LONGS(ABS_CNT));
++	memcpy(info->miscCode, dev->mscbit, sizeof(unsigned long) * BITS_TO_LONGS(MSC_CNT));
++	memcpy(info->ledCode, dev->ledbit, sizeof(unsigned long) * BITS_TO_LONGS(LED_CNT));
++	memcpy(info->soundCode, dev->sndbit, sizeof(unsigned long) * BITS_TO_LONGS(SND_CNT));
++	memcpy(info->forceCode, dev->ffbit, sizeof(unsigned long) * BITS_TO_LONGS(FF_CNT));
++	memcpy(info->switchCode, dev->swbit, sizeof(unsigned long) * BITS_TO_LONGS(SW_CNT));
++	for (i = 0; i < BITS_TO_LONGS(ABS_CNT); i++) {
++		if (dev->absbit[i] != 0) {
++			memcpy(info->axisInfo, dev->absinfo, sizeof(struct input_absinfo) * ABS_CNT);
++			break;
++		}
++	}
++	info->bustype = dev->id.bustype;
++	info->vendor = dev->id.vendor;
++	info->product = dev->id.product;
++	info->version = dev->id.version;
++	SendInfoToHdf(info);
++	kfree(info);
++	info = NULL;
++}
++#endif
++
+ /*
+  * Register the input device; print a message.
+  * Configure the input layer interface
+@@ -1952,6 +2000,9 @@
+ 			continue;
+ 		}
+ 
++#if defined(CONFIG_DRIVERS_HDF_INPUT)
++		transfer_info(hidinput->input);
++#endif
+ 		if (input_register_device(hidinput->input))
+ 			goto out_unwind;
+ 		hidinput->registered = true;
+diff -Naur a/drivers/hid/Makefile b/drivers/hid/Makefile
+--- a/drivers/hid/Makefile	2022-04-15 21:05:13.889124134 +0800
++++ b/drivers/hid/Makefile	2022-04-20 19:17:58.761084044 +0800
+@@ -2,6 +2,19 @@
+ #
+ # Makefile for the HID driver
+ #
++HDF_ROOT_DIR = -I$(srctree)/drivers/hdf
++ccflags-$(CONFIG_DRIVERS_HDF_INPUT) += $(HDF_ROOT_DIR)/framework/model/input/driver \
++             $(HDF_ROOT_DIR)/framework/include/core \
++             $(HDF_ROOT_DIR)/framework/core/common/include/host \
++             $(HDF_ROOT_DIR)/framework/include/utils \
++             $(HDF_ROOT_DIR)/framework/include/osal \
++             $(HDF_ROOT_DIR)/framework/ability/sbuf/include \
++             $(HDF_ROOT_DIR)/inner_api/utils \
++             $(HDF_ROOT_DIR)/inner_api/osal/shared \
++             $(HDF_ROOT_DIR)/inner_api/host/shared \
++             $(HDF_ROOT_DIR)/inner_api/core \
++             $(HDF_ROOT_DIR)/khdf/osal/include \
++             $(HDF_ROOT_DIR)/evdev
+ hid-y			:= hid-core.o hid-input.o hid-quirks.o
+ hid-$(CONFIG_DEBUG_FS)		+= hid-debug.o
+ 
+diff -Naur a/drivers/input/mousedev.c b/drivers/input/mousedev.c
+--- a/drivers/input/mousedev.c	2022-04-15 21:05:14.105126510 +0800
++++ b/drivers/input/mousedev.c	2022-04-20 19:17:58.761084044 +0800
+@@ -869,7 +869,7 @@
+ 
+ 	if (mixdev) {
+ 		dev_set_name(&mousedev->dev, "mice");
+-
++		mousedev->open = 1;
+ 		mousedev->open_device = mixdev_open_devices;
+ 		mousedev->close_device = mixdev_close_devices;
+ 	} else {
+diff -Naur a/drivers/Kconfig b/drivers/Kconfig
+--- a/drivers/Kconfig	2022-04-18 15:08:13.419423461 +0800
++++ b/drivers/Kconfig	2022-04-20 19:17:58.761084044 +0800
+@@ -238,6 +238,8 @@
+ 
+ source "drivers/counter/Kconfig"
+ 
++source "drivers/hdf/khdf/Kconfig"
++
+ source "drivers/most/Kconfig"
+ 
+ source "drivers/accesstokenid/Kconfig"
+diff -Naur a/drivers/Makefile b/drivers/Makefile
+--- a/drivers/Makefile	2022-04-18 15:08:13.419423461 +0800
++++ b/drivers/Makefile	2022-04-20 19:17:58.761084044 +0800
+@@ -192,5 +192,6 @@
+ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
+ obj-$(CONFIG_ARCH_MESON)	+= amlogic/
+ obj-$(CONFIG_COUNTER)		+= counter/
++obj-$(CONFIG_DRIVERS_HDF)	+= hdf/
+ obj-$(CONFIG_MOST)		+= most/
+ obj-$(CONFIG_ACCESS_TOKENID)	+= accesstokenid/
+diff -Naur a/include/linux/hid.h b/include/linux/hid.h
+--- a/include/linux/hid.h	2022-04-15 21:05:16.257150172 +0800
++++ b/include/linux/hid.h	2022-04-20 19:17:58.765084096 +0800
+@@ -622,6 +622,7 @@
+ 	struct list_head debug_list;
+ 	spinlock_t  debug_list_lock;
+ 	wait_queue_head_t debug_wait;
++	void *input_dev;
+ };
+ 
+ #define to_hid_device(pdev) \
