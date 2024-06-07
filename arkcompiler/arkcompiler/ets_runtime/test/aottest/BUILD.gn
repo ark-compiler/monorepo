@@ -1,0 +1,260 @@
+# Copyright (c) 2021 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+group("ark_aot_js_test") {
+  testonly = true
+  test_list = [
+    "asyncfunctionenter",
+    "bigint_typed_array_constructors",
+    "call_default_args",
+    "constructor_returns_non_object",
+    "tryldglobalbyname",
+    "dynamicimport",
+    "emptyif",
+    "formatrangetoparts",
+
+    "module",
+    "undefined",
+    "cjs",
+  ]
+
+  deps = []
+  foreach(test, test_list) {
+    deps += [
+      "${test}:${test}AotAction",
+      "${test}:${test}AotContextAction",
+    ]
+  }
+}
+
+group("ark_aot_ts_test") {
+  testonly = true
+  test_list = [
+    "add",
+    "and",
+    "ashr",
+    "asyncgenerator",
+    "asyncgeneratormultiloop",
+    "asyncgeneratorrest",
+    "async_context",
+    "async_env",
+    "await",
+    "await_loop",
+    "bind",
+    "builtinmath",
+    "call_same_bytecode_func",
+    "callithisrange",
+    "calls",
+    "classstatic",
+    "class_method_signature",
+    "closeiterator",
+    "compiler_test",
+    "continue_from_finally",
+    "copyrestargs",
+    "createarrayimm16",
+    "createarraywithbuffer",
+    "createemptyarray",
+    "createemptyobject",
+    "creategeneratorobj",
+    "createiterresultobj",
+    "createobjecthavingmethod",
+    "createobjectwithbuffer",
+    "createregexpwithliteral",
+    "dec",
+    "defineasyncfunc",
+    "defineclasswithbuffer",
+    "defineclass",
+    "definefunc",
+    "definefunc_variable_args",
+    "definegeneratorfunc",
+    "definegettersetterbyvalue",
+    "definemethod",
+    "definencfunc",
+    "delobjprop",
+    "deopt",
+    "deopt_clear_aotflags",
+    "destructuring",
+    "div",
+    "duplicatefunctions",
+    "duplicatekey",
+    "elements_kind",
+    "exception_case1",
+    "exception_case10",
+    "exception_case11",
+    "exception_case12",
+    "exception_case13",
+    "exception_case2",
+    "exception_case3",
+    "exception_case4",
+    "exception_case5",
+    "exception_case6",
+    "exception_case7",
+    "exception_case8",
+    "exception_case9",
+    "exp",
+    "fast_call_builtins",
+    "forloop",
+    "framestatesasync",
+    "framestatesphi",
+    "generatormerge",
+    "generatorcontinuefinally",
+    "getiterator",
+    "getiteratornext",
+    "getnextpropname",
+    "getpropiterator",
+    "getresumemode",
+    "gettemplateobject",
+    "getunmappedargs",
+    "global_this_ts",
+    "helloaot",
+    "helloconcurrent",
+    "ic",
+    "inc",
+    "inline",
+    "instanceof",
+    "isfalse",
+    "isin",
+    "isomorphism",
+    "istrue",
+    "jsonstringify",
+    "large_func",
+    "large_func_acc",
+    "ldbigint",
+    "ldconst",
+    "ldfunctionpref",
+    "ldglobalvar",
+    "ldobjbyname",
+    "ldobjbyvalue",
+    "ldstlexvar",
+    "ldsuperbyname",
+    "logic_op",
+    "loop_peeling",
+    "loop_phi",
+    "loop_with_variable_exchange",
+    "loops",
+    "map",
+    "mod",
+    "modules",
+    "mul",
+    "multi_module_compilation",
+    "neg",
+    "new",
+    "newlexenv",
+    "newobjrange",
+    "newobjspread",
+    "not",
+    "numberspeculativeretype",
+    "optimization",
+    "optimized_call",
+    "or",
+    "pgo_call",
+    "poplexenv",
+    "proxy",
+    "resumegenerator",
+    "rodata",
+    "setobjectwithproto",
+    "set",
+    "shl",
+    "shr",
+    "specialloops",
+    "starrayspread",
+    "statesplit",
+    "stclasstoglobalrecord",
+    "stconsttoglobalrecord",
+    "stglobalvar",
+    "stlettoglobalrecord",
+    "stobjbyindex",
+    "stobjbyname",
+    "stobjbyvalue",
+    "stownbyindex",
+    "stownbyname",
+    "stownbynamewithnameset",
+    "stownbyvalue",
+    "stownbyvaluewithnameset",
+    "strictequal",
+    "strictnotequal",
+    "stsuperbyname",
+    "sub",
+    "supercall",
+    "supercallspread",
+    "suspendgenerator",
+    "suspendgeneratorbranch",
+
+    "suspendgeneratorfor",
+    "suspendgeneratorphi",
+    "suspendgeneratorreturn",
+    "suspendgeneratorthrow",
+    "throw",
+    "throwifsupernotcorrectcall",
+    "throwundefindeifhole",
+    "tonumber",
+    "tonumeric",
+    "try",
+    "try_catch_finally",
+    "trystglobalbynameprefid32",
+    "ts_inline",
+    "ts_inline_accessor",
+    "ts_inline_accessor_deopt",
+    "ts_inline_accessor_extends",
+    "ts_inline_accessor_same_name",
+    "ts_inline_change_target",
+    "ts_inline_deopt",
+    "ts_inline_deopt_loop",
+    "ts_inline_extends",
+    "ts_inline_loop",
+    "ts_inline_max_call",
+    "ts_multi_inline",
+    "ts_multi_inline_deopt",
+    "ts_multi_inline_max_call",
+    "ts_multi_inline_recursive",
+    "typedarray",
+    "typedarray_load_store",
+    "typeof",
+    "xor",
+  ]
+
+  deps = []
+  foreach(test, test_list) {
+    deps += [
+      "${test}:${test}AotAction",
+      "${test}:${test}AotContextAction",
+    ]
+  }
+
+  if (is_debug) {
+    debug_test_list = [
+      # builtins_stub test only print log in debug mode
+      "builtins_array",
+      "builtins_stub",
+    ]
+    foreach(test, debug_test_list) {
+      deps += [
+        "${test}:${test}AotAction",
+        "${test}:${test}AotContextAction",
+      ]
+    }
+  }
+}
+
+group("ark_aot_test") {
+  testonly = true
+  deps = [
+    ":ark_aot_js_test",
+    ":ark_aot_ts_test",
+    "analyze_property:analyze_property_test",
+    "aot_compatibility_test:aot_compatibility_test",
+    "aot_multi_constantpool_test:aot_multi_constantpool_test",
+    "aot_type_test:aot_type_test",
+    "vtable:vtable_test",
+  ]
+}
