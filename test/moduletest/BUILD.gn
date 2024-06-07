@@ -1,0 +1,342 @@
+# Copyright (c) 2021 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+group("ark_js_moduletest") {
+  testonly = true
+
+  test_list = [
+    "allocatearraybuffer",
+    "array",
+    "arrayfindlast",
+    "arrayforeach",
+    "arrayjoin",
+    "arraytoreversed",
+    "arraytospliced",
+    "arraywith",
+    "arrayprotochange",
+    "assignproxy",
+    "async",
+    "asyncgenerator",
+    "bigint",
+    "bindfunction",
+    "bitwiseop",
+    "builtins",
+    "callframe",
+    "calltype",
+    "class",
+    "compareobjecthclass",
+    "concurrent",
+    "container",
+    "createarray",
+    "dataproperty",
+    "datecase",
+    "datecompare",
+    "dateparse",
+    "decodeuricomponent",
+    "dynamicimport",
+    "dyninstruction",
+    "ecmastringtable",
+    "equal",
+    "errorhelper",
+    "errorcause",
+    "flatten",
+    "forawaitof",
+    "forin",
+    "fortest",
+    "functionapply",
+    "generator",
+    "getpropertybyindex",
+    "getunmappedargs",
+    "global",
+    "globalaccessor",
+    "globalrecord",
+    "globalthis",
+
+    # "helloworld",
+    "instanceofic",
+    "intl",
+    "jsonparser",
+    "jsonstringifier",
+    "ldmodulensbyic",
+    "lexicalenv",
+    "linkedhashtable",
+    "loadicbyname",
+    "loadicbyvalue",
+    "localelowercase",
+    "memleakobjectcreate",
+    "merge",
+    "module",
+    "moduleImportJson",
+    "moduleUseCjs",
+    "multiargs",
+    "multiprotoic",
+    "negintmin",
+    "newobjdynrange",
+    "objectcloneproperties",
+    "objoperate",
+    "objseal",
+    "promise",
+    "protobuf",
+    "proxy",
+    "regexpcallthrow",
+    "require",
+    "setobjectwithproto",
+    "spreadoperator",
+    "stackoverflow",
+    "storeicbyname",
+    "string",
+    "stubbuilder",
+    "throwdyn",
+    "trycatch",
+    "typearray",
+    "typedarrayat",
+    "typedarrayfindlast",
+    "typedarraytosorted",
+    "typedarraywith",
+    "watch",
+    "weakcollectionswithsymbol",
+    "wrapperclassfunc",
+    "yieldstar",
+    "esmnestedimportcjs",
+    "regexp",
+    "deregistermodule",
+  ]
+
+  deps = []
+  foreach(test, test_list) {
+    deps += [
+      "${test}:${test}Action",
+      "${test}:${test}ContextAction",
+    ]
+  }
+
+  if (!is_debug) {
+    release_test_list = [
+      "hugearray",
+      "multiconstpoolarray",
+      "multiconstpoolclass",
+      "multiconstpoolconstructor",
+      "multiconstpoolfunc",
+      "multiconstpoolobj",
+    ]
+
+    foreach(test, release_test_list) {
+      deps += [
+        "${test}:${test}Action",
+        "${test}:${test}ContextAction",
+      ]
+    }
+  }
+}
+
+group("ark_asm_test") {
+  testonly = true
+
+  test_list = [
+    "allocatearraybuffer",
+    "array",
+    "arrayfindlast",
+    "arrayforeach",
+    "arrayjoin",
+    "arrayprotochange",
+    "asmstackoverflow",
+    "assignproxy",
+    "async",
+    "bigint",
+    "bindfunction",
+    "bitwiseop",
+    "builtins",
+    "callframe",
+    "calltype",
+    "class",
+    "compareobjecthclass",
+    "concurrent",
+    "container",
+    "dataproperty",
+    "dateparse",
+    "decodeuricomponent",
+    "dynamicimport",
+    "dyninstruction",
+    "ecmastringtable",
+    "equal",
+    "errorcause",
+    "flatten",
+    "forin",
+    "fortest",
+    "functionapply",
+    "generator",
+    "getunmappedargs",
+    "global",
+    "globalaccessor",
+    "globalrecord",
+    "globalthis",
+
+    # "helloworld",
+    "instanceofic",
+    "intl",
+    "jsonparser",
+    "jsonstringifier",
+    "ldmodulensbyic",
+    "lexicalenv",
+    "linkedhashtable",
+    "loadicbyvalue",
+    "module",
+    "multiargs",
+    "multiprotoic",
+    "negintmin",
+    "newobjdynrange",
+    "objectcloneproperties",
+    "objoperate",
+    "objseal",
+    "promise",
+    "proxy",
+    "regexpcallthrow",
+    "setobjectwithproto",
+    "spreadoperator",
+    "stackoverflow",
+    "stubbuilder",
+    "throwdyn",
+    "trycatch",
+    "typedarrayat",
+    "typedarrayfindlast",
+    "typedarraytosorted",
+    "typedarraywith",
+    "watch",
+    "weakcollectionswithsymbol",
+    "wrapperclassfunc",
+    "yieldstar",
+    "regexp",
+    "deregistermodule",
+  ]
+
+  deps = []
+  foreach(test, test_list) {
+    deps += [
+      "${test}:${test}AsmAction",
+      "${test}:${test}AsmContextAction",
+    ]
+  }
+
+  if (!is_debug) {
+    release_test_list = [
+      "hugearray",
+      "multiconstpoolarray",
+      "multiconstpoolclass",
+      "multiconstpoolconstructor",
+      "multiconstpoolfunc",
+      "multiconstpoolobj",
+    ]
+
+    foreach(test, release_test_list) {
+      deps += [
+        "${test}:${test}AsmAction",
+        "${test}:${test}AsmContextAction",
+      ]
+    }
+  }
+}
+
+group("ark_asm_single_step_test") {
+  testonly = true
+
+  test_list = [
+    "allocatearraybuffer",
+    "arrayfindlast",
+    "arrayforeach",
+    "arrayjoin",
+    "arrayprotochange",
+    "asmstackoverflow",
+    "assignproxy",
+    "async",
+    "bigint",
+    "bindfunction",
+    "bitwiseop",
+    "callframe",
+    "calltype",
+    "class",
+    "compareobjecthclass",
+    "concurrent",
+    "container",
+    "dataproperty",
+    "dynamicimport",
+    "dyninstruction",
+    "ecmastringtable",
+    "errorcause",
+    "forin",
+    "fortest",
+    "functionapply",
+    "generator",
+    "getunmappedargs",
+    "global",
+    "globalaccessor",
+    "globalrecord",
+    "globalthis",
+
+    # "helloworld",
+    "instanceofic",
+    "jsonparser",
+    "jsonstringifier",
+    "ldmodulensbyic",
+    "lexicalenv",
+    "loadicbyvalue",
+    "module",
+    "multiargs",
+    "multiprotoic",
+    "negintmin",
+    "newobjdynrange",
+    "objectcloneproperties",
+    "objoperate",
+    "objseal",
+    "promise",
+    "proxy",
+    "regexpcallthrow",
+    "setobjectwithproto",
+    "spreadoperator",
+    "stackoverflow",
+    "stubbuilder",
+    "throwdyn",
+    "trycatch",
+    "typedarrayat",
+    "typedarrayfindlast",
+    "typedarraytosorted",
+    "typedarraywith",
+    "watch",
+    "weakcollectionswithsymbol",
+    "yieldstar",
+  ]
+
+  deps = []
+  foreach(test, test_list) {
+    deps += [
+      "${test}:${test}AsmSingleStepAction",
+      "${test}:${test}AsmSingleStepContextAction",
+    ]
+  }
+
+  if (!is_debug) {
+    release_test_list = [
+      "multiconstpoolarray",
+      "multiconstpoolclass",
+      "multiconstpoolconstructor",
+      "multiconstpoolfunc",
+      "multiconstpoolobj",
+    ]
+
+    foreach(test, release_test_list) {
+      deps += [
+        "${test}:${test}AsmSingleStepAction",
+        "${test}:${test}AsmSingleStepContextAction",
+      ]
+    }
+  }
+}
