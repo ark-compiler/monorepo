@@ -1,0 +1,90 @@
+{
+    "name": "@ohos/libxml2",
+    "description": "Libxml2 is the XML C parser and toolkit developed for the Gnome project (but usable outside of the Gnome platform), it is free software available under the MIT License",
+    "version": "4.1",
+    "license": "MIT",
+    "publishAs": "code-segment",
+    "segment": {
+        "destPath": "third_party/libxml2"
+    },
+    "dirs": {},
+    "scripts": {},
+    "licensePath": "Copyright",
+    "readmePath": {
+        "en": "README.md"
+    },
+    "component": {
+        "name": "libxml2",
+        "subsystem": "thirdparty",
+        "syscap": [],
+        "features": [],
+        "adapted_system_type": [ "mini", "small", "standard" ],
+        "rom": "",
+        "ram": "",
+        "deps": {
+            "components": [],
+            "third_party": []
+        },
+        "build": {
+            "sub_component": [ "//third_party/libxml2:libxml2" ],
+            "inner_kits": [
+                {
+                    "name": "//third_party/libxml2:libxml2",
+                    "header": {
+                        "header_files": [
+                            "libxml/c14n.h",
+                            "libxml/catalog.h",
+                            "libxml/chvalid.h",
+                            "libxml/debugXML.h",
+                            "libxml/dict.h",
+                            "libxml/DOCBparser.h",
+                            "libxml/encoding.h",
+                            "libxml/entities.h",
+                            "libxml/globals.h",
+                            "libxml/hash.h",
+                            "libxml/HTMLparser.h",
+                            "libxml/HTMLtree.h",
+                            "libxml/list.h",
+                            "libxml/nanoftp.h",
+                            "libxml/nanohttp.h",
+                            "libxml/parser.h",
+                            "libxml/parserInternals.h",
+                            "libxml/pattern.h",
+                            "libxml/relaxng.h",
+                            "libxml/SAX.h",
+                            "libxml/SAX2.h",
+                            "libxml/schemasInternals.h",
+                            "libxml/schematron.h",
+                            "libxml/threads.h",
+                            "libxml/tree.h",
+                            "libxml/uri.h",
+                            "libxml/valid.h",
+                            "libxml/xinclude.h",
+                            "libxml/xlink.h",
+                            "libxml/xmlautomata.h",
+                            "libxml/xmlerror.h",
+                            "libxml/xmlexports.h",
+                            "libxml/xmlIO.h",
+                            "libxml/xmlmemory.h",
+                            "libxml/xmlmodule.h",
+                            "libxml/xmlreader.h",
+                            "libxml/xmlregexp.h",
+                            "libxml/xmlsave.h",
+                            "libxml/xmlschemas.h",
+                            "libxml/xmlschemastypes.h",
+                            "libxml/xmlstring.h",
+                            "libxml/xmlunicode.h",
+                            "libxml/xmlversion.h",
+                            "libxml/xmlwriter.h",
+                            "libxml/xpath.h",
+                            "libxml/xpathInternals.h",
+                            "libxml/xpointer.h"
+                        ],
+                        "header_base": "${root_gen_dir}/third_party/libxml2/libxml2-2.9.14/include"
+                    }
+                }
+            ],
+            "test": []
+        }
+    }
+}

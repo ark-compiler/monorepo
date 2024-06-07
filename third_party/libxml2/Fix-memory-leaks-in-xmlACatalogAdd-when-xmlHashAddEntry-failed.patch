@@ -1,0 +1,25 @@
+From 43555b3ff9c28a44aa27f447475b9f9cfccbe702 Mon Sep 17 00:00:00 2001
+From: xiezhipeng <xiezhipeng1@huawei.com>
+Date: Fri, 24 Jun 2022 09:39:54 +0800
+Subject: [PATCH] fix memory leaks in xmlACatalogAdd
+
+---
+ catalog.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/catalog.c b/catalog.c
+index effbb2e..866e753 100644
+--- a/catalog.c
++++ b/catalog.c
+@@ -2981,6 +2981,8 @@ xmlACatalogAdd(xmlCatalogPtr catal, const xmlChar * type,
+ 	    if (catal->sgml == NULL)
+ 		catal->sgml = xmlHashCreate(10);
+             res = xmlHashAddEntry(catal->sgml, orig, entry);
++            if (res)
++                xmlFreeCatalogEntry(entry, NULL);
+         }
+     }
+     return (res);
+-- 
+1.8.3.1
+

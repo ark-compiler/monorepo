@@ -1,0 +1,28 @@
+From 9736e895d02e889b25c7e8a73afe3f7bf61dca27 Mon Sep 17 00:00:00 2001
+From: xiezhipeng <xiezhipeng1@huawei.com>
+Date: Thu, 16 Jun 2022 19:13:10 +0800
+Subject: [PATCH] Fix memory leaks for xmlACatalogAdd
+
+---
+ xmlcatalog.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/xmlcatalog.c b/xmlcatalog.c
+index 3f0e1b9..6fdbff9 100644
+--- a/xmlcatalog.c
++++ b/xmlcatalog.c
+@@ -527,6 +527,11 @@ int main(int argc, char **argv) {
+ 		    xmlACatalogDump(catal, stdout);
+ 		}
+ 		i += 2;
++		/* Check for memory leaks */
++		if (catal != NULL)
++		    xmlFreeCatalog(catal);
++		if (super != NULL)
++		    xmlFreeCatalog(super);
+ 	    } else {
+ 		if ((!strcmp(argv[i], "-add")) ||
+ 		    (!strcmp(argv[i], "--add"))) {
+-- 
+1.8.3.1
+

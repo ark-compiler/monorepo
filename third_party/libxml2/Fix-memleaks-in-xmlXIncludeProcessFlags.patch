@@ -1,0 +1,41 @@
+From b01853fb42257136461d1b45e45ecaa3f3ecd570 Mon Sep 17 00:00:00 2001
+From: panxiaohe <panxiaohe@huawei.com>
+Date: Tue, 9 Nov 2021 14:27:24 +0800
+Subject: [PATCH] Fix memleaks in xmlXIncludeProcessFlags
+
+---
+ tree.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/tree.c b/tree.c
+index 17e59d7..64799fb 100644
+--- a/tree.c
++++ b/tree.c
+@@ -3720,11 +3720,19 @@ xmlFreeNodeList(xmlNodePtr cur) {
+ 	     * Otherwise the node name might come from the document's
+ 	     * dictionary
+ 	     */
+-	    if ((cur->name != NULL) &&
+-		(cur->type != XML_TEXT_NODE) &&
+-		(cur->type != XML_COMMENT_NODE))
+-		DICT_FREE(cur->name)
+-	    xmlFree(cur);
++	    if ((cur->type == XML_DOCUMENT_NODE) ||
++#ifdef LIBXML_DOCB_ENABLED
++		(cur->type == XML_DOCB_DOCUMENT_NODE) ||
++#endif
++		(cur->type == XML_HTML_DOCUMENT_NODE)) {
++		xmlFreeDoc((xmlDocPtr) cur);
++	    } else {
++		if ((cur->name != NULL) &&
++		    (cur->type != XML_TEXT_NODE) &&
++		    (cur->type != XML_COMMENT_NODE))
++			DICT_FREE(cur->name)
++		xmlFree(cur);
++	    }
+ 	}
+ 
+         if (next != NULL) {
+-- 
+1.8.3.1
+

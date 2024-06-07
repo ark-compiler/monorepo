@@ -1,0 +1,18 @@
+diff --git a/xml2-config.in b/xml2-config.in
+index 5863ffa..47f205e 100644
+--- a/xml2-config.in
++++ b/xml2-config.in
+@@ -3,7 +3,12 @@
+ prefix=@prefix@
+ exec_prefix=@exec_prefix@
+ includedir=@includedir@
+-libdir=@libdir@
++if [ "`ldd /bin/sh | grep lib64`" = "" ]
++then
++    libdir=${exec_prefix}/lib
++else
++    libdir=${exec_prefix}/lib64
++fi
+ cflags=
+ libs=
+ 
