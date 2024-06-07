@@ -1,0 +1,42 @@
+From 1a2d8ddc066143d256fdb8cc554707fe141dd2f6 Mon Sep 17 00:00:00 2001
+From: Nick Wellnhofer <wellnhofer@aevum.de>
+Date: Tue, 11 Oct 2022 13:02:47 +0200
+Subject: [PATCH] parser: Fix potential memory leak in xmlParseAttValueInternal
+
+Fix memory leak in case xmlParseAttValueInternal is called with a NULL
+`len` a non-NULL `alloc` argument. This static function is never called
+with such arguments internally, but the misleading code should be fixed
+nevertheless.
+
+Fixes #422.
+
+Reference:https://github.com/GNOME/libxml2/commit/1a2d8ddc066143d256fdb8cc554707fe141dd2f6
+Conflict:NA
+
+---
+ parser.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/parser.c b/parser.c
+index 7bb47366..337e62f6 100644
+--- a/parser.c
++++ b/parser.c
+@@ -9155,6 +9155,7 @@ xmlParseAttValueInternal(xmlParserCtxtPtr ctxt, int *len, int *alloc,
+     in++;
+     col++;
+     if (len != NULL) {
++        if (alloc) *alloc = 0;
+         *len = last - start;
+         ret = (xmlChar *) start;
+     } else {
+@@ -9164,7 +9165,6 @@ xmlParseAttValueInternal(xmlParserCtxtPtr ctxt, int *len, int *alloc,
+     CUR_PTR = in;
+     ctxt->input->line = line;
+     ctxt->input->col = col;
+-    if (alloc) *alloc = 0;
+     return ret;
+ need_complex:
+     if (alloc) *alloc = 1;
+-- 
+2.27.0
+
