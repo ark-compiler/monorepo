@@ -1,0 +1,10 @@
+[
+  {
+    "Name": "mingw-w64",
+    "License": "Zope Public License V2.1",
+    "License File": "COPYING",
+    "Version Number": "7.0.0",
+    "Upstream URL": "http://mingw-w64.org/",
+    "Description": "Mingw-w64 is an advancement of the original mingw.org project, created to support the GCC compiler on Windows systems. It has forked it in 2007 in order to provide support for 64 bits and new APIs. It has since then gained widespread use and distribution."
+  }
+]
