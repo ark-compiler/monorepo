@@ -1,0 +1,683 @@
+commit a83314e5eba1184044ee4c91487f565253b57d00
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Thu Jun 16 17:21:50 2022 +0800
+
+    linux_drivers_irqchip
+    
+    Change-Id: Ifda62249085840709db5f0ee48a23adb25c025e9
+
+diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index dc062e8c2..7e727cb18 100644
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -457,7 +457,7 @@ config CSKY_APB_INTC
+ 	  the controller's register.
+ 
+ config IMX_IRQSTEER
+-	bool "i.MX IRQSTEER support"
++	tristate "i.MX IRQSTEER support"
+ 	depends on ARCH_MXC || COMPILE_TEST
+ 	default ARCH_MXC
+ 	select IRQ_DOMAIN
+diff --git a/drivers/irqchip/irq-gic-common.c b/drivers/irqchip/irq-gic-common.c
+index f47b41dfd..fb53e63ce 100644
+--- a/drivers/irqchip/irq-gic-common.c
++++ b/drivers/irqchip/irq-gic-common.c
+@@ -115,6 +115,14 @@ void gic_dist_config(void __iomem *base, int gic_irqs,
+ 	for (i = 32; i < gic_irqs; i += 4)
+ 		writel_relaxed(GICD_INT_DEF_PRI_X4, base + GIC_DIST_PRI + i);
+ 
++#ifndef CONFIG_GIC_GENTLE_CONFIG
++	/*
++	 * eCockpit: do not deactivate all SPIs as this would erase the other
++	 * cluster's GIC configuration.
++	 * This is now done in function gic_set_type() (called by request_irq)
++	 * which allows to limit this to the interrupts registered by the
++	 * cluster.
++	 */
+ 	/*
+ 	 * Deactivate and disable all SPIs. Leave the PPI and SGIs
+ 	 * alone as they are in the redistributor registers on GICv3.
+@@ -125,6 +133,7 @@ void gic_dist_config(void __iomem *base, int gic_irqs,
+ 		writel_relaxed(GICD_INT_EN_CLR_X32,
+ 			       base + GIC_DIST_ENABLE_CLEAR + i / 8);
+ 	}
++#endif
+ 
+ 	if (sync_access)
+ 		sync_access();
+diff --git a/drivers/irqchip/irq-gic-v3.c b/drivers/irqchip/irq-gic-v3.c
+index 1bdb7acf4..66b887832 100644
+--- a/drivers/irqchip/irq-gic-v3.c
++++ b/drivers/irqchip/irq-gic-v3.c
+@@ -145,6 +145,10 @@ enum gic_intid_range {
+ 	__INVALID_RANGE__
+ };
+ 
++#ifdef CONFIG_GIC_GENTLE_CONFIG
++static u64 gic_mpidr_to_affinity(unsigned long mpidr);
++#endif
++
+ static enum gic_intid_range __get_intid_range(irq_hw_number_t hwirq)
+ {
+ 	switch (hwirq) {
+@@ -573,6 +577,9 @@ static int gic_set_type(struct irq_data *d, unsigned int type)
+ 	void __iomem *base;
+ 	u32 offset, index;
+ 	int ret;
++#ifdef CONFIG_GIC_GENTLE_CONFIG
++	u64 affinity;
++#endif
+ 
+ 	range = get_intid_range(d);
+ 
+@@ -593,6 +600,16 @@ static int gic_set_type(struct irq_data *d, unsigned int type)
+ 		rwp_wait = gic_dist_wait_for_rwp;
+ 	}
+ 
++#ifdef CONFIG_GIC_GENTLE_CONFIG
++	/* In a SoC running multiple OSes on ARM clusters sharing the same GIC,
++	 * set the affinity of the SPI here.
++	 * This allows to set the affinity to only the interrupts
++	 * registered by the cluster.
++	 */
++	affinity = gic_mpidr_to_affinity(cpu_logical_map(smp_processor_id()));
++	gic_write_irouter(affinity, base + GICD_IROUTER + irq * 8);
++#endif
++
+ 	offset = convert_offset_index(d, GICD_ICFGR, &index);
+ 
+ 	ret = gic_configure_irq(index, type, base + offset, rwp_wait);
+@@ -770,10 +787,26 @@ static bool gic_has_group0(void)
+ static void __init gic_dist_init(void)
+ {
+ 	unsigned int i;
++#ifndef CONFIG_GIC_GENTLE_CONFIG
+ 	u64 affinity;
++#endif
+ 	void __iomem *base = gic_data.dist_base;
+ 	u32 val;
+ 
++#ifdef CONFIG_GIC_GENTLE_CONFIG
++       /* In a SoC running multiple OSes on ARM clusters sharing the same GIC,
++        * we take care of not re-configuring the distributor
++        * when another OS already did it, else this could interfere
++        * with the on-going interrupts directed to the other OS.
++        */
++       u32 gicd_ctlr = readl_relaxed(base + GICD_CTLR);
++
++       if (gicd_ctlr & (GICD_CTLR_ENABLE_G1A | GICD_CTLR_ENABLE_G1)) {
++               printk(KERN_INFO "GIC Distributor already configured: skip gic_dist_init\n");
++               return;
++       }
++#endif
++
+ 	/* Disable the distributor */
+ 	writel_relaxed(0, base + GICD_CTLR);
+ 	gic_dist_wait_for_rwp();
+@@ -814,6 +847,14 @@ static void __init gic_dist_init(void)
+ 	/* Enable distributor with ARE, Group1 */
+ 	writel_relaxed(val, base + GICD_CTLR);
+ 
++#ifndef CONFIG_GIC_GENTLE_CONFIG
++	/* In a SoC running multiple OSes on ARM clusters sharing the same GIC,
++	 * do not set the affinity to all interrupts as this
++	 * would conflict with the other cluster's GIC configuration.
++	 * This is now done in function gic_set_type() (called by request_irq)
++	 * which allows to limit this to the interrupts registered by the
++	 * cluster.
++	 */
+ 	/*
+ 	 * Set all global interrupts to the boot CPU only. ARE must be
+ 	 * enabled.
+@@ -824,6 +865,7 @@ static void __init gic_dist_init(void)
+ 
+ 	for (i = 0; i < GIC_ESPI_NR; i++)
+ 		gic_write_irouter(affinity, base + GICD_IROUTERnE + i * 8);
++#endif
+ }
+ 
+ static int gic_iterate_rdists(int (*fn)(struct redist_region *, void __iomem *))
+diff --git a/drivers/irqchip/irq-imx-gpcv2.c b/drivers/irqchip/irq-imx-gpcv2.c
+index 7031ef44d..e04dbd549 100644
+--- a/drivers/irqchip/irq-imx-gpcv2.c
++++ b/drivers/irqchip/irq-imx-gpcv2.c
+@@ -3,11 +3,25 @@
+  * Copyright (C) 2015 Freescale Semiconductor, Inc.
+  */
+ 
++#include <linux/arm-smccc.h>
++#include <linux/mfd/syscon/imx6q-iomuxc-gpr.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
++#include <linux/regmap.h>
+ #include <linux/slab.h>
+ #include <linux/irqchip.h>
+ #include <linux/syscore_ops.h>
++#include <linux/smp.h>
++#include <linux/cpuidle.h>
++
++#define FSL_SIP_GPC                     0xC2000000
++#define FSL_SIP_CONFIG_GPC_MASK         0x00
++#define FSL_SIP_CONFIG_GPC_UNMASK       0x01
++#define FSL_SIP_CONFIG_GPC_SET_WAKE     0x02
++#define FSL_SIP_CONFIG_GPC_PM_DOMAIN    0x03
++#define FSL_SIP_CONFIG_GPC_SET_AFF      0x04
++#define FSL_SIP_CONFIG_GPC_CORE_WAKE    0x05
+ 
+ #define IMR_NUM			4
+ #define GPC_MAX_IRQS            (IMR_NUM * 32)
+@@ -17,6 +31,7 @@
+ #define GPC_IMR1_CORE2		0x1c0
+ #define GPC_IMR1_CORE3		0x1d0
+ 
++static unsigned int err11171;
+ 
+ struct gpcv2_irqchip_data {
+ 	struct raw_spinlock	rlock;
+@@ -70,9 +85,48 @@ static struct syscore_ops imx_gpcv2_syscore_ops = {
+ 	.resume		= gpcv2_wakeup_source_restore,
+ };
+ 
++#ifdef CONFIG_SMP
++void imx_gpcv2_raise_softirq(const struct cpumask *mask,
++					  unsigned int irq)
++{
++	struct arm_smccc_res res;
++
++	if (!err11171)
++		return;
++
++	/* now call into EL3 and take care of the wakeup */
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_CORE_WAKE,
++			*cpumask_bits(mask), 0, 0, 0, 0, 0, &res);
++}
++#endif
++
++static void imx_gpcv2_wake_request_fixup(void)
++{
++	struct regmap *iomux_gpr;
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_CORE_WAKE,
++			0, 0, 0, 0, 0, 0, &res);
++
++	if (res.a0) {
++		pr_warn("irq-imx-gpcv2: EL3 does not support FSL_SIP_CONFIG_GPC_CORE_WAKE, disabling cpuidle.\n");
++		err11171 = false;
++		disable_cpuidle();
++		return;
++	}
++
++	iomux_gpr = syscon_regmap_lookup_by_compatible("fsl,imx6q-iomuxc-gpr");
++	if (!IS_ERR(iomux_gpr))
++		regmap_update_bits(iomux_gpr, IOMUXC_GPR1, IMX6Q_GPR1_GINT,
++					IMX6Q_GPR1_GINT);
++}
++
+ static int imx_gpcv2_irq_set_wake(struct irq_data *d, unsigned int on)
+ {
+ 	struct gpcv2_irqchip_data *cd = d->chip_data;
++#ifdef CONFIG_ARM64
++	struct arm_smccc_res res;
++#endif
+ 	unsigned int idx = d->hwirq / 32;
+ 	unsigned long flags;
+ 	u32 mask, val;
+@@ -82,8 +136,29 @@ static int imx_gpcv2_irq_set_wake(struct irq_data *d, unsigned int on)
+ 	val = cd->wakeup_sources[idx];
+ 
+ 	cd->wakeup_sources[idx] = on ? (val & ~mask) : (val | mask);
++
++#ifdef CONFIG_ARM64
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_SET_WAKE,
++			d->hwirq, on, 0, 0, 0, 0, &res);
++#endif
+ 	raw_spin_unlock_irqrestore(&cd->rlock, flags);
+ 
++
++	/*
++	 * Do *not* call into the parent, as the GIC doesn't have any
++	 * wake-up facility...
++	 */
++
++	return 0;
++}
++
++static int imx8mq_gpcv2_irq_set_wake(struct irq_data *d, unsigned int on)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_SET_WAKE,
++		d->hwirq, on, 0, 0, 0, 0, &res);
++
+ 	/*
+ 	 * Do *not* call into the parent, as the GIC doesn't have any
+ 	 * wake-up facility...
+@@ -108,6 +183,16 @@ static void imx_gpcv2_irq_unmask(struct irq_data *d)
+ 	irq_chip_unmask_parent(d);
+ }
+ 
++static void imx8mq_gpcv2_irq_unmask(struct irq_data *d)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_UNMASK,
++		d->hwirq, 0, 0, 0, 0, 0, &res);
++
++	irq_chip_unmask_parent(d);
++}
++
+ static void imx_gpcv2_irq_mask(struct irq_data *d)
+ {
+ 	struct gpcv2_irqchip_data *cd = d->chip_data;
+@@ -124,6 +209,41 @@ static void imx_gpcv2_irq_mask(struct irq_data *d)
+ 	irq_chip_mask_parent(d);
+ }
+ 
++static void imx8mq_gpcv2_irq_mask(struct irq_data *d)
++{
++	struct arm_smccc_res res;
++
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_MASK,
++		d->hwirq, 0, 0, 0, 0, 0, &res);
++
++	irq_chip_mask_parent(d);
++}
++
++int imx8mq_gpcv2_irq_set_affinity(struct irq_data *d, const struct cpumask *cpumask,
++		      bool force)
++{
++	struct arm_smccc_res res;
++	int cpu = cpumask_any_and(cpumask, cpu_online_mask);
++
++	arm_smccc_smc(FSL_SIP_GPC, FSL_SIP_CONFIG_GPC_SET_AFF,
++		d->hwirq, cpu, 0, 0, 0, 0, &res);
++
++	return irq_chip_set_affinity_parent(d, cpumask, force);
++}
++
++static struct irq_chip gpcv2_imx8mq_irqchip_data_chip = {
++	.name			= "GPCv2 i.MX8MQ",
++	.irq_eoi		= irq_chip_eoi_parent,
++	.irq_mask		= imx8mq_gpcv2_irq_mask,
++	.irq_unmask		= imx8mq_gpcv2_irq_unmask,
++	.irq_set_wake		= imx8mq_gpcv2_irq_set_wake,
++	.irq_retrigger		= irq_chip_retrigger_hierarchy,
++	.irq_set_type		= irq_chip_set_type_parent,
++#ifdef CONFIG_SMP
++	.irq_set_affinity	= imx8mq_gpcv2_irq_set_affinity,
++#endif
++};
++
+ static struct irq_chip gpcv2_irqchip_data_chip = {
+ 	.name			= "GPCv2",
+ 	.irq_eoi		= irq_chip_eoi_parent,
+@@ -178,6 +298,7 @@ static int imx_gpcv2_domain_alloc(struct irq_domain *domain,
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
+ 		irq_domain_set_hwirq_and_chip(domain, irq + i, hwirq + i,
++				err11171 ? &gpcv2_imx8mq_irqchip_data_chip :
+ 				&gpcv2_irqchip_data_chip, domain->host_data);
+ 	}
+ 
+@@ -251,34 +372,43 @@ static int __init imx_gpcv2_irqchip_init(struct device_node *node,
+ 	}
+ 	irq_set_default_host(domain);
+ 
+-	/* Initially mask all interrupts */
+-	for (i = 0; i < IMR_NUM; i++) {
+-		void __iomem *reg = cd->gpc_base + i * 4;
+-
+-		switch (core_num) {
+-		case 4:
+-			writel_relaxed(~0, reg + GPC_IMR1_CORE2);
+-			writel_relaxed(~0, reg + GPC_IMR1_CORE3);
+-			fallthrough;
+-		case 2:
+-			writel_relaxed(~0, reg + GPC_IMR1_CORE0);
+-			writel_relaxed(~0, reg + GPC_IMR1_CORE1);
++	if (of_machine_is_compatible("fsl,imx8mq")) {
++		/* sw workaround for IPI can't wakeup CORE
++		ERRATA(ERR011171) on i.MX8MQ */
++		err11171 = true;
++		imx_gpcv2_wake_request_fixup();
++	} else {
++		/* Initially mask all interrupts */
++		for (i = 0; i < IMR_NUM; i++) {
++			void __iomem *reg = cd->gpc_base + i * 4;
++
++			switch (core_num) {
++			case 4:
++				writel_relaxed(~0, reg + GPC_IMR1_CORE2);
++				writel_relaxed(~0, reg + GPC_IMR1_CORE3);
++				fallthrough;
++			case 2:
++				writel_relaxed(~0, reg + GPC_IMR1_CORE0);
++				writel_relaxed(~0, reg + GPC_IMR1_CORE1);
++			}
++			cd->wakeup_sources[i] = ~0;
+ 		}
+-		cd->wakeup_sources[i] = ~0;
+-	}
+ 
+-	/* Let CORE0 as the default CPU to wake up by GPC */
+-	cd->cpu2wakeup = GPC_IMR1_CORE0;
++		/* Let CORE0 as the default CPU to wake up by GPC */
++		cd->cpu2wakeup = GPC_IMR1_CORE0;
+ 
+-	/*
+-	 * Due to hardware design failure, need to make sure GPR
+-	 * interrupt(#32) is unmasked during RUN mode to avoid entering
+-	 * DSM by mistake.
+-	 */
+-	writel_relaxed(~0x1, cd->gpc_base + cd->cpu2wakeup);
++		/*
++		 * Due to hardware design failure, need to make sure GPR
++		 * interrupt(#32) is unmasked during RUN mode to avoid entering
++		 * DSM by mistake.
++		 */
++		writel_relaxed(~0x1, cd->gpc_base + cd->cpu2wakeup);
++	}
+ 
+ 	imx_gpcv2_instance = cd;
+-	register_syscore_ops(&imx_gpcv2_syscore_ops);
++
++	if (!err11171)
++		register_syscore_ops(&imx_gpcv2_syscore_ops);
+ 
+ 	/*
+ 	 * Clear the OF_POPULATED flag set in of_irq_init so that
+diff --git a/drivers/irqchip/irq-imx-irqsteer.c b/drivers/irqchip/irq-imx-irqsteer.c
+index 1edf7692a..0cf9c3c83 100644
+--- a/drivers/irqchip/irq-imx-irqsteer.c
++++ b/drivers/irqchip/irq-imx-irqsteer.c
+@@ -10,9 +10,13 @@
+ #include <linux/irqchip/chained_irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/kernel.h>
++#include <linux/module.h>
+ #include <linux/of_irq.h>
+ #include <linux/of_platform.h>
+ #include <linux/spinlock.h>
++#include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
++#include <linux/reset.h>
+ 
+ #define CTRL_STRIDE_OFF(_t, _r)	(_t * 4 * _r)
+ #define CHANCTRL		0x0
+@@ -25,6 +29,7 @@
+ #define CHAN_MAX_OUTPUT_INT	0x8
+ 
+ struct irqsteer_data {
++	struct irq_chip		chip;
+ 	void __iomem		*regs;
+ 	struct clk		*ipg_clk;
+ 	int			irq[CHAN_MAX_OUTPUT_INT];
+@@ -34,6 +39,11 @@ struct irqsteer_data {
+ 	int			channel;
+ 	struct irq_domain	*domain;
+ 	u32			*saved_reg;
++	bool			inited;
++
++	struct device		*dev;
++	struct device		*pd_csi;
++	struct device		*pd_isi;
+ };
+ 
+ static int imx_irqsteer_get_reg_index(struct irqsteer_data *data,
+@@ -42,6 +52,38 @@ static int imx_irqsteer_get_reg_index(struct irqsteer_data *data,
+ 	return (data->reg_num - irqnum / 32 - 1);
+ }
+ 
++static int imx_irqsteer_attach_pd(struct irqsteer_data *data)
++{
++	struct device *dev = data->dev;
++	struct device_link *link;
++
++	data->pd_csi = dev_pm_domain_attach_by_name(dev, "pd_csi");
++	if (IS_ERR(data->pd_csi ))
++		return PTR_ERR(data->pd_csi);
++	else if (!data->pd_csi)
++		return 0;
++
++	link = device_link_add(dev, data->pd_csi,
++			DL_FLAG_STATELESS |
++			DL_FLAG_PM_RUNTIME);
++	if (IS_ERR(link))
++		return PTR_ERR(link);
++
++	data->pd_isi = dev_pm_domain_attach_by_name(dev, "pd_isi_ch0");
++	if (IS_ERR(data->pd_isi))
++		return PTR_ERR(data->pd_isi);
++	else if (!data->pd_isi)
++		return 0;
++
++	link = device_link_add(dev, data->pd_isi,
++			DL_FLAG_STATELESS |
++			DL_FLAG_PM_RUNTIME);
++	if (IS_ERR(link))
++		return PTR_ERR(link);
++
++	return 0;
++}
++
+ static void imx_irqsteer_irq_unmask(struct irq_data *d)
+ {
+ 	struct irqsteer_data *data = d->chip_data;
+@@ -79,9 +121,11 @@ static struct irq_chip imx_irqsteer_irq_chip = {
+ static int imx_irqsteer_irq_map(struct irq_domain *h, unsigned int irq,
+ 				irq_hw_number_t hwirq)
+ {
++	struct irqsteer_data *irqsteer_data = h->host_data;
++
+ 	irq_set_status_flags(irq, IRQ_LEVEL);
+ 	irq_set_chip_data(irq, h->host_data);
+-	irq_set_chip_and_handler(irq, &imx_irqsteer_irq_chip, handle_level_irq);
++	irq_set_chip_and_handler(irq, &irqsteer_data->chip, handle_level_irq);
+ 
+ 	return 0;
+ }
+@@ -140,6 +184,33 @@ static void imx_irqsteer_irq_handler(struct irq_desc *desc)
+ 	chained_irq_exit(irq_desc_get_chip(desc), desc);
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static int imx_irqsteer_chans_enable(struct irqsteer_data *data)
++{
++	return 0;
++}
++#else
++static int imx_irqsteer_chans_enable(struct irqsteer_data *data)
++{
++	int ret;
++
++	ret = clk_prepare_enable(irqsteer_data->ipg_clk);
++	if (ret) {
++		dev_err(data->dev, "failed to enable ipg clk: %d\n", ret);
++		return ret;
++	}
++
++	/* steer all IRQs into configured channel */
++	writel_relaxed(BIT(data->channel), data->regs + CHANCTRL);
++
++	/* read back CHANCTRL register cannot reflact on HW register
++	 * real value due to the HW action, so add one flag here.
++	 */
++	data->inited = true;
++	return 0;
++}
++#endif
++
+ static int imx_irqsteer_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *np = pdev->dev.of_node;
+@@ -151,6 +222,10 @@ static int imx_irqsteer_probe(struct platform_device *pdev)
+ 	if (!data)
+ 		return -ENOMEM;
+ 
++	data->chip = imx_irqsteer_irq_chip;
++	data->chip.parent_device = &pdev->dev;
++	data->dev = &pdev->dev;
++	data->inited = false;
+ 	data->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(data->regs)) {
+ 		dev_err(&pdev->dev, "failed to initialize reg\n");
+@@ -162,6 +237,14 @@ static int imx_irqsteer_probe(struct platform_device *pdev)
+ 		return dev_err_probe(&pdev->dev, PTR_ERR(data->ipg_clk),
+ 				     "failed to get ipg clk\n");
+ 
++	ret = imx_irqsteer_attach_pd(data);
++	if (ret < 0 && ret == -EPROBE_DEFER)
++		return ret;
++
++	ret = device_reset(&pdev->dev);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++
+ 	raw_spin_lock_init(&data->lock);
+ 
+ 	ret = of_property_read_u32(np, "fsl,num-irqs", &irqs_num);
+@@ -186,14 +269,9 @@ static int imx_irqsteer_probe(struct platform_device *pdev)
+ 			return -ENOMEM;
+ 	}
+ 
+-	ret = clk_prepare_enable(data->ipg_clk);
+-	if (ret) {
+-		dev_err(&pdev->dev, "failed to enable ipg clk: %d\n", ret);
++	ret = imx_irqsteer_chans_enable(data);
++	if (ret)
+ 		return ret;
+-	}
+-
+-	/* steer all IRQs into configured channel */
+-	writel_relaxed(BIT(data->channel), data->regs + CHANCTRL);
+ 
+ 	data->domain = irq_domain_add_linear(np, data->reg_num * 32,
+ 					     &imx_irqsteer_domain_ops, data);
+@@ -222,6 +300,7 @@ static int imx_irqsteer_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, data);
+ 
++	pm_runtime_enable(&pdev->dev);
+ 	return 0;
+ out:
+ 	clk_disable_unprepare(data->ipg_clk);
+@@ -239,12 +318,21 @@ static int imx_irqsteer_remove(struct platform_device *pdev)
+ 
+ 	irq_domain_remove(irqsteer_data->domain);
+ 
+-	clk_disable_unprepare(irqsteer_data->ipg_clk);
+-
+-	return 0;
++	return pm_runtime_force_suspend(&pdev->dev);
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
++static void imx_irqsteer_init(struct irqsteer_data *data)
++{
++	/* steer all IRQs into configured channel */
++	writel_relaxed(BIT(data->channel), data->regs + CHANCTRL);
++
++	/* read back CHANCTRL register cannot reflact on HW register
++	 * real value due to the HW action, so add one flag here.
++	 */
++	data->inited = true;
++}
++
+ static void imx_irqsteer_save_regs(struct irqsteer_data *data)
+ {
+ 	int i;
+@@ -264,7 +352,7 @@ static void imx_irqsteer_restore_regs(struct irqsteer_data *data)
+ 			       data->regs + CHANMASK(i, data->reg_num));
+ }
+ 
+-static int imx_irqsteer_suspend(struct device *dev)
++static int imx_irqsteer_runtime_suspend(struct device *dev)
+ {
+ 	struct irqsteer_data *irqsteer_data = dev_get_drvdata(dev);
+ 
+@@ -274,7 +362,7 @@ static int imx_irqsteer_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
+-static int imx_irqsteer_resume(struct device *dev)
++static int imx_irqsteer_runtime_resume(struct device *dev)
+ {
+ 	struct irqsteer_data *irqsteer_data = dev_get_drvdata(dev);
+ 	int ret;
+@@ -284,20 +372,29 @@ static int imx_irqsteer_resume(struct device *dev)
+ 		dev_err(dev, "failed to enable ipg clk: %d\n", ret);
+ 		return ret;
+ 	}
+-	imx_irqsteer_restore_regs(irqsteer_data);
++
++	/* don't need restore registers when first sub_irq requested */
++	if (!irqsteer_data->inited)
++		imx_irqsteer_init(irqsteer_data);
++	else
++		imx_irqsteer_restore_regs(irqsteer_data);
+ 
+ 	return 0;
+ }
+ #endif
+ 
+ static const struct dev_pm_ops imx_irqsteer_pm_ops = {
+-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(imx_irqsteer_suspend, imx_irqsteer_resume)
++	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				      pm_runtime_force_resume)
++	SET_RUNTIME_PM_OPS(imx_irqsteer_runtime_suspend,
++			   imx_irqsteer_runtime_resume, NULL)
+ };
+ 
+ static const struct of_device_id imx_irqsteer_dt_ids[] = {
+ 	{ .compatible = "fsl,imx-irqsteer", },
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, imx_irqsteer_dt_ids);
+ 
+ static struct platform_driver imx_irqsteer_driver = {
+ 	.driver = {
+@@ -308,4 +405,5 @@ static struct platform_driver imx_irqsteer_driver = {
+ 	.probe = imx_irqsteer_probe,
+ 	.remove = imx_irqsteer_remove,
+ };
+-builtin_platform_driver(imx_irqsteer_driver);
++module_platform_driver(imx_irqsteer_driver);
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/irqchip/irq-ls-extirq.c b/drivers/irqchip/irq-ls-extirq.c
+index 4d1179fed..3c6ed7b47 100644
+--- a/drivers/irqchip/irq-ls-extirq.c
++++ b/drivers/irqchip/irq-ls-extirq.c
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
++// Copyright 2019-2020 NXP
+ 
+ #define pr_fmt(fmt) "irq-ls-extirq: " fmt
+ 
+@@ -64,7 +65,7 @@ static struct irq_chip ls_extirq_chip = {
+ 	.irq_set_type		= ls_extirq_set_type,
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+ 	.irq_set_affinity	= irq_chip_set_affinity_parent,
+-	.flags                  = IRQCHIP_SET_TYPE_MASKED,
++	.flags                  = IRQCHIP_SET_TYPE_MASKED | IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
+ static int
+@@ -183,6 +184,9 @@ ls_extirq_of_init(struct device_node *node, struct device_node *parent)
+ 		priv->bit_reverse = (revcr != 0);
+ 	}
+ 
++	if (of_device_is_compatible(node, "fsl,ls1043a-extirq"))
++		priv->bit_reverse = true;
++
+ 	domain = irq_domain_add_hierarchy(parent_domain, 0, priv->nirq, node,
+ 					  &extirq_domain_ops, priv);
+ 	if (!domain)
+@@ -195,3 +199,5 @@ ls_extirq_of_init(struct device_node *node, struct device_node *parent)
+ }
+ 
+ IRQCHIP_DECLARE(ls1021a_extirq, "fsl,ls1021a-extirq", ls_extirq_of_init);
++IRQCHIP_DECLARE(ls1043a_extirq, "fsl,ls1043a-extirq", ls_extirq_of_init);
++IRQCHIP_DECLARE(ls1088a_extirq, "fsl,ls1088a-extirq", ls_extirq_of_init);

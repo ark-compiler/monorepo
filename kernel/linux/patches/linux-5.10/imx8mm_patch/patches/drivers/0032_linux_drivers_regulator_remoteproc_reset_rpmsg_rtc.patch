@@ -1,0 +1,2683 @@
+commit e046a5aceba259e3f2925aa809fc95ce8e22e404
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Thu Jun 16 17:27:15 2022 +0800
+
+    linux_drivers_regulator_remoteproc_reset_rpmsg_rtc
+    
+    Change-Id: I70798f1381ce7dac1b89f11aa3a0c5633845487e
+
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index a6d27334a..2158d88b6 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -3499,6 +3499,16 @@ static int _regulator_do_set_suspend_voltage(struct regulator_dev *rdev,
+ 	return 0;
+ }
+ 
++static bool _regulator_is_bypass(struct regulator_dev *rdev)
++{
++	bool bypassed = false;
++
++	if (rdev->desc->ops->get_bypass)
++		rdev->desc->ops->get_bypass(rdev, &bypassed);
++
++	return bypassed;
++}
++
+ static int regulator_set_voltage_unlocked(struct regulator *regulator,
+ 					  int min_uV, int max_uV,
+ 					  suspend_state_t state)
+@@ -3568,8 +3578,9 @@ int regulator_set_voltage_rdev(struct regulator_dev *rdev, int min_uV,
+ 	if (rdev->supply &&
+ 	    regulator_ops_is_valid(rdev->supply->rdev,
+ 				   REGULATOR_CHANGE_VOLTAGE) &&
+-	    (rdev->desc->min_dropout_uV || !(rdev->desc->ops->get_voltage ||
+-					   rdev->desc->ops->get_voltage_sel))) {
++	    (_regulator_is_bypass(rdev) || rdev->desc->min_dropout_uV ||
++	     !(rdev->desc->ops->get_voltage ||
++	     rdev->desc->ops->get_voltage_sel))) {
+ 		int current_supply_uV;
+ 		int selector;
+ 
+diff --git a/drivers/regulator/fixed.c b/drivers/regulator/fixed.c
+index 3de7709bd..12f0f5102 100644
+--- a/drivers/regulator/fixed.c
++++ b/drivers/regulator/fixed.c
+@@ -27,7 +27,7 @@
+ #include <linux/regulator/of_regulator.h>
+ #include <linux/regulator/machine.h>
+ #include <linux/clk.h>
+-
++#include <linux/pinctrl/consumer.h>
+ 
+ struct fixed_voltage_data {
+ 	struct regulator_desc desc;
+@@ -275,11 +275,32 @@ static const struct of_device_id fixed_of_match[] = {
+ MODULE_DEVICE_TABLE(of, fixed_of_match);
+ #endif
+ 
++#ifdef CONFIG_PM_SLEEP
++static int reg_fixed_voltage_suspend(struct device *dev)
++{
++	pinctrl_pm_select_sleep_state(dev);
++
++	return 0;
++}
++static int reg_fixed_voltage_resume(struct device *dev)
++{
++	pinctrl_pm_select_default_state(dev);
++
++	return 0;
++}
++#endif
++
++static const struct dev_pm_ops reg_fixed_voltage_pm_ops = {
++	SET_LATE_SYSTEM_SLEEP_PM_OPS(reg_fixed_voltage_suspend,
++		reg_fixed_voltage_resume)
++};
++
+ static struct platform_driver regulator_fixed_voltage_driver = {
+ 	.probe		= reg_fixed_voltage_probe,
+ 	.driver		= {
+ 		.name		= "reg-fixed-voltage",
+ 		.of_match_table = of_match_ptr(fixed_of_match),
++		.pm = &reg_fixed_voltage_pm_ops,
+ 	},
+ };
+ 
+diff --git a/drivers/regulator/pca9450-regulator.c b/drivers/regulator/pca9450-regulator.c
+index d38109cc3..d59305a6d 100644
+--- a/drivers/regulator/pca9450-regulator.c
++++ b/drivers/regulator/pca9450-regulator.c
+@@ -251,6 +251,7 @@ static const struct pca9450_regulator_desc pca9450a_regulators[] = {
+ 			.vsel_mask = BUCK1OUT_DVS0_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK1CTRL,
+ 			.enable_mask = BUCK1_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 			.of_parse_cb = pca9450_set_dvs_levels,
+ 		},
+@@ -275,7 +276,8 @@ static const struct pca9450_regulator_desc pca9450a_regulators[] = {
+ 			.vsel_reg = PCA9450_REG_BUCK2OUT_DVS0,
+ 			.vsel_mask = BUCK2OUT_DVS0_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK2CTRL,
+-			.enable_mask = BUCK1_ENMODE_MASK,
++			.enable_mask = BUCK2_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ_STBYREQ,
+ 			.owner = THIS_MODULE,
+ 			.of_parse_cb = pca9450_set_dvs_levels,
+ 		},
+@@ -301,6 +303,7 @@ static const struct pca9450_regulator_desc pca9450a_regulators[] = {
+ 			.vsel_mask = BUCK3OUT_DVS0_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK3CTRL,
+ 			.enable_mask = BUCK3_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 			.of_parse_cb = pca9450_set_dvs_levels,
+ 		},
+@@ -326,6 +329,7 @@ static const struct pca9450_regulator_desc pca9450a_regulators[] = {
+ 			.vsel_mask = BUCK4OUT_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK4CTRL,
+ 			.enable_mask = BUCK4_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 		},
+ 	},
+@@ -344,6 +348,7 @@ static const struct pca9450_regulator_desc pca9450a_regulators[] = {
+ 			.vsel_mask = BUCK5OUT_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK5CTRL,
+ 			.enable_mask = BUCK5_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 		},
+ 	},
+@@ -362,6 +367,7 @@ static const struct pca9450_regulator_desc pca9450a_regulators[] = {
+ 			.vsel_mask = BUCK6OUT_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK6CTRL,
+ 			.enable_mask = BUCK6_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 		},
+ 	},
+@@ -477,6 +483,7 @@ static const struct pca9450_regulator_desc pca9450bc_regulators[] = {
+ 			.vsel_mask = BUCK1OUT_DVS0_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK1CTRL,
+ 			.enable_mask = BUCK1_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 			.of_parse_cb = pca9450_set_dvs_levels,
+ 		},
+@@ -501,7 +508,8 @@ static const struct pca9450_regulator_desc pca9450bc_regulators[] = {
+ 			.vsel_reg = PCA9450_REG_BUCK2OUT_DVS0,
+ 			.vsel_mask = BUCK2OUT_DVS0_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK2CTRL,
+-			.enable_mask = BUCK1_ENMODE_MASK,
++			.enable_mask = BUCK2_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ_STBYREQ,
+ 			.owner = THIS_MODULE,
+ 			.of_parse_cb = pca9450_set_dvs_levels,
+ 		},
+@@ -527,6 +535,7 @@ static const struct pca9450_regulator_desc pca9450bc_regulators[] = {
+ 			.vsel_mask = BUCK4OUT_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK4CTRL,
+ 			.enable_mask = BUCK4_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 		},
+ 	},
+@@ -545,6 +554,7 @@ static const struct pca9450_regulator_desc pca9450bc_regulators[] = {
+ 			.vsel_mask = BUCK5OUT_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK5CTRL,
+ 			.enable_mask = BUCK5_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 		},
+ 	},
+@@ -563,6 +573,7 @@ static const struct pca9450_regulator_desc pca9450bc_regulators[] = {
+ 			.vsel_mask = BUCK6OUT_MASK,
+ 			.enable_reg = PCA9450_REG_BUCK6CTRL,
+ 			.enable_mask = BUCK6_ENMODE_MASK,
++			.enable_val = BUCK_ENMODE_ONREQ,
+ 			.owner = THIS_MODULE,
+ 		},
+ 	},
+diff --git a/drivers/regulator/pfuze100-regulator.c b/drivers/regulator/pfuze100-regulator.c
+index 01a12cfce..7e8022025 100644
+--- a/drivers/regulator/pfuze100-regulator.c
++++ b/drivers/regulator/pfuze100-regulator.c
+@@ -24,6 +24,15 @@
+ #define PFUZE100_STANDBY_OFFSET	1
+ #define PFUZE100_MODE_OFFSET	3
+ #define PFUZE100_CONF_OFFSET	4
++/*
++ * below regs will lost after exit from LPSR mode(PFUZE3000), need to be saved
++ * and restored:
++ * 0x20~0x40: 33
++ * 0x66~0x71: 12
++ * 0x7f: 1
++ * total 46 registers.
++ */
++#define PFUZE100_REG_SAVED_NUM (33 + 12 + 1)
+ 
+ #define PFUZE100_DEVICEID	0x0
+ #define PFUZE100_REVID		0x3
+@@ -73,6 +82,8 @@ struct pfuze_chip {
+ 	int     flags;
+ 	struct regmap *regmap;
+ 	struct device *dev;
++	bool need_restore;
++	unsigned int reg_save_array[PFUZE100_REG_SAVED_NUM];
+ 	struct pfuze_regulator regulator_descs[PFUZE100_MAX_REGULATOR];
+ 	struct regulator_dev *regulators[PFUZE100_MAX_REGULATOR];
+ 	struct pfuze_regulator *pfuze_regulators;
+@@ -861,6 +872,9 @@ static int pfuze100_regulator_probe(struct i2c_client *client,
+ 		}
+ 	}
+ 
++	if (of_get_property(client->dev.of_node, "fsl,lpsr-mode", NULL))
++		pfuze_chip->need_restore = true;
++
+ 	if (of_property_read_bool(client->dev.of_node,
+ 				  "fsl,pmic-stby-poweroff"))
+ 		return pfuze_power_off_prepare_init(pfuze_chip);
+@@ -878,11 +892,90 @@ static int pfuze100_regulator_remove(struct i2c_client *client)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static int pfuze_reg_save_restore(struct pfuze_chip *pfuze_chip, int start,
++				  int end, int index, bool save)
++{
++	int i, ret;
++
++	for (i = 0; i < end - start + 1; i++) {
++		if (save)
++			ret = regmap_read(pfuze_chip->regmap, start + i,
++					&pfuze_chip->reg_save_array[index + i]);
++		else
++			ret = regmap_write(pfuze_chip->regmap, start + i,
++					pfuze_chip->reg_save_array[index + i]);
++
++		if (ret)
++			return ret;
++	}
++
++	return index + i;
++}
++
++static int __maybe_unused pfuze_suspend(struct device *dev)
++{
++	struct pfuze_chip *pfuze_chip = i2c_get_clientdata(to_i2c_client(dev));
++	int index = 0;
++
++	if (pfuze_chip->need_restore) {
++		/* 0x20~0x40 */
++		index = pfuze_reg_save_restore(pfuze_chip, 0x20, 0x40, index, true);
++		if (index < 0)
++			goto err_ret;
++		/* 0x66~0x71 */
++		index = pfuze_reg_save_restore(pfuze_chip, 0x66, 0x71, ++index, true);
++		if (index < 0)
++			goto err_ret;
++		/* 0x7f */
++		index = pfuze_reg_save_restore(pfuze_chip, 0x7f, 0x7f, ++index, true);
++		if (index < 0)
++			goto err_ret;
++	}
++
++	return 0;
++
++err_ret:
++	return index;
++}
++
++static int __maybe_unused pfuze_resume(struct device *dev)
++{
++	struct pfuze_chip *pfuze_chip = i2c_get_clientdata(to_i2c_client(dev));
++	int index = 0;
++
++	if (pfuze_chip->need_restore) {
++		/* 0x20~0x40 */
++		index = pfuze_reg_save_restore(pfuze_chip, 0x20, 0x40, index, false);
++		if (index < 0)
++			goto err_ret;
++		/* 0x66~0x71 */
++		index = pfuze_reg_save_restore(pfuze_chip, 0x66, 0x71, ++index, false);
++		if (index < 0)
++			goto err_ret;
++		/* 0x7f */
++		index = pfuze_reg_save_restore(pfuze_chip, 0x7f, 0x7f, ++index, false);
++		if (index < 0)
++			goto err_ret;
++	}
++
++	return 0;
++
++err_ret:
++	return index;
++}
++#endif
++
++static const struct dev_pm_ops pfuze_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(pfuze_suspend, pfuze_resume)
++};
++
+ static struct i2c_driver pfuze_driver = {
+ 	.id_table = pfuze_device_id,
+ 	.driver = {
+ 		.name = "pfuze100-regulator",
+ 		.of_match_table = pfuze_dt_ids,
++		.pm = &pfuze_pm_ops,
+ 	},
+ 	.probe = pfuze100_regulator_probe,
+ 	.remove = pfuze100_regulator_remove,
+diff --git a/drivers/remoteproc/remoteproc_core.c b/drivers/remoteproc/remoteproc_core.c
+index 47924d5ed..47a00794f 100644
+--- a/drivers/remoteproc/remoteproc_core.c
++++ b/drivers/remoteproc/remoteproc_core.c
+@@ -1685,7 +1685,7 @@ static int rproc_stop(struct rproc *rproc, bool crashed)
+  */
+ int rproc_trigger_recovery(struct rproc *rproc)
+ {
+-	const struct firmware *firmware_p;
++	const struct firmware *firmware_p = NULL;
+ 	struct device *dev = &rproc->dev;
+ 	int ret;
+ 
+@@ -1707,16 +1707,19 @@ int rproc_trigger_recovery(struct rproc *rproc)
+ 	rproc_coredump(rproc);
+ 
+ 	/* load firmware */
+-	ret = request_firmware(&firmware_p, rproc->firmware, dev);
+-	if (ret < 0) {
+-		dev_err(dev, "request_firmware failed: %d\n", ret);
+-		goto unlock_mutex;
++	if (!rproc->skip_fw_recovery) {
++		ret = request_firmware(&firmware_p, rproc->firmware, dev);
++		if (ret < 0) {
++			dev_err(dev, "request_firmware failed: %d\n", ret);
++			goto unlock_mutex;
++		}
+ 	}
+ 
+ 	/* boot the remote processor up again */
+ 	ret = rproc_start(rproc, firmware_p);
+ 
+-	release_firmware(firmware_p);
++	if (!rproc->skip_fw_recovery)
++		release_firmware(firmware_p);
+ 
+ unlock_mutex:
+ 	mutex_unlock(&rproc->lock);
+diff --git a/drivers/remoteproc/remoteproc_elf_loader.c b/drivers/remoteproc/remoteproc_elf_loader.c
+index df68d8775..6cb71fe47 100644
+--- a/drivers/remoteproc/remoteproc_elf_loader.c
++++ b/drivers/remoteproc/remoteproc_elf_loader.c
+@@ -129,6 +129,22 @@ u64 rproc_elf_get_boot_addr(struct rproc *rproc, const struct firmware *fw)
+ }
+ EXPORT_SYMBOL(rproc_elf_get_boot_addr);
+ 
++static void rproc_elf_memcpy(struct rproc *rproc, void *dest, const void *src, size_t count)
++{
++	if (!rproc->ops->elf_memcpy)
++		memcpy(dest, src, count);
++
++	rproc->ops->elf_memcpy(rproc, dest, src, count);
++}
++
++static void rproc_elf_memset(struct rproc *rproc, void *s, int c, size_t count)
++{
++	if (!rproc->ops->elf_memset)
++		memset(s, c, count);
++
++	rproc->ops->elf_memset(rproc, s, c, count);
++}
++
+ /**
+  * rproc_elf_load_segments() - load firmware segments to memory
+  * @rproc: remote processor which will be booted using these fw segments
+@@ -214,7 +230,7 @@ int rproc_elf_load_segments(struct rproc *rproc, const struct firmware *fw)
+ 
+ 		/* put the segment where the remote processor expects it */
+ 		if (filesz)
+-			memcpy(ptr, elf_data + offset, filesz);
++			rproc_elf_memcpy(rproc, ptr, elf_data + offset, filesz);
+ 
+ 		/*
+ 		 * Zero out remaining memory for this segment.
+@@ -224,7 +240,7 @@ int rproc_elf_load_segments(struct rproc *rproc, const struct firmware *fw)
+ 		 * this.
+ 		 */
+ 		if (memsz > filesz)
+-			memset(ptr + filesz, 0, memsz - filesz);
++			rproc_elf_memset(rproc, ptr + filesz, 0, memsz - filesz);
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/reset/Kconfig b/drivers/reset/Kconfig
+index 147543ad3..ade26cd86 100644
+--- a/drivers/reset/Kconfig
++++ b/drivers/reset/Kconfig
+@@ -58,6 +58,15 @@ config RESET_BRCMSTB_RESCAL
+ 	  This enables the RESCAL reset controller for SATA, PCIe0, or PCIe1 on
+ 	  BCM7216.
+ 
++config RESET_DISPMIX
++	tristate "IMX Display Mix reset support"
++	default y
++	select REGMAP_MMIO
++	depends on ARCH_MXC
++	help
++	  This driver provides support for Display Mix reset that is controlled
++	  by dispmix GPR registers.
++
+ config RESET_HSDK
+ 	bool "Synopsys HSDK Reset Driver"
+ 	depends on HAS_IOMEM
+@@ -90,6 +99,14 @@ config RESET_LANTIQ
+ 	help
+ 	  This enables the reset controller driver for Lantiq / Intel XWAY SoCs.
+ 
++config RESET_GPIO
++	tristate "GPIO reset controller support"
++	default y
++	depends on GPIOLIB && OF
++	help
++	  This driver provides support for reset lines that are controlled
++	  directly by GPIOs.
++
+ config RESET_LPC18XX
+ 	bool "LPC18xx/43xx Reset Driver" if COMPILE_TEST
+ 	default ARCH_LPC18XX
+diff --git a/drivers/reset/Makefile b/drivers/reset/Makefile
+index 16947610c..c2c901498 100644
+--- a/drivers/reset/Makefile
++++ b/drivers/reset/Makefile
+@@ -9,10 +9,12 @@ obj-$(CONFIG_RESET_AXS10X) += reset-axs10x.o
+ obj-$(CONFIG_RESET_BERLIN) += reset-berlin.o
+ obj-$(CONFIG_RESET_BRCMSTB) += reset-brcmstb.o
+ obj-$(CONFIG_RESET_BRCMSTB_RESCAL) += reset-brcmstb-rescal.o
++obj-$(CONFIG_RESET_DISPMIX) += reset-dispmix.o
+ obj-$(CONFIG_RESET_HSDK) += reset-hsdk.o
+ obj-$(CONFIG_RESET_IMX7) += reset-imx7.o
+ obj-$(CONFIG_RESET_INTEL_GW) += reset-intel-gw.o
+ obj-$(CONFIG_RESET_LANTIQ) += reset-lantiq.o
++obj-$(CONFIG_RESET_GPIO) += gpio-reset.o
+ obj-$(CONFIG_RESET_LPC18XX) += reset-lpc18xx.o
+ obj-$(CONFIG_RESET_MESON) += reset-meson.o
+ obj-$(CONFIG_RESET_MESON_AUDIO_ARB) += reset-meson-audio-arb.o
+diff --git a/drivers/reset/gpio-reset.c b/drivers/reset/gpio-reset.c
+new file mode 100644
+index 000000000..cfd3fe026
+--- /dev/null
++++ b/drivers/reset/gpio-reset.c
+@@ -0,0 +1,217 @@
++/*
++ * GPIO Reset Controller driver
++ *
++ * Copyright 2013 Philipp Zabel, Pengutronix
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/gpio.h>
++#include <linux/module.h>
++#include <linux/of_gpio.h>
++#include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/reset-controller.h>
++
++struct gpio_reset_data {
++	struct reset_controller_dev rcdev;
++	unsigned int gpio;
++	bool active_low;
++	s32 delay_us;
++	s32 post_delay_ms;
++};
++
++static void gpio_reset_set(struct reset_controller_dev *rcdev, int asserted)
++{
++	struct gpio_reset_data *drvdata = container_of(rcdev,
++			struct gpio_reset_data, rcdev);
++	int value = asserted;
++
++	if (drvdata->active_low)
++		value = !value;
++
++	gpio_set_value_cansleep(drvdata->gpio, value);
++}
++
++static int gpio_reset(struct reset_controller_dev *rcdev, unsigned long id)
++{
++	struct gpio_reset_data *drvdata = container_of(rcdev,
++			struct gpio_reset_data, rcdev);
++
++	if (drvdata->delay_us < 0)
++		return -ENOSYS;
++
++	gpio_reset_set(rcdev, 1);
++	udelay(drvdata->delay_us);
++	gpio_reset_set(rcdev, 0);
++
++	if (drvdata->post_delay_ms < 0)
++		return 0;
++
++	msleep(drvdata->post_delay_ms);
++	return 0;
++}
++
++static int gpio_reset_assert(struct reset_controller_dev *rcdev,
++		unsigned long id)
++{
++	gpio_reset_set(rcdev, 1);
++
++	return 0;
++}
++
++static int gpio_reset_deassert(struct reset_controller_dev *rcdev,
++		unsigned long id)
++{
++	gpio_reset_set(rcdev, 0);
++
++	return 0;
++}
++
++static struct reset_control_ops gpio_reset_ops = {
++	.reset = gpio_reset,
++	.assert = gpio_reset_assert,
++	.deassert = gpio_reset_deassert,
++};
++
++static int of_gpio_reset_xlate(struct reset_controller_dev *rcdev,
++			       const struct of_phandle_args *reset_spec)
++{
++	if (WARN_ON(reset_spec->args_count != 0))
++		return -EINVAL;
++
++	return 0;
++}
++
++static int gpio_reset_probe(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct gpio_reset_data *drvdata;
++	enum of_gpio_flags flags;
++	unsigned long gpio_flags;
++	bool initially_in_reset;
++	int ret;
++
++	drvdata = devm_kzalloc(&pdev->dev, sizeof(*drvdata), GFP_KERNEL);
++	if (drvdata == NULL)
++		return -ENOMEM;
++
++	if (of_gpio_named_count(np, "reset-gpios") != 1) {
++		dev_err(&pdev->dev,
++			"reset-gpios property missing, or not a single gpio\n");
++		return -EINVAL;
++	}
++
++	drvdata->gpio = of_get_named_gpio_flags(np, "reset-gpios", 0, &flags);
++	if (drvdata->gpio == -EPROBE_DEFER) {
++		return drvdata->gpio;
++	} else if (!gpio_is_valid(drvdata->gpio)) {
++		dev_err(&pdev->dev, "invalid reset gpio: %d\n", drvdata->gpio);
++		return drvdata->gpio;
++	}
++
++	drvdata->active_low = flags & OF_GPIO_ACTIVE_LOW;
++
++	ret = of_property_read_u32(np, "reset-delay-us", &drvdata->delay_us);
++	if (ret < 0)
++		drvdata->delay_us = -1;
++	else if (drvdata->delay_us < 0)
++		dev_warn(&pdev->dev, "reset delay too high\n");
++
++	/* It is optional.
++	 * Some devices need some milliseconds to wait after reset.
++	 */
++	ret = of_property_read_u32(np, "reset-post-delay-ms", &drvdata->post_delay_ms);
++	if (ret < 0)
++		drvdata->post_delay_ms = -1;
++
++	initially_in_reset = of_property_read_bool(np, "initially-in-reset");
++	if (drvdata->active_low ^ initially_in_reset)
++		gpio_flags = GPIOF_OUT_INIT_HIGH;
++	else
++		gpio_flags = GPIOF_OUT_INIT_LOW;
++
++	ret = devm_gpio_request_one(&pdev->dev, drvdata->gpio, gpio_flags, NULL);
++	if (ret < 0) {
++		dev_err(&pdev->dev, "failed to request gpio %d: %d\n",
++			drvdata->gpio, ret);
++		return ret;
++	}
++
++	platform_set_drvdata(pdev, drvdata);
++
++	drvdata->rcdev.of_node = np;
++	drvdata->rcdev.owner = THIS_MODULE;
++	drvdata->rcdev.nr_resets = 1;
++	drvdata->rcdev.ops = &gpio_reset_ops;
++	drvdata->rcdev.of_xlate = of_gpio_reset_xlate;
++	reset_controller_register(&drvdata->rcdev);
++
++	return 0;
++}
++
++static int gpio_reset_remove(struct platform_device *pdev)
++{
++	struct gpio_reset_data *drvdata = platform_get_drvdata(pdev);
++
++	reset_controller_unregister(&drvdata->rcdev);
++
++	return 0;
++}
++
++static struct of_device_id gpio_reset_dt_ids[] = {
++	{ .compatible = "gpio-reset" },
++	{ }
++};
++
++#ifdef CONFIG_PM_SLEEP
++static int gpio_reset_suspend(struct device *dev)
++{
++	pinctrl_pm_select_sleep_state(dev);
++
++	return 0;
++}
++static int gpio_reset_resume(struct device *dev)
++{
++	pinctrl_pm_select_default_state(dev);
++
++	return 0;
++}
++#endif
++
++static const struct dev_pm_ops gpio_reset_pm_ops = {
++	SET_LATE_SYSTEM_SLEEP_PM_OPS(gpio_reset_suspend, gpio_reset_resume)
++};
++
++static struct platform_driver gpio_reset_driver = {
++	.probe = gpio_reset_probe,
++	.remove = gpio_reset_remove,
++	.driver = {
++		.name = "gpio-reset",
++		.owner = THIS_MODULE,
++		.of_match_table = of_match_ptr(gpio_reset_dt_ids),
++		.pm = &gpio_reset_pm_ops,
++	},
++};
++
++static int __init gpio_reset_init(void)
++{
++	return platform_driver_register(&gpio_reset_driver);
++}
++arch_initcall(gpio_reset_init);
++
++static void __exit gpio_reset_exit(void)
++{
++	platform_driver_unregister(&gpio_reset_driver);
++}
++module_exit(gpio_reset_exit);
++
++MODULE_AUTHOR("Philipp Zabel <p.zabel@pengutronix.de>");
++MODULE_DESCRIPTION("gpio reset controller");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:gpio-reset");
++MODULE_DEVICE_TABLE(of, gpio_reset_dt_ids);
+diff --git a/drivers/reset/reset-dispmix.c b/drivers/reset/reset-dispmix.c
+new file mode 100644
+index 000000000..60daf7109
+--- /dev/null
++++ b/drivers/reset/reset-dispmix.c
+@@ -0,0 +1,399 @@
++/*
++ * IMX Display Mix GPR reset driver
++ *
++ * Copyright 2019 NXP
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/reset-controller.h>
++#include <dt-bindings/reset/imx8mm-dispmix.h>
++#include <dt-bindings/reset/imx8mn-dispmix.h>
++
++#define DRIVER_NAME		"dispmix_reset_drv"
++
++/* DISPMIX GPR registers */
++#define DISPLAY_MIX_SFT_RSTN_CSR		0x00
++#define DISPLAY_MIX_CLK_EN_CSR			0x00
++#define GPR_MIPI_RESET_DIV			0x00
++
++struct dispmix_reset_controller {
++	struct reset_controller_dev rcdev;
++	struct device *dev;
++	struct regmap *rstcon;
++	struct clk *ipg_clk;
++	bool active_low;
++};
++
++struct dispmix_reset_entry {
++	uint32_t reg_off;
++	uint32_t bit_off;
++};
++
++struct dispmix_reset_pdata {
++	const struct dispmix_reset_entry *resets;
++	uint32_t nr_resets;
++	const struct regmap_config *config;
++};
++
++#define RESET_ENTRY(id, reg, bit)			\
++	[id] = { .reg_off = (reg), .bit_off = (bit) }
++
++static const struct dispmix_reset_entry imx8mm_sft_rstn[] = {
++	/* dispmix reset entry */
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_CHIP_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 0),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_IPG_HARD_ASYNC_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 1),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_CSI_HRESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 2),
++	RESET_ENTRY(IMX8MM_CAMERA_PIXEL_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 3),
++	RESET_ENTRY(IMX8MM_MIPI_CSI_I_PRESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 4),
++	RESET_ENTRY(IMX8MM_MIPI_DSI_I_PRESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 5),
++	RESET_ENTRY(IMX8MM_BUS_RSTN_BLK_SYNC,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 6),
++};
++
++static const struct dispmix_reset_entry imx8mm_clk_en[] = {
++	/* dispmix clock enable entry */
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_CSI_HCLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  0),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_SPU_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  1),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_MEM_WRAPPER_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  2),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_IPG_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  3),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_IPG_CLK_S_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  4),
++	RESET_ENTRY(IMX8MM_CSI_BRIDGE_IPG_CLK_S_RAW_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  5),
++	RESET_ENTRY(IMX8MM_LCDIF_APB_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  6),
++	RESET_ENTRY(IMX8MM_LCDIF_PIXEL_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  7),
++	RESET_ENTRY(IMX8MM_MIPI_DSI_PCLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  8),
++	RESET_ENTRY(IMX8MM_MIPI_DSI_CLKREF_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  9),
++	RESET_ENTRY(IMX8MM_MIPI_CSI_ACLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR, 10),
++	RESET_ENTRY(IMX8MM_MIPI_CSI_PCLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR, 11),
++	RESET_ENTRY(IMX8MM_BUS_BLK_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR, 12),
++};
++
++static const struct dispmix_reset_entry imx8mm_mipi_rst[] = {
++	/* mipi lanes reset entry */
++	RESET_ENTRY(IMX8MM_MIPI_S_RESET,
++		    GPR_MIPI_RESET_DIV, 16),
++	RESET_ENTRY(IMX8MM_MIPI_M_RESET,
++		    GPR_MIPI_RESET_DIV, 17),
++};
++
++static const struct dispmix_reset_entry imx8mn_sft_rstn[] = {
++	/* dispmix reset entry */
++	RESET_ENTRY(IMX8MN_MIPI_DSI_PCLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 0),
++	RESET_ENTRY(IMX8MN_MIPI_DSI_CLKREF_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 1),
++	RESET_ENTRY(IMX8MN_MIPI_CSI_PCLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 2),
++	RESET_ENTRY(IMX8MN_MIPI_CSI_ACLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 3),
++	RESET_ENTRY(IMX8MN_LCDIF_PIXEL_CLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 4),
++	RESET_ENTRY(IMX8MN_LCDIF_APB_CLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 5),
++	RESET_ENTRY(IMX8MN_ISI_PROC_CLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 6),
++	RESET_ENTRY(IMX8MN_ISI_APB_CLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 7),
++	RESET_ENTRY(IMX8MN_BUS_BLK_CLK_RESET,
++		    DISPLAY_MIX_SFT_RSTN_CSR, 8),
++};
++
++static const struct dispmix_reset_entry imx8mn_clk_en[] = {
++	/* dispmix clock enable entry */
++	RESET_ENTRY(IMX8MN_MIPI_DSI_PCLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  0),
++	RESET_ENTRY(IMX8MN_MIPI_DSI_CLKREF_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  1),
++	RESET_ENTRY(IMX8MN_MIPI_CSI_PCLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  2),
++	RESET_ENTRY(IMX8MN_MIPI_CSI_ACLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  3),
++	RESET_ENTRY(IMX8MN_LCDIF_PIXEL_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  4),
++	RESET_ENTRY(IMX8MN_LCDIF_APB_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  5),
++	RESET_ENTRY(IMX8MN_ISI_PROC_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  6),
++	RESET_ENTRY(IMX8MN_ISI_APB_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  7),
++	RESET_ENTRY(IMX8MN_BUS_BLK_CLK_EN,
++		    DISPLAY_MIX_CLK_EN_CSR,  8),
++};
++
++static const struct dispmix_reset_entry imx8mn_mipi_rst[] = {
++	/* mipi lanes reset entry */
++	RESET_ENTRY(IMX8MN_MIPI_S_RESET,
++		    GPR_MIPI_RESET_DIV, 16),
++	RESET_ENTRY(IMX8MN_MIPI_M_RESET,
++		    GPR_MIPI_RESET_DIV, 17),
++};
++
++static const struct regmap_config sft_rstn_config = {
++	.name = "sft_rstn",
++	.reg_bits = 32,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.max_register = 0x00,
++};
++
++static const struct regmap_config clk_en_config = {
++	.name = "clk_en",
++	.reg_bits = 32,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.max_register = 0x00,
++};
++
++static const struct regmap_config mipi_rst_config = {
++	.name = "mipi_rst",
++	.reg_bits = 32,
++	.val_bits = 32,
++	.reg_stride = 4,
++	.max_register = 0x00,
++};
++
++static const struct dispmix_reset_pdata imx8mm_sft_rstn_pdata = {
++	.resets    = imx8mm_sft_rstn,
++	.nr_resets = IMX8MM_DISPMIX_SFT_RSTN_NUM,
++	.config    = &sft_rstn_config,
++};
++
++static const struct dispmix_reset_pdata imx8mm_clk_en_pdata = {
++	.resets    = imx8mm_clk_en,
++	.nr_resets = IMX8MM_DISPMIX_CLK_EN_NUM,
++	.config    = &clk_en_config,
++};
++
++static const struct dispmix_reset_pdata imx8mm_mipi_rst_pdata = {
++	.resets    = imx8mm_mipi_rst,
++	.nr_resets = IMX8MM_MIPI_RESET_NUM,
++	.config    = &mipi_rst_config,
++};
++
++static const struct dispmix_reset_pdata imx8mn_sft_rstn_pdata = {
++	.resets    = imx8mn_sft_rstn,
++	.nr_resets = IMX8MN_DISPMIX_SFT_RSTN_NUM,
++	.config    = &sft_rstn_config,
++};
++
++static const struct dispmix_reset_pdata imx8mn_clk_en_pdata = {
++	.resets    = imx8mn_clk_en,
++	.nr_resets = IMX8MN_DISPMIX_CLK_EN_NUM,
++	.config    = &clk_en_config,
++};
++
++static const struct dispmix_reset_pdata imx8mn_mipi_rst_pdata = {
++	.resets    = imx8mn_mipi_rst,
++	.nr_resets = IMX8MN_MIPI_RESET_NUM,
++	.config    = &mipi_rst_config,
++};
++
++static const struct of_device_id dispmix_reset_dt_ids[] = {
++	{
++		.compatible = "fsl,imx8mm-dispmix-sft-rstn",
++		.data = &imx8mm_sft_rstn_pdata,
++	},
++	{
++		.compatible = "fsl,imx8mm-dispmix-clk-en",
++		.data = &imx8mm_clk_en_pdata,
++	},
++	{
++		.compatible = "fsl,imx8mm-dispmix-mipi-rst",
++		.data = &imx8mm_mipi_rst_pdata,
++	},
++	{
++		.compatible = "fsl,imx8mn-dispmix-sft-rstn",
++		.data = &imx8mn_sft_rstn_pdata,
++	},
++	{
++		.compatible = "fsl,imx8mn-dispmix-clk-en",
++		.data = &imx8mn_clk_en_pdata,
++	},
++	{
++		.compatible = "fsl,imx8mn-dispmix-mipi-rst",
++		.data = &imx8mn_mipi_rst_pdata,
++	},
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, dispmix_reset_dt_ids);
++
++static int dispmix_reset_assert(struct reset_controller_dev *rcdev,
++				unsigned long id)
++{
++	struct dispmix_reset_controller *drcdev;
++	const struct of_device_id *of_id;
++	const struct dispmix_reset_pdata *pdata;
++	const struct dispmix_reset_entry *rstent;
++	struct regmap *rstcon;
++
++	if (id >= rcdev->nr_resets) {
++		pr_info("dispmix reset: %lu is not a valid line\n", id);
++		return -EINVAL;
++	}
++
++	drcdev = container_of(rcdev, struct dispmix_reset_controller, rcdev);
++	of_id  = of_match_device(dispmix_reset_dt_ids, drcdev->dev);
++	pdata = of_id->data;
++
++	rstcon = drcdev->rstcon;
++	rstent = &pdata->resets[id];
++
++	pm_runtime_get_sync(drcdev->dev);
++	regmap_update_bits(rstcon, rstent->reg_off,
++			   1 << rstent->bit_off,
++			   !drcdev->active_low << rstent->bit_off);
++	pm_runtime_put(drcdev->dev);
++
++	return 0;
++}
++
++static int dispmix_reset_deassert(struct reset_controller_dev *rcdev,
++				  unsigned long id)
++{
++	struct dispmix_reset_controller *drcdev;
++	const struct of_device_id *of_id;
++	const struct dispmix_reset_pdata *pdata;
++	const struct dispmix_reset_entry *rstent;
++	struct regmap *rstcon;
++
++	if (id >= rcdev->nr_resets) {
++		pr_info("dispmix reset: %lu is not a valid line\n", id);
++		return -EINVAL;
++	}
++
++	drcdev = container_of(rcdev, struct dispmix_reset_controller, rcdev);
++	of_id  = of_match_device(dispmix_reset_dt_ids, drcdev->dev);
++	pdata = of_id->data;
++
++	rstcon = drcdev->rstcon;
++	rstent = &pdata->resets[id];
++
++	pm_runtime_get_sync(drcdev->dev);
++	regmap_update_bits(rstcon, rstent->reg_off,
++			   1 << rstent->bit_off,
++			   !!drcdev->active_low << rstent->bit_off);
++	pm_runtime_put(drcdev->dev);
++
++	return 0;
++}
++
++static const struct reset_control_ops dispmix_reset_ops = {
++	.assert   = dispmix_reset_assert,
++	.deassert = dispmix_reset_deassert,
++};
++
++static int dispmix_reset_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	const struct of_device_id *of_id;
++	struct dispmix_reset_controller *drcdev;
++	const struct dispmix_reset_pdata *pdata;
++	struct resource *res;
++	void __iomem *regs;
++	struct regmap *regmap;
++	struct clk *apb_clk;
++
++	drcdev = devm_kzalloc(dev, sizeof(*drcdev), GFP_KERNEL);
++	if (!drcdev)
++		return -ENOMEM;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -ENODEV;
++
++	regs = devm_ioremap_resource(dev, res);
++	if (IS_ERR(regs))
++		return PTR_ERR(regs);
++
++	apb_clk = devm_clk_get(dev, "disp_apb_root_clk");
++	if (IS_ERR(apb_clk)) {
++		dev_err(dev, "Unable to get disp apb clock\n");
++		return PTR_ERR(apb_clk);
++	}
++
++	drcdev->active_low = of_property_read_bool(np, "active_low");
++
++	of_id = of_match_device(dispmix_reset_dt_ids, dev);
++	pdata = of_id->data;
++
++	/* init mmio regmap */
++	regmap = regmap_init_mmio_clk(NULL, NULL,
++				      regs, pdata->config);
++	if (IS_ERR(regmap)) {
++		dev_err(dev, "Failed to init mmio regmap: %ld\n",
++			PTR_ERR(regmap));
++		return PTR_ERR(regmap);
++	}
++	drcdev->rstcon = regmap;
++
++	platform_set_drvdata(pdev, drcdev);
++	pm_runtime_enable(dev);
++
++	/* register reset controller */
++	drcdev->dev = dev;
++	drcdev->rcdev.of_node = dev->of_node;
++	drcdev->rcdev.owner = THIS_MODULE;
++	drcdev->rcdev.nr_resets = pdata->nr_resets;
++	drcdev->rcdev.ops = &dispmix_reset_ops;
++
++	return devm_reset_controller_register(dev, &drcdev->rcdev);
++}
++
++static int dispmix_reset_remove(struct platform_device *pdev)
++{
++	pm_runtime_disable(&pdev->dev);
++	platform_set_drvdata(pdev, NULL);
++
++	return 0;
++}
++
++static struct platform_driver dispmix_reset_driver = {
++	.probe  = dispmix_reset_probe,
++	.remove = dispmix_reset_remove,
++	.driver = {
++		.name  = DRIVER_NAME,
++		.owner = THIS_MODULE,
++		.of_match_table = of_match_ptr(dispmix_reset_dt_ids),
++	},
++};
++
++builtin_platform_driver(dispmix_reset_driver);
++
++MODULE_DESCRIPTION("IMX Display Mix reset driver");
++MODULE_AUTHOR("Fancy Fang <chen.fang@nxp.com>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/rpmsg/Kconfig b/drivers/rpmsg/Kconfig
+index f96716893..2942e89b1 100644
+--- a/drivers/rpmsg/Kconfig
++++ b/drivers/rpmsg/Kconfig
+@@ -15,6 +15,14 @@ config RPMSG_CHAR
+ 	  in /dev. They make it possible for user-space programs to send and
+ 	  receive rpmsg packets.
+ 
++config RPMSG_NS
++	tristate "RPMSG name service announcement"
++	depends on RPMSG
++	help
++	  Say Y here to enable the support of the name service announcement
++	  channel that probes the associated RPMsg device on remote endpoint
++	  service announcement.
++
+ config RPMSG_MTK_SCP
+ 	tristate "MediaTek SCP"
+ 	depends on MTK_SCP
+@@ -62,6 +70,20 @@ config RPMSG_VIRTIO
+ 	tristate "Virtio RPMSG bus driver"
+ 	depends on HAS_DMA
+ 	select RPMSG
++	select RPMSG_NS
+ 	select VIRTIO
+ 
++config HAVE_IMX_RPMSG
++	bool "IMX RPMSG driver on the AMP SOCs"
++	default y
++	depends on IMX_MBOX
++	select RPMSG_VIRTIO
++	help
++	  Say y here to enable support for the iMX Rpmsg Driver	providing
++	  communication channels to remote processors in iMX asymmetric
++	  multiprocessing (AMP) platforms.
++
++	  Especially, it is mandatory required when the partition reset is
++	  required on some iMX AMP platforms.
++
+ endmenu
+diff --git a/drivers/rpmsg/Makefile b/drivers/rpmsg/Makefile
+index ffe932ef6..e0bb7cd98 100644
+--- a/drivers/rpmsg/Makefile
++++ b/drivers/rpmsg/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_RPMSG)		+= rpmsg_core.o
+ obj-$(CONFIG_RPMSG_CHAR)	+= rpmsg_char.o
++obj-$(CONFIG_RPMSG_NS)		+= rpmsg_ns.o
+ obj-$(CONFIG_RPMSG_MTK_SCP)	+= mtk_rpmsg.o
+ qcom_glink-objs			:= qcom_glink_native.o qcom_glink_ssr.o
+ obj-$(CONFIG_RPMSG_QCOM_GLINK) += qcom_glink.o
+@@ -8,3 +9,4 @@ obj-$(CONFIG_RPMSG_QCOM_GLINK_RPM) += qcom_glink_rpm.o
+ obj-$(CONFIG_RPMSG_QCOM_GLINK_SMEM) += qcom_glink_smem.o
+ obj-$(CONFIG_RPMSG_QCOM_SMD)	+= qcom_smd.o
+ obj-$(CONFIG_RPMSG_VIRTIO)	+= virtio_rpmsg_bus.o
++obj-$(CONFIG_HAVE_IMX_RPMSG)	+= imx_rpmsg.o
+diff --git a/drivers/rpmsg/imx_rpmsg.c b/drivers/rpmsg/imx_rpmsg.c
+new file mode 100644
+index 000000000..504010fec
+--- /dev/null
++++ b/drivers/rpmsg/imx_rpmsg.c
+@@ -0,0 +1,680 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2019 NXP
++ */
++
++#include <linux/slab.h>
++#include <linux/circ_buf.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#ifdef CONFIG_IMX_SCU
++#include <linux/firmware/imx/sci.h>
++#endif
++#include <linux/init.h>
++#include <linux/mailbox_client.h>
++#include <linux/module.h>
++#include <linux/notifier.h>
++#include <linux/of_device.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
++#include <linux/virtio_ring.h>
++#include <linux/imx_rpmsg.h>
++#include "rpmsg_internal.h"
++
++enum imx_rpmsg_variants {
++	IMX8QM,
++	IMX8QXP,
++	IMX8MQ,
++	IMX8MM,
++	IMX7ULP,
++	IMX7D,
++	IMX6SX,
++};
++
++struct imx_virdev {
++	struct virtio_device vdev;
++	unsigned int vring[2];
++	struct virtqueue *vq[2];
++	int base_vq_id;
++	int num_of_vqs;
++	struct imx_rpmsg_vproc *rpdev;
++};
++
++struct imx_rpmsg_vproc {
++	struct mbox_client cl;
++	struct mbox_client cl_rxdb;
++	struct mbox_chan *tx_ch;
++	struct mbox_chan *rx_ch;
++	struct mbox_chan *rxdb_ch;
++	enum imx_rpmsg_variants variant;
++	int vdev_nums;
++	int first_notify;
++	u32 flags;
++#define MAX_VDEV_NUMS  8
++	struct imx_virdev *ivdev[MAX_VDEV_NUMS];
++	struct delayed_work rpmsg_work;
++	struct circ_buf rx_buffer;
++	spinlock_t mu_lock;
++	u32 mub_partition;
++	struct notifier_block proc_nb;
++	struct platform_device *pdev;
++};
++
++#define SC_IRQ_GROUP_REBOOTED   5U      /* Partition reboot complete */
++
++/*
++ * The time consumption by remote ready is less than 1ms in the
++ * evaluation. Set the max wait timeout as 50ms here.
++ */
++#define REMOTE_READY_WAIT_MAX_RETRIES	500
++
++#define RPMSG_NUM_BUFS		(512)
++#define RPMSG_BUF_SIZE		(512)
++#define RPMSG_BUFS_SPACE	(RPMSG_NUM_BUFS * RPMSG_BUF_SIZE)
++#define RPMSG_VRING_ALIGN	(4096)
++#define RPMSG_RING_SIZE	((DIV_ROUND_UP(vring_size(RPMSG_NUM_BUFS / 2, \
++				RPMSG_VRING_ALIGN), PAGE_SIZE)) * PAGE_SIZE)
++
++#define to_imx_virdev(vd) container_of(vd, struct imx_virdev, vdev)
++
++/*
++ * 1: indicated that remote processor is ready from re-initialization.
++ * Clear this bit after the RPMSG restore is finished at master side.
++ */
++#define REMOTE_IS_READY			BIT(0)
++/* 1: Use reserved memory region as DMA pool */
++#define SPECIFIC_DMA_POOL		BIT(1)
++
++struct imx_rpmsg_vq_info {
++	__u16 num;	/* number of entries in the virtio_ring */
++	__u16 vq_id;	/* a globaly unique index of this virtqueue */
++	__u32 mmsg;	/* the mailbox msg transferred on the virtqueue */
++	void *addr;	/* address where we mapped the virtio ring */
++	struct imx_rpmsg_vproc *rpdev;
++};
++
++static u64 imx_rpmsg_get_features(struct virtio_device *vdev)
++{
++	/* VIRTIO_RPMSG_F_NS has been made private */
++	return 1 << 0;
++}
++
++static int imx_rpmsg_finalize_features(struct virtio_device *vdev)
++{
++	/* Give virtio_ring a chance to accept features */
++	vring_transport_features(vdev);
++	return 0;
++}
++
++/* kick the remote processor, and let it know which virtqueue to poke at */
++static bool imx_rpmsg_notify(struct virtqueue *vq)
++{
++	int ret;
++	struct imx_rpmsg_vq_info *rpvq = vq->priv;
++	struct imx_rpmsg_vproc *rpdev = rpvq->rpdev;
++
++	rpvq->mmsg = rpvq->vq_id << 16;
++	/*
++	 * Send the index of the triggered virtqueue as the mu payload.
++	 * Use the timeout MU send message here.
++	 * Since that M4 core may not be loaded, and the first MSG may
++	 * not be handled by M4 when multi-vdev is enabled.
++	 * To make sure that the message wound't be discarded when M4
++	 * is running normally or in the suspend mode. Only use
++	 * the timeout mechanism by the first notify when the vdev is
++	 * registered.
++	 * ~14ms is required by M4 ready to process the MU message from
++	 * cold boot. Set the wait time 20ms here.
++	 */
++	if (unlikely(rpdev->first_notify > 0)) {
++		rpdev->first_notify--;
++		rpdev->cl.tx_tout = 20;
++		ret = mbox_send_message(rpdev->tx_ch, &rpvq->mmsg);
++		if (ret < 0)
++			return false;
++	} else {
++		rpdev->cl.tx_tout = 0;
++		ret = mbox_send_message(rpdev->tx_ch, &rpvq->mmsg);
++		if (ret < 0)
++			return false;
++	}
++
++	return true;
++}
++
++static struct virtqueue *rp_find_vq(struct virtio_device *vdev,
++				    unsigned int index,
++				    void (*callback)(struct virtqueue *vq),
++				    const char *name,
++				    bool ctx)
++{
++	struct imx_virdev *virdev = to_imx_virdev(vdev);
++	struct imx_rpmsg_vproc *rpdev = virdev->rpdev;
++	struct platform_device *pdev = rpdev->pdev;
++	struct device *dev = &pdev->dev;
++	struct imx_rpmsg_vq_info *rpvq;
++	struct virtqueue *vq;
++	int err;
++
++	rpvq = kmalloc(sizeof(*rpvq), GFP_KERNEL);
++	if (!rpvq)
++		return ERR_PTR(-ENOMEM);
++
++	/* ioremap'ing normal memory, so we cast away sparse's complaints */
++	rpvq->addr = (__force void *) ioremap(virdev->vring[index],
++							RPMSG_RING_SIZE);
++	if (!rpvq->addr) {
++		err = -ENOMEM;
++		goto free_rpvq;
++	}
++
++	memset_io(rpvq->addr, 0, RPMSG_RING_SIZE);
++
++	dev_dbg(dev, "vring%d: phys 0x%x, virt 0x%p\n",
++			index, virdev->vring[index], rpvq->addr);
++
++	vq = vring_new_virtqueue(index, RPMSG_NUM_BUFS / 2, RPMSG_VRING_ALIGN,
++			vdev, true, ctx,
++			rpvq->addr,
++			imx_rpmsg_notify, callback,
++			name);
++	if (!vq) {
++		dev_err(dev, "vring_new_virtqueue failed\n");
++		err = -ENOMEM;
++		goto unmap_vring;
++	}
++
++	virdev->vq[index] = vq;
++	vq->priv = rpvq;
++	/* system-wide unique id for this virtqueue */
++	rpvq->vq_id = virdev->base_vq_id + index;
++	rpvq->rpdev = rpdev;
++
++	return vq;
++
++unmap_vring:
++	/* iounmap normal memory, so make sparse happy */
++	iounmap((__force void __iomem *) rpvq->addr);
++free_rpvq:
++	kfree(rpvq);
++	return ERR_PTR(err);
++}
++
++static void imx_rpmsg_del_vqs(struct virtio_device *vdev)
++{
++	struct virtqueue *vq, *n;
++
++	list_for_each_entry_safe(vq, n, &vdev->vqs, list) {
++		struct imx_rpmsg_vq_info *rpvq = vq->priv;
++
++		iounmap(rpvq->addr);
++		vring_del_virtqueue(vq);
++		kfree(rpvq);
++	}
++}
++
++static int imx_rpmsg_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
++		       struct virtqueue *vqs[],
++		       vq_callback_t *callbacks[],
++		       const char * const names[],
++		       const bool *ctx,
++		       struct irq_affinity *desc)
++{
++	struct imx_virdev *virdev = to_imx_virdev(vdev);
++	int i, err;
++
++	/* we maintain two virtqueues per remote processor (for RX and TX) */
++	if (nvqs != 2)
++		return -EINVAL;
++
++	for (i = 0; i < nvqs; ++i) {
++		vqs[i] = rp_find_vq(vdev, i, callbacks[i], names[i],
++				ctx ? ctx[i] : false);
++		if (IS_ERR(vqs[i])) {
++			err = PTR_ERR(vqs[i]);
++			goto error;
++		}
++	}
++
++	virdev->num_of_vqs = nvqs;
++	return 0;
++
++error:
++	imx_rpmsg_del_vqs(vdev);
++	return err;
++}
++
++static void imx_rpmsg_reset(struct virtio_device *vdev)
++{
++	dev_dbg(&vdev->dev, "reset !\n");
++}
++
++static u8 imx_rpmsg_get_status(struct virtio_device *vdev)
++{
++	return 0;
++}
++
++static void imx_rpmsg_set_status(struct virtio_device *vdev, u8 status)
++{
++	dev_dbg(&vdev->dev, "%s new status: %d\n", __func__, status);
++}
++
++static void imx_rpmsg_vproc_release(struct device *dev)
++{
++	/* this handler is provided so driver core doesn't yell at us */
++}
++
++static struct virtio_config_ops imx_rpmsg_config_ops = {
++	.get_features	= imx_rpmsg_get_features,
++	.finalize_features = imx_rpmsg_finalize_features,
++	.find_vqs	= imx_rpmsg_find_vqs,
++	.del_vqs	= imx_rpmsg_del_vqs,
++	.reset		= imx_rpmsg_reset,
++	.set_status	= imx_rpmsg_set_status,
++	.get_status	= imx_rpmsg_get_status,
++};
++
++static const struct of_device_id imx_rpmsg_dt_ids[] = {
++	{ .compatible = "fsl,imx8qm-rpmsg", .data = (void *)IMX8QM, },
++	{ .compatible = "fsl,imx8qxp-rpmsg", .data = (void *)IMX8QXP, },
++	{ .compatible = "fsl,imx8mq-rpmsg", .data = (void *)IMX8MQ, },
++	{ .compatible = "fsl,imx8mm-rpmsg", .data = (void *)IMX8MM, },
++	{ .compatible = "fsl,imx7ulp-rpmsg", .data = (void *)IMX7ULP, },
++	{ .compatible = "fsl,imx7d-rpmsg", .data = (void *)IMX7D, },
++	{ .compatible = "fsl,imx6sx-rpmsg", .data = (void *)IMX6SX, },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, imx_rpmsg_dt_ids);
++
++static int set_vring_phy_buf(struct platform_device *pdev,
++		       struct imx_rpmsg_vproc *rpdev, int vdev_nums)
++{
++	struct resource *res;
++	resource_size_t size;
++	unsigned int start, end;
++	int i, ret = 0;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (res) {
++		size = resource_size(res);
++		start = res->start;
++		end = res->start + size;
++		for (i = 0; i < vdev_nums; i++) {
++			rpdev->ivdev[i] = kzalloc(sizeof(struct imx_virdev),
++							GFP_KERNEL);
++			if (!rpdev->ivdev[i])
++				return -ENOMEM;
++
++			rpdev->ivdev[i]->vring[0] = start;
++			rpdev->ivdev[i]->vring[1] = start + 0x8000;
++			start += 0x10000;
++			if (start > end) {
++				dev_err(&pdev->dev,
++					"Too small memory size %x!\n",
++					(u32)size);
++				ret = -EINVAL;
++				break;
++			}
++		}
++	} else {
++		return -ENOMEM;
++	}
++
++	return ret;
++}
++
++static void rpmsg_work_handler(struct work_struct *work)
++{
++	u32 message;
++	unsigned long flags;
++	struct imx_virdev *virdev;
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct imx_rpmsg_vproc *rpdev = container_of(dwork,
++			struct imx_rpmsg_vproc, rpmsg_work);
++	struct circ_buf *cb = &rpdev->rx_buffer;
++	struct platform_device *pdev = rpdev->pdev;
++	struct device *dev = &pdev->dev;
++
++	spin_lock_irqsave(&rpdev->mu_lock, flags);
++	/* handle all incoming mu message */
++	while (CIRC_CNT(cb->head, cb->tail, PAGE_SIZE)) {
++		message = cb->buf[cb->tail];
++		message |= (cb->buf[cb->tail + 1] << 8);
++		message |= (cb->buf[cb->tail + 2] << 16);
++		message |= (cb->buf[cb->tail + 3] << 24);
++		spin_unlock_irqrestore(&rpdev->mu_lock, flags);
++		virdev = rpdev->ivdev[(message >> 16) / 2];
++
++		dev_dbg(dev, "%s msg: 0x%x\n", __func__, message);
++		message = message >> 16;
++		message -= virdev->base_vq_id;
++
++		/*
++		 * Currently both PENDING_MSG and explicit-virtqueue-index
++		 * messaging are supported.
++		 * Whatever approach is taken, at this point message contains
++		 * the index of the vring which was just triggered.
++		 */
++		if (message  < virdev->num_of_vqs)
++			vring_interrupt(message, virdev->vq[message]);
++		spin_lock_irqsave(&rpdev->mu_lock, flags);
++		cb->tail = CIRC_ADD(cb->tail, PAGE_SIZE, 4);
++	}
++	spin_unlock_irqrestore(&rpdev->mu_lock, flags);
++}
++
++#ifdef CONFIG_IMX_SCU
++void imx_rpmsg_restore(struct imx_rpmsg_vproc *rpdev)
++{
++	int i;
++	int vdev_nums = rpdev->vdev_nums;
++
++	for (i = 0; i < vdev_nums; i++) {
++		unregister_virtio_device(&rpdev->ivdev[i]->vdev);
++		kfree(rpdev->ivdev[i]);
++	}
++
++	/* Make a double check that remote processor is ready or not */
++	for (i = 0; i < REMOTE_READY_WAIT_MAX_RETRIES; i++) {
++		if (rpdev->flags & REMOTE_IS_READY)
++			break;
++		udelay(100);
++	}
++	if (unlikely((rpdev->flags & REMOTE_IS_READY) == 0)) {
++		pr_info("Wait for remote ready timeout, use first_notify.\n");
++		/*
++		 * In order to make the codes to be robust and back compatible.
++		 * When wait remote ready timeout, re-initialize the
++		 * first_notify to send the first kick-off message when
++		 * register the vdev.
++		 */
++		rpdev->first_notify = rpdev->vdev_nums;
++	}
++
++	/* Allocate and setup ivdev again to register virtio devices */
++	if (set_vring_phy_buf(rpdev->pdev, rpdev, rpdev->vdev_nums))
++		pr_err("No vring buffer.\n");
++
++	for (i = 0; i < vdev_nums; i++) {
++		rpdev->ivdev[i]->vdev.id.device = VIRTIO_ID_RPMSG;
++		rpdev->ivdev[i]->vdev.config = &imx_rpmsg_config_ops;
++		rpdev->ivdev[i]->vdev.dev.parent = &rpdev->pdev->dev;
++		rpdev->ivdev[i]->vdev.dev.release = imx_rpmsg_vproc_release;
++		rpdev->ivdev[i]->base_vq_id = i * 2;
++		rpdev->ivdev[i]->rpdev = rpdev;
++
++		if (register_virtio_device(&rpdev->ivdev[i]->vdev))
++			pr_err("%s failed to register rpdev.\n", __func__);
++	}
++}
++
++static int imx_rpmsg_partition_notify(struct notifier_block *nb,
++				      unsigned long event, void *group)
++{
++	struct imx_rpmsg_vproc *rpdev;
++
++	rpdev = container_of(nb, struct imx_rpmsg_vproc, proc_nb);
++
++	/* Ignore other irqs */
++	if (!((event & BIT(rpdev->mub_partition)) &&
++		(*(u8 *)group == SC_IRQ_GROUP_REBOOTED)))
++		return 0;
++
++	imx_rpmsg_restore(rpdev);
++	pr_info("Patition%d reset!\n", rpdev->mub_partition);
++
++	return 0;
++}
++#endif
++
++static void imx_rpmsg_rxdb_callback(struct mbox_client *c, void *msg)
++{
++	unsigned long flags;
++	struct imx_rpmsg_vproc *rpdev = container_of(c,
++			struct imx_rpmsg_vproc, cl);
++
++	spin_lock_irqsave(&rpdev->mu_lock, flags);
++	rpdev->flags |= REMOTE_IS_READY;
++	spin_unlock_irqrestore(&rpdev->mu_lock, flags);
++}
++
++static int imx_rpmsg_rxdb_channel_init(struct imx_rpmsg_vproc *rpdev)
++{
++	struct platform_device *pdev = rpdev->pdev;
++	struct device *dev = &pdev->dev;
++	struct mbox_client *cl;
++	int ret = 0;
++
++	cl = &rpdev->cl_rxdb;
++	cl->dev = dev;
++	cl->rx_callback = imx_rpmsg_rxdb_callback;
++
++	/*
++	 * RX door bell is used to receive the ready signal from remote
++	 * after the partition reset of A core.
++	 */
++	rpdev->rxdb_ch = mbox_request_channel_byname(cl, "rxdb");
++	if (IS_ERR(rpdev->rxdb_ch)) {
++		ret = PTR_ERR(rpdev->rxdb_ch);
++		dev_dbg(cl->dev, "failed to request mbox chan rxdb, ret %d\n",
++			ret);
++		return ret;
++	}
++
++	return ret;
++}
++
++static void imx_rpmsg_rx_callback(struct mbox_client *c, void *msg)
++{
++	int buf_space;
++	u32 *data = msg;
++	struct imx_rpmsg_vproc *rpdev = container_of(c,
++			struct imx_rpmsg_vproc, cl);
++	struct circ_buf *cb = &rpdev->rx_buffer;
++
++	spin_lock(&rpdev->mu_lock);
++	buf_space = CIRC_SPACE(cb->head, cb->tail, PAGE_SIZE);
++	if (unlikely(!buf_space)) {
++		dev_err(c->dev, "RPMSG RX overflow!\n");
++		spin_unlock(&rpdev->mu_lock);
++		return;
++	}
++	cb->buf[cb->head] = (u8) *data;
++	cb->buf[cb->head + 1] = (u8) (*data >> 8);
++	cb->buf[cb->head + 2] = (u8) (*data >> 16);
++	cb->buf[cb->head + 3] = (u8) (*data >> 24);
++	cb->head = CIRC_ADD(cb->head, PAGE_SIZE, 4);
++	spin_unlock(&rpdev->mu_lock);
++
++	schedule_delayed_work(&(rpdev->rpmsg_work), 0);
++}
++
++static int imx_rpmsg_xtr_channel_init(struct imx_rpmsg_vproc *rpdev)
++{
++	struct platform_device *pdev = rpdev->pdev;
++	struct device *dev = &pdev->dev;
++	struct mbox_client *cl;
++	int ret = 0;
++
++	cl = &rpdev->cl;
++	cl->dev = dev;
++	cl->tx_block = true;
++	cl->tx_tout = 20;
++	cl->knows_txdone = false;
++	cl->rx_callback = imx_rpmsg_rx_callback;
++
++	rpdev->tx_ch = mbox_request_channel_byname(cl, "tx");
++	if (IS_ERR(rpdev->tx_ch)) {
++		ret = PTR_ERR(rpdev->tx_ch);
++		dev_dbg(cl->dev, "failed to request mbox tx chan, ret %d\n",
++			ret);
++		goto err_out;
++	}
++	rpdev->rx_ch = mbox_request_channel_byname(cl, "rx");
++	if (IS_ERR(rpdev->rx_ch)) {
++		ret = PTR_ERR(rpdev->rx_ch);
++		dev_dbg(cl->dev, "failed to request mbox rx chan, ret %d\n",
++			ret);
++		goto err_out;
++	}
++
++	return ret;
++
++err_out:
++	if (!IS_ERR(rpdev->tx_ch))
++		mbox_free_channel(rpdev->tx_ch);
++	if (!IS_ERR(rpdev->rx_ch))
++		mbox_free_channel(rpdev->rx_ch);
++
++	return ret;
++}
++
++static int imx_rpmsg_probe(struct platform_device *pdev)
++{
++	int j, ret = 0;
++	unsigned long variant;
++	char *buf;
++	struct device *dev = &pdev->dev;
++	struct device_node *np = pdev->dev.of_node;
++	struct imx_rpmsg_vproc *rpdev;
++
++	buf = devm_kzalloc(dev, PAGE_SIZE, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	rpdev = devm_kzalloc(dev, sizeof(*rpdev), GFP_KERNEL);
++	if (!rpdev)
++		return -ENOMEM;
++
++	rpdev->pdev = pdev;
++#ifdef CONFIG_IMX_SCU
++	rpdev->proc_nb.notifier_call = imx_rpmsg_partition_notify;
++#endif
++	variant = (uintptr_t)of_device_get_match_data(dev);
++	rpdev->variant = (enum imx_rpmsg_variants)variant;
++	rpdev->rx_buffer.buf = buf;
++	rpdev->rx_buffer.head = 0;
++	rpdev->rx_buffer.tail = 0;
++
++	/* Initialize the RX/TX channels. */
++	ret = imx_rpmsg_xtr_channel_init(rpdev);
++	if (ret)
++		return ret;
++
++	spin_lock_init(&rpdev->mu_lock);
++	INIT_DELAYED_WORK(&(rpdev->rpmsg_work), rpmsg_work_handler);
++	ret = of_property_read_u32(np, "vdev-nums", &rpdev->vdev_nums);
++	if (ret)
++		rpdev->vdev_nums = 1;
++	if (rpdev->vdev_nums > MAX_VDEV_NUMS) {
++		dev_err(dev, "vdev-nums exceed the max %d\n", MAX_VDEV_NUMS);
++		ret = -EINVAL;
++		goto err_chl;
++	}
++	rpdev->first_notify = rpdev->vdev_nums;
++
++	ret = set_vring_phy_buf(pdev, rpdev, rpdev->vdev_nums);
++	if (ret) {
++		dev_err(dev, "No vring buffer.\n");
++		ret = -ENOMEM;
++		goto err_chl;
++	}
++	if (of_reserved_mem_device_init(dev)) {
++		dev_dbg(dev, "dev doesn't have specific DMA pool.\n");
++		rpdev->flags &= (~SPECIFIC_DMA_POOL);
++	} else {
++		rpdev->flags |= SPECIFIC_DMA_POOL;
++	}
++
++	for (j = 0; j < rpdev->vdev_nums; j++) {
++		dev_dbg(dev, "%s rpdev vdev%d: vring0 0x%x, vring1 0x%x\n",
++			 __func__, rpdev->vdev_nums,
++			 rpdev->ivdev[j]->vring[0],
++			 rpdev->ivdev[j]->vring[1]);
++		rpdev->ivdev[j]->vdev.id.device = VIRTIO_ID_RPMSG;
++		rpdev->ivdev[j]->vdev.config = &imx_rpmsg_config_ops;
++		rpdev->ivdev[j]->vdev.dev.parent = &pdev->dev;
++		rpdev->ivdev[j]->vdev.dev.release = imx_rpmsg_vproc_release;
++		rpdev->ivdev[j]->base_vq_id = j * 2;
++		rpdev->ivdev[j]->rpdev = rpdev;
++
++		ret = register_virtio_device(&rpdev->ivdev[j]->vdev);
++		if (ret) {
++			dev_err(dev, "%s failed to register rpdev: %d\n",
++					__func__, ret);
++			goto err_out;
++		}
++	}
++	/* Initialize the RX doorbell channel. */
++	ret = imx_rpmsg_rxdb_channel_init(rpdev);
++	if (ret)
++		goto err_out;
++
++	platform_set_drvdata(pdev, rpdev);
++
++#ifdef CONFIG_IMX_SCU
++	if (rpdev->variant == IMX8QXP || rpdev->variant == IMX8QM) {
++		/* Get muB partition id and enable irq in SCFW then */
++		if (of_property_read_u32(np, "mub-partition",
++					&rpdev->mub_partition))
++			rpdev->mub_partition = 3; /* default partition 3 */
++
++		ret = imx_scu_irq_group_enable(SC_IRQ_GROUP_REBOOTED,
++					      BIT(rpdev->mub_partition),
++					      true);
++		if (ret) {
++			dev_warn(&pdev->dev, "Enable irq failed.\n");
++			return ret;
++		}
++
++		ret = imx_scu_irq_register_notifier(&rpdev->proc_nb);
++		if (ret) {
++			imx_scu_irq_group_enable(SC_IRQ_GROUP_REBOOTED,
++						BIT(rpdev->mub_partition),
++						false);
++			dev_warn(&pdev->dev, "reqister scu notifier failed.\n");
++			return ret;
++		}
++	}
++#endif
++
++	return ret;
++
++err_out:
++	if (rpdev->flags & SPECIFIC_DMA_POOL)
++		of_reserved_mem_device_release(dev);
++err_chl:
++	if (!IS_ERR(rpdev->tx_ch))
++		mbox_free_channel(rpdev->tx_ch);
++	if (!IS_ERR(rpdev->rx_ch))
++		mbox_free_channel(rpdev->rx_ch);
++	return ret;
++}
++
++static struct platform_driver imx_rpmsg_driver = {
++	.driver = {
++		   .owner = THIS_MODULE,
++		   .name = "imx-rpmsg",
++		   .of_match_table = imx_rpmsg_dt_ids,
++		   },
++	.probe = imx_rpmsg_probe,
++};
++
++static int __init imx_rpmsg_init(void)
++{
++	int ret;
++
++	ret = platform_driver_register(&imx_rpmsg_driver);
++	if (ret)
++		pr_err("Unable to initialize rpmsg driver\n");
++	else
++		pr_info("imx rpmsg driver is registered.\n");
++
++	return ret;
++}
++
++MODULE_DESCRIPTION("iMX remote processor messaging virtio device");
++MODULE_LICENSE("GPL v2");
++arch_initcall(imx_rpmsg_init);
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index 484088653..7d7e80980 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -1333,6 +1333,20 @@ static int qcom_glink_trysend(struct rpmsg_endpoint *ept, void *data, int len)
+ 	return __qcom_glink_send(channel, data, len, false);
+ }
+ 
++static int qcom_glink_sendto(struct rpmsg_endpoint *ept, void *data, int len, u32 dst)
++{
++	struct glink_channel *channel = to_glink_channel(ept);
++
++	return __qcom_glink_send(channel, data, len, true);
++}
++
++static int qcom_glink_trysendto(struct rpmsg_endpoint *ept, void *data, int len, u32 dst)
++{
++	struct glink_channel *channel = to_glink_channel(ept);
++
++	return __qcom_glink_send(channel, data, len, false);
++}
++
+ /*
+  * Finds the device_node for the glink child interested in this channel.
+  */
+@@ -1365,7 +1379,9 @@ static const struct rpmsg_device_ops glink_device_ops = {
+ static const struct rpmsg_endpoint_ops glink_endpoint_ops = {
+ 	.destroy_ept = qcom_glink_destroy_ept,
+ 	.send = qcom_glink_send,
++	.sendto = qcom_glink_sendto,
+ 	.trysend = qcom_glink_trysend,
++	.trysendto = qcom_glink_trysendto,
+ };
+ 
+ static void qcom_glink_rpdev_release(struct device *dev)
+@@ -1626,7 +1642,7 @@ static int qcom_glink_create_chrdev(struct qcom_glink *glink)
+ 	rpdev->dev.parent = glink->dev;
+ 	rpdev->dev.release = qcom_glink_device_release;
+ 
+-	return rpmsg_chrdev_register_device(rpdev);
++	return rpmsg_ctrldev_register_device(rpdev);
+ }
+ 
+ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
+diff --git a/drivers/rpmsg/qcom_smd.c b/drivers/rpmsg/qcom_smd.c
+index 19903de62..d223e438d 100644
+--- a/drivers/rpmsg/qcom_smd.c
++++ b/drivers/rpmsg/qcom_smd.c
+@@ -974,6 +974,20 @@ static int qcom_smd_trysend(struct rpmsg_endpoint *ept, void *data, int len)
+ 	return __qcom_smd_send(qsept->qsch, data, len, false);
+ }
+ 
++static int qcom_smd_sendto(struct rpmsg_endpoint *ept, void *data, int len, u32 dst)
++{
++	struct qcom_smd_endpoint *qsept = to_smd_endpoint(ept);
++
++	return __qcom_smd_send(qsept->qsch, data, len, true);
++}
++
++static int qcom_smd_trysendto(struct rpmsg_endpoint *ept, void *data, int len, u32 dst)
++{
++	struct qcom_smd_endpoint *qsept = to_smd_endpoint(ept);
++
++	return __qcom_smd_send(qsept->qsch, data, len, false);
++}
++
+ static __poll_t qcom_smd_poll(struct rpmsg_endpoint *ept,
+ 				  struct file *filp, poll_table *wait)
+ {
+@@ -1038,7 +1052,9 @@ static const struct rpmsg_device_ops qcom_smd_device_ops = {
+ static const struct rpmsg_endpoint_ops qcom_smd_endpoint_ops = {
+ 	.destroy_ept = qcom_smd_destroy_ept,
+ 	.send = qcom_smd_send,
++	.sendto = qcom_smd_sendto,
+ 	.trysend = qcom_smd_trysend,
++	.trysendto = qcom_smd_trysendto,
+ 	.poll = qcom_smd_poll,
+ };
+ 
+@@ -1097,7 +1113,7 @@ static int qcom_smd_create_chrdev(struct qcom_smd_edge *edge)
+ 	qsdev->rpdev.dev.parent = &edge->dev;
+ 	qsdev->rpdev.dev.release = qcom_smd_release_device;
+ 
+-	return rpmsg_chrdev_register_device(&qsdev->rpdev);
++	return rpmsg_ctrldev_register_device(&qsdev->rpdev);
+ }
+ 
+ /*
+diff --git a/drivers/rpmsg/rpmsg_core.c b/drivers/rpmsg/rpmsg_core.c
+index 91de94089..07b680bda 100644
+--- a/drivers/rpmsg/rpmsg_core.c
++++ b/drivers/rpmsg/rpmsg_core.c
+@@ -20,6 +20,50 @@
+ 
+ #include "rpmsg_internal.h"
+ 
++/**
++ * rpmsg_create_channel() - create a new rpmsg channel
++ * using its name and address info.
++ * @rpdev: rpmsg device
++ * @chinfo: channel_info to bind
++ *
++ * Returns a pointer to the new rpmsg device on success, or NULL on error.
++ */
++struct rpmsg_device *rpmsg_create_channel(struct rpmsg_device *rpdev,
++					  struct rpmsg_channel_info *chinfo)
++{
++	if (WARN_ON(!rpdev))
++		return NULL;
++	if (!rpdev->ops || !rpdev->ops->create_channel) {
++		dev_err(&rpdev->dev, "no create_channel ops found\n");
++		return NULL;
++	}
++
++	return rpdev->ops->create_channel(rpdev, chinfo);
++}
++EXPORT_SYMBOL(rpmsg_create_channel);
++
++/**
++ * rpmsg_release_channel() - release a rpmsg channel
++ * using its name and address info.
++ * @rpdev: rpmsg device
++ * @chinfo: channel_info to bind
++ *
++ * Returns 0 on success or an appropriate error value.
++ */
++int rpmsg_release_channel(struct rpmsg_device *rpdev,
++			  struct rpmsg_channel_info *chinfo)
++{
++	if (WARN_ON(!rpdev))
++		return -EINVAL;
++	if (!rpdev->ops || !rpdev->ops->release_channel) {
++		dev_err(&rpdev->dev, "no release_channel ops found\n");
++		return -ENXIO;
++	}
++
++	return rpdev->ops->release_channel(rpdev, chinfo);
++}
++EXPORT_SYMBOL(rpmsg_release_channel);
++
+ /**
+  * rpmsg_create_ept() - create a new rpmsg_endpoint
+  * @rpdev: rpmsg channel device
+@@ -71,6 +115,57 @@ struct rpmsg_endpoint *rpmsg_create_ept(struct rpmsg_device *rpdev,
+ }
+ EXPORT_SYMBOL(rpmsg_create_ept);
+ 
++/**
++ * rpmsg_create_default_ept() - create a default rpmsg_endpoint for a rpmsg device
++ * @rpdev: rpmsg channel device
++ * @cb: rx callback handler
++ * @priv: private data for the driver's use
++ * @chinfo: channel_info with the local rpmsg address to bind with @cb
++ *
++ * On register_rpmsg_driver if no callback is provided in the rpmsg_driver structure,
++ * no endpoint is created when the device is probed by the rpmsg bus.
++ *
++ * This function returns a pointer to the default endpoint if already created or creates
++ * a endpoint and assign it as the default endpoint of the rpmsg device.
++ *
++ * Drivers should provide their @rpdev channel (so the new endpoint would belong
++ * to the same remote processor their channel belongs to), an rx callback
++ * function, an optional private data (which is provided back when the
++ * rx callback is invoked), and an address they want to bind with the
++ * callback. If @addr is RPMSG_ADDR_ANY, then rpmsg_create_ept will
++ * dynamically assign them an available rpmsg address (drivers should have
++ * a very good reason why not to always use RPMSG_ADDR_ANY here).
++ *
++ * Returns a pointer to the endpoint on success, or NULL on error.
++ */
++struct rpmsg_endpoint *rpmsg_create_default_ept(struct rpmsg_device *rpdev,
++						rpmsg_rx_cb_t cb, void *priv,
++						struct rpmsg_channel_info chinfo)
++{
++	struct rpmsg_endpoint *ept;
++
++	if (WARN_ON(!rpdev))
++		return NULL;
++
++	/* It does not make sense to create a default  endpoint without a callback. */
++	if (!cb)
++		return NULL;
++
++	if (rpdev->ept)
++		return rpdev->ept;
++
++	ept = rpdev->ops->create_ept(rpdev, cb, priv, chinfo);
++	if (!ept)
++		return NULL;
++
++	/* Assign the new endpoint as default endpoint */
++	rpdev->ept = ept;
++	rpdev->src = ept->addr;
++
++	return ept;
++}
++EXPORT_SYMBOL(rpmsg_create_default_ept);
++
+ /**
+  * rpmsg_destroy_ept() - destroy an existing rpmsg endpoint
+  * @ept: endpoing to destroy
+diff --git a/drivers/rpmsg/rpmsg_internal.h b/drivers/rpmsg/rpmsg_internal.h
+index 3fc83cd50..d6056f09b 100644
+--- a/drivers/rpmsg/rpmsg_internal.h
++++ b/drivers/rpmsg/rpmsg_internal.h
+@@ -20,6 +20,8 @@
+ 
+ /**
+  * struct rpmsg_device_ops - indirection table for the rpmsg_device operations
++ * @create_channel:	create backend-specific channel, optional
++ * @release_channel:	release backend-specific channel, optional
+  * @create_ept:		create backend-specific endpoint, required
+  * @announce_create:	announce presence of new channel, optional
+  * @announce_destroy:	announce destruction of channel, optional
+@@ -29,6 +31,10 @@
+  * advertise new channels implicitly by creating the endpoints.
+  */
+ struct rpmsg_device_ops {
++	struct rpmsg_device *(*create_channel)(struct rpmsg_device *rpdev,
++					       struct rpmsg_channel_info *chinfo);
++	int (*release_channel)(struct rpmsg_device *rpdev,
++			       struct rpmsg_channel_info *chinfo);
+ 	struct rpmsg_endpoint *(*create_ept)(struct rpmsg_device *rpdev,
+ 					    rpmsg_rx_cb_t cb, void *priv,
+ 					    struct rpmsg_channel_info chinfo);
+@@ -68,24 +74,24 @@ struct rpmsg_endpoint_ops {
+ 			     poll_table *wait);
+ };
+ 
+-int rpmsg_register_device(struct rpmsg_device *rpdev);
+-int rpmsg_unregister_device(struct device *parent,
+-			    struct rpmsg_channel_info *chinfo);
+-
+ struct device *rpmsg_find_device(struct device *parent,
+ 				 struct rpmsg_channel_info *chinfo);
+ 
++struct rpmsg_device *rpmsg_create_channel(struct rpmsg_device *rpdev,
++					  struct rpmsg_channel_info *chinfo);
++int rpmsg_release_channel(struct rpmsg_device *rpdev,
++			  struct rpmsg_channel_info *chinfo);
+ /**
+- * rpmsg_chrdev_register_device() - register chrdev device based on rpdev
++ * rpmsg_ctrldev_register_device() - register a char device for control based on rpdev
+  * @rpdev:	prepared rpdev to be used for creating endpoints
+  *
+  * This function wraps rpmsg_register_device() preparing the rpdev for use as
+  * basis for the rpmsg chrdev.
+  */
+-static inline int rpmsg_chrdev_register_device(struct rpmsg_device *rpdev)
++static inline int rpmsg_ctrldev_register_device(struct rpmsg_device *rpdev)
+ {
+-	strcpy(rpdev->id.name, "rpmsg_chrdev");
+-	rpdev->driver_override = "rpmsg_chrdev";
++	strcpy(rpdev->id.name, "rpmsg_ctrl");
++	rpdev->driver_override = "rpmsg_ctrl";
+ 
+ 	return rpmsg_register_device(rpdev);
+ }
+diff --git a/drivers/rpmsg/rpmsg_ns.c b/drivers/rpmsg/rpmsg_ns.c
+new file mode 100644
+index 000000000..762ff1ae2
+--- /dev/null
++++ b/drivers/rpmsg/rpmsg_ns.c
+@@ -0,0 +1,126 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) STMicroelectronics 2020 - All Rights Reserved
++ */
++#include <linux/device.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/rpmsg.h>
++#include <linux/rpmsg/ns.h>
++#include <linux/slab.h>
++
++#include "rpmsg_internal.h"
++
++/**
++ * rpmsg_ns_register_device() - register name service device based on rpdev
++ * @rpdev: prepared rpdev to be used for creating endpoints
++ *
++ * This function wraps rpmsg_register_device() preparing the rpdev for use as
++ * basis for the rpmsg name service device.
++ */
++int rpmsg_ns_register_device(struct rpmsg_device *rpdev)
++{
++	strcpy(rpdev->id.name, "rpmsg_ns");
++	rpdev->driver_override = "rpmsg_ns";
++	rpdev->src = RPMSG_NS_ADDR;
++	rpdev->dst = RPMSG_NS_ADDR;
++
++	return rpmsg_register_device(rpdev);
++}
++EXPORT_SYMBOL(rpmsg_ns_register_device);
++
++/* invoked when a name service announcement arrives */
++static int rpmsg_ns_cb(struct rpmsg_device *rpdev, void *data, int len,
++		       void *priv, u32 src)
++{
++	struct rpmsg_ns_msg *msg = data;
++	struct rpmsg_device *newch;
++	struct rpmsg_channel_info chinfo;
++	struct device *dev = rpdev->dev.parent;
++	int ret;
++
++#if defined(CONFIG_DYNAMIC_DEBUG)
++	dynamic_hex_dump("NS announcement: ", DUMP_PREFIX_NONE, 16, 1,
++			 data, len, true);
++#endif
++
++	if (len != sizeof(*msg)) {
++		dev_err(dev, "malformed ns msg (%d)\n", len);
++		return -EINVAL;
++	}
++
++	/* don't trust the remote processor for null terminating the name */
++	msg->name[RPMSG_NAME_SIZE - 1] = '\0';
++
++	strncpy(chinfo.name, msg->name, sizeof(chinfo.name));
++	chinfo.src = RPMSG_ADDR_ANY;
++	chinfo.dst = rpmsg32_to_cpu(rpdev, msg->addr);
++
++	dev_info(dev, "%sing channel %s addr 0x%x\n",
++		 rpmsg32_to_cpu(rpdev, msg->flags) & RPMSG_NS_DESTROY ?
++		 "destroy" : "creat", msg->name, chinfo.dst);
++
++	if (rpmsg32_to_cpu(rpdev, msg->flags) & RPMSG_NS_DESTROY) {
++		ret = rpmsg_release_channel(rpdev, &chinfo);
++		if (ret)
++			dev_err(dev, "rpmsg_destroy_channel failed: %d\n", ret);
++	} else {
++		newch = rpmsg_create_channel(rpdev, &chinfo);
++		if (!newch)
++			dev_err(dev, "rpmsg_create_channel failed\n");
++	}
++
++	return 0;
++}
++
++static int rpmsg_ns_probe(struct rpmsg_device *rpdev)
++{
++	struct rpmsg_endpoint *ns_ept;
++	struct rpmsg_channel_info ns_chinfo = {
++		.src = RPMSG_NS_ADDR,
++		.dst = RPMSG_NS_ADDR,
++		.name = "name_service",
++	};
++
++	/*
++	 * Create the NS announcement service endpoint associated to the RPMsg
++	 * device. The endpoint will be automatically destroyed when the RPMsg
++	 * device will be deleted.
++	 */
++	ns_ept = rpmsg_create_ept(rpdev, rpmsg_ns_cb, NULL, ns_chinfo);
++	if (!ns_ept) {
++		dev_err(&rpdev->dev, "failed to create the ns ept\n");
++		return -ENOMEM;
++	}
++	rpdev->ept = ns_ept;
++
++	return 0;
++}
++
++static struct rpmsg_driver rpmsg_ns_driver = {
++	.drv.name = KBUILD_MODNAME,
++	.probe = rpmsg_ns_probe,
++};
++
++static int rpmsg_ns_init(void)
++{
++	int ret;
++
++	ret = register_rpmsg_driver(&rpmsg_ns_driver);
++	if (ret < 0)
++		pr_err("%s: Failed to register rpmsg driver\n", __func__);
++
++	return ret;
++}
++postcore_initcall(rpmsg_ns_init);
++
++static void rpmsg_ns_exit(void)
++{
++	unregister_rpmsg_driver(&rpmsg_ns_driver);
++}
++module_exit(rpmsg_ns_exit);
++
++MODULE_DESCRIPTION("Name service announcement rpmsg driver");
++MODULE_AUTHOR("Arnaud Pouliquen <arnaud.pouliquen@st.com>");
++MODULE_ALIAS("rpmsg:" KBUILD_MODNAME);
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/rpmsg/virtio_rpmsg_bus.c b/drivers/rpmsg/virtio_rpmsg_bus.c
+index 7d7ed4e5c..e42234a3e 100644
+--- a/drivers/rpmsg/virtio_rpmsg_bus.c
++++ b/drivers/rpmsg/virtio_rpmsg_bus.c
+@@ -19,11 +19,12 @@
+ #include <linux/mutex.h>
+ #include <linux/of_device.h>
+ #include <linux/rpmsg.h>
++#include <linux/rpmsg/byteorder.h>
++#include <linux/rpmsg/ns.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/sched.h>
+ #include <linux/virtio.h>
+-#include <linux/virtio_byteorder.h>
+ #include <linux/virtio_ids.h>
+ #include <linux/virtio_config.h>
+ #include <linux/wait.h>
+@@ -48,7 +49,6 @@
+  * @endpoints_lock: lock of the endpoints set
+  * @sendq:	wait queue of sending contexts waiting for a tx buffers
+  * @sleepers:	number of senders that are waiting for a tx buffer
+- * @ns_ept:	the bus's name service endpoint
+  *
+  * This structure stores the rpmsg state of a given virtio remote processor
+  * device (there might be several virtio proc devices for each physical
+@@ -67,7 +67,6 @@ struct virtproc_info {
+ 	struct mutex endpoints_lock;
+ 	wait_queue_head_t sendq;
+ 	atomic_t sleepers;
+-	struct rpmsg_endpoint *ns_ept;
+ };
+ 
+ /* The feature bitmap for virtio rpmsg */
+@@ -85,42 +84,14 @@ struct virtproc_info {
+  * Every message sent(/received) on the rpmsg bus begins with this header.
+  */
+ struct rpmsg_hdr {
+-	__virtio32 src;
+-	__virtio32 dst;
+-	__virtio32 reserved;
+-	__virtio16 len;
+-	__virtio16 flags;
++	__rpmsg32 src;
++	__rpmsg32 dst;
++	__rpmsg32 reserved;
++	__rpmsg16 len;
++	__rpmsg16 flags;
+ 	u8 data[];
+ } __packed;
+ 
+-/**
+- * struct rpmsg_ns_msg - dynamic name service announcement message
+- * @name: name of remote service that is published
+- * @addr: address of remote service that is published
+- * @flags: indicates whether service is created or destroyed
+- *
+- * This message is sent across to publish a new service, or announce
+- * about its removal. When we receive these messages, an appropriate
+- * rpmsg channel (i.e device) is created/destroyed. In turn, the ->probe()
+- * or ->remove() handler of the appropriate rpmsg driver will be invoked
+- * (if/as-soon-as one is registered).
+- */
+-struct rpmsg_ns_msg {
+-	char name[RPMSG_NAME_SIZE];
+-	__virtio32 addr;
+-	__virtio32 flags;
+-} __packed;
+-
+-/**
+- * enum rpmsg_ns_flags - dynamic name service announcement flags
+- *
+- * @RPMSG_NS_CREATE: a new remote service was just created
+- * @RPMSG_NS_DESTROY: a known remote service was just destroyed
+- */
+-enum rpmsg_ns_flags {
+-	RPMSG_NS_CREATE		= 0,
+-	RPMSG_NS_DESTROY	= 1,
+-};
+ 
+ /**
+  * struct virtio_rpmsg_channel - rpmsg channel descriptor
+@@ -167,9 +138,6 @@ struct virtio_rpmsg_channel {
+  */
+ #define RPMSG_RESERVED_ADDRESSES	(1024)
+ 
+-/* Address 53 is reserved for advertising remote services */
+-#define RPMSG_NS_ADDR			(53)
+-
+ static void virtio_rpmsg_destroy_ept(struct rpmsg_endpoint *ept);
+ static int virtio_rpmsg_send(struct rpmsg_endpoint *ept, void *data, int len);
+ static int virtio_rpmsg_sendto(struct rpmsg_endpoint *ept, void *data, int len,
+@@ -181,6 +149,8 @@ static int virtio_rpmsg_trysendto(struct rpmsg_endpoint *ept, void *data,
+ 				  int len, u32 dst);
+ static int virtio_rpmsg_trysend_offchannel(struct rpmsg_endpoint *ept, u32 src,
+ 					   u32 dst, void *data, int len);
++static struct rpmsg_device *__rpmsg_create_channel(struct virtproc_info *vrp,
++						   struct rpmsg_channel_info *chinfo);
+ 
+ static const struct rpmsg_endpoint_ops virtio_endpoint_ops = {
+ 	.destroy_ept = virtio_rpmsg_destroy_ept,
+@@ -285,6 +255,24 @@ static struct rpmsg_endpoint *__rpmsg_create_ept(struct virtproc_info *vrp,
+ 	return NULL;
+ }
+ 
++static struct rpmsg_device *virtio_rpmsg_create_channel(struct rpmsg_device *rpdev,
++							struct rpmsg_channel_info *chinfo)
++{
++	struct virtio_rpmsg_channel *vch = to_virtio_rpmsg_channel(rpdev);
++	struct virtproc_info *vrp = vch->vrp;
++
++	return __rpmsg_create_channel(vrp, chinfo);
++}
++
++static int virtio_rpmsg_release_channel(struct rpmsg_device *rpdev,
++					struct rpmsg_channel_info *chinfo)
++{
++	struct virtio_rpmsg_channel *vch = to_virtio_rpmsg_channel(rpdev);
++	struct virtproc_info *vrp = vch->vrp;
++
++	return rpmsg_unregister_device(&vrp->vdev->dev, chinfo);
++}
++
+ static struct rpmsg_endpoint *virtio_rpmsg_create_ept(struct rpmsg_device *rpdev,
+ 						      rpmsg_rx_cb_t cb,
+ 						      void *priv,
+@@ -341,8 +329,8 @@ static int virtio_rpmsg_announce_create(struct rpmsg_device *rpdev)
+ 		struct rpmsg_ns_msg nsm;
+ 
+ 		strncpy(nsm.name, rpdev->id.name, RPMSG_NAME_SIZE);
+-		nsm.addr = cpu_to_virtio32(vrp->vdev, rpdev->ept->addr);
+-		nsm.flags = cpu_to_virtio32(vrp->vdev, RPMSG_NS_CREATE);
++		nsm.addr = cpu_to_rpmsg32(rpdev, rpdev->ept->addr);
++		nsm.flags = cpu_to_rpmsg32(rpdev, RPMSG_NS_CREATE);
+ 
+ 		err = rpmsg_sendto(rpdev->ept, &nsm, sizeof(nsm), RPMSG_NS_ADDR);
+ 		if (err)
+@@ -365,8 +353,8 @@ static int virtio_rpmsg_announce_destroy(struct rpmsg_device *rpdev)
+ 		struct rpmsg_ns_msg nsm;
+ 
+ 		strncpy(nsm.name, rpdev->id.name, RPMSG_NAME_SIZE);
+-		nsm.addr = cpu_to_virtio32(vrp->vdev, rpdev->ept->addr);
+-		nsm.flags = cpu_to_virtio32(vrp->vdev, RPMSG_NS_DESTROY);
++		nsm.addr = cpu_to_rpmsg32(rpdev, rpdev->ept->addr);
++		nsm.flags = cpu_to_rpmsg32(rpdev, RPMSG_NS_DESTROY);
+ 
+ 		err = rpmsg_sendto(rpdev->ept, &nsm, sizeof(nsm), RPMSG_NS_ADDR);
+ 		if (err)
+@@ -377,6 +365,8 @@ static int virtio_rpmsg_announce_destroy(struct rpmsg_device *rpdev)
+ }
+ 
+ static const struct rpmsg_device_ops virtio_rpmsg_ops = {
++	.create_channel = virtio_rpmsg_create_channel,
++	.release_channel = virtio_rpmsg_release_channel,
+ 	.create_ept = virtio_rpmsg_create_ept,
+ 	.announce_create = virtio_rpmsg_announce_create,
+ 	.announce_destroy = virtio_rpmsg_announce_destroy,
+@@ -395,8 +385,8 @@ static void virtio_rpmsg_release_device(struct device *dev)
+  * this function will be used to create both static and dynamic
+  * channels.
+  */
+-static struct rpmsg_device *rpmsg_create_channel(struct virtproc_info *vrp,
+-						 struct rpmsg_channel_info *chinfo)
++static struct rpmsg_device *__rpmsg_create_channel(struct virtproc_info *vrp,
++						   struct rpmsg_channel_info *chinfo)
+ {
+ 	struct virtio_rpmsg_channel *vch;
+ 	struct rpmsg_device *rpdev;
+@@ -425,6 +415,7 @@ static struct rpmsg_device *rpmsg_create_channel(struct virtproc_info *vrp,
+ 	rpdev->src = chinfo->src;
+ 	rpdev->dst = chinfo->dst;
+ 	rpdev->ops = &virtio_rpmsg_ops;
++	rpdev->little_endian = virtio_is_little_endian(vrp->vdev);
+ 
+ 	/*
+ 	 * rpmsg server channels has predefined local address (for now),
+@@ -618,10 +609,10 @@ static int rpmsg_send_offchannel_raw(struct rpmsg_device *rpdev,
+ 		}
+ 	}
+ 
+-	msg->len = cpu_to_virtio16(vrp->vdev, len);
++	msg->len = cpu_to_rpmsg16(rpdev, len);
+ 	msg->flags = 0;
+-	msg->src = cpu_to_virtio32(vrp->vdev, src);
+-	msg->dst = cpu_to_virtio32(vrp->vdev, dst);
++	msg->src = cpu_to_rpmsg32(rpdev, src);
++	msg->dst = cpu_to_rpmsg32(rpdev, dst);
+ 	msg->reserved = 0;
+ 	memcpy(msg->data, data, len);
+ 
+@@ -710,14 +701,15 @@ static int rpmsg_recv_single(struct virtproc_info *vrp, struct device *dev,
+ {
+ 	struct rpmsg_endpoint *ept;
+ 	struct scatterlist sg;
+-	unsigned int msg_len = virtio16_to_cpu(vrp->vdev, msg->len);
++	bool little_endian = virtio_is_little_endian(vrp->vdev);
++	unsigned int msg_len = __rpmsg16_to_cpu(little_endian, msg->len);
+ 	int err;
+ 
+ 	dev_dbg(dev, "From: 0x%x, To: 0x%x, Len: %d, Flags: %d, Reserved: %d\n",
+-		virtio32_to_cpu(vrp->vdev, msg->src),
+-		virtio32_to_cpu(vrp->vdev, msg->dst), msg_len,
+-		virtio16_to_cpu(vrp->vdev, msg->flags),
+-		virtio32_to_cpu(vrp->vdev, msg->reserved));
++		__rpmsg32_to_cpu(little_endian, msg->src),
++		__rpmsg32_to_cpu(little_endian, msg->dst), msg_len,
++		__rpmsg16_to_cpu(little_endian, msg->flags),
++		__rpmsg32_to_cpu(little_endian, msg->reserved));
+ #if defined(CONFIG_DYNAMIC_DEBUG)
+ 	dynamic_hex_dump("rpmsg_virtio RX: ", DUMP_PREFIX_NONE, 16, 1,
+ 			 msg, sizeof(*msg) + msg_len, true);
+@@ -736,7 +728,7 @@ static int rpmsg_recv_single(struct virtproc_info *vrp, struct device *dev,
+ 	/* use the dst addr to fetch the callback of the appropriate user */
+ 	mutex_lock(&vrp->endpoints_lock);
+ 
+-	ept = idr_find(&vrp->endpoints, virtio32_to_cpu(vrp->vdev, msg->dst));
++	ept = idr_find(&vrp->endpoints, __rpmsg32_to_cpu(little_endian, msg->dst));
+ 
+ 	/* let's make sure no one deallocates ept while we use it */
+ 	if (ept)
+@@ -750,7 +742,7 @@ static int rpmsg_recv_single(struct virtproc_info *vrp, struct device *dev,
+ 
+ 		if (ept->cb)
+ 			ept->cb(ept->rpdev, msg->data, msg_len, ept->priv,
+-				virtio32_to_cpu(vrp->vdev, msg->src));
++				__rpmsg32_to_cpu(little_endian, msg->src));
+ 
+ 		mutex_unlock(&ept->cb_lock);
+ 
+@@ -821,60 +813,47 @@ static void rpmsg_xmit_done(struct virtqueue *svq)
+ 	wake_up_interruptible(&vrp->sendq);
+ }
+ 
+-/* invoked when a name service announcement arrives */
+-static int rpmsg_ns_cb(struct rpmsg_device *rpdev, void *data, int len,
+-		       void *priv, u32 src)
++/*
++ * Called to expose to user a /dev/rpmsg_ctrlX interface allowing to
++ * create endpoint-to-endpoint communication without associated RPMsg channel.
++ * The endpoints are rattached to the ctrldev RPMsg device.
++ */
++static struct rpmsg_device *rpmsg_virtio_add_ctrl_dev(struct virtio_device *vdev)
+ {
+-	struct rpmsg_ns_msg *msg = data;
+-	struct rpmsg_device *newch;
+-	struct rpmsg_channel_info chinfo;
+-	struct virtproc_info *vrp = priv;
+-	struct device *dev = &vrp->vdev->dev;
+-	int ret;
+-
+-#if defined(CONFIG_DYNAMIC_DEBUG)
+-	dynamic_hex_dump("NS announcement: ", DUMP_PREFIX_NONE, 16, 1,
+-			 data, len, true);
+-#endif
+-
+-	if (len != sizeof(*msg)) {
+-		dev_err(dev, "malformed ns msg (%d)\n", len);
+-		return -EINVAL;
+-	}
++	struct virtproc_info *vrp = vdev->priv;
++	struct virtio_rpmsg_channel *vch;
++	struct rpmsg_device *rpdev_ctrl;
++	int err = 0;
+ 
+-	/*
+-	 * the name service ept does _not_ belong to a real rpmsg channel,
+-	 * and is handled by the rpmsg bus itself.
+-	 * for sanity reasons, make sure a valid rpdev has _not_ sneaked
+-	 * in somehow.
+-	 */
+-	if (rpdev) {
+-		dev_err(dev, "anomaly: ns ept has an rpdev handle\n");
+-		return -EINVAL;
+-	}
++	vch = kzalloc(sizeof(*vch), GFP_KERNEL);
++	if (!vch)
++		return ERR_PTR(-ENOMEM);
+ 
+-	/* don't trust the remote processor for null terminating the name */
+-	msg->name[RPMSG_NAME_SIZE - 1] = '\0';
++	/* Link the channel to the vrp */
++	vch->vrp = vrp;
+ 
+-	strncpy(chinfo.name, msg->name, sizeof(chinfo.name));
+-	chinfo.src = RPMSG_ADDR_ANY;
+-	chinfo.dst = virtio32_to_cpu(vrp->vdev, msg->addr);
++	/* Assign public information to the rpmsg_device */
++	rpdev_ctrl = &vch->rpdev;
++	rpdev_ctrl->ops = &virtio_rpmsg_ops;
+ 
+-	dev_info(dev, "%sing channel %s addr 0x%x\n",
+-		 virtio32_to_cpu(vrp->vdev, msg->flags) & RPMSG_NS_DESTROY ?
+-		 "destroy" : "creat", msg->name, chinfo.dst);
++	rpdev_ctrl->dev.parent = &vrp->vdev->dev;
++	rpdev_ctrl->dev.release = virtio_rpmsg_release_device;
++	rpdev_ctrl->little_endian = virtio_is_little_endian(vrp->vdev);
+ 
+-	if (virtio32_to_cpu(vrp->vdev, msg->flags) & RPMSG_NS_DESTROY) {
+-		ret = rpmsg_unregister_device(&vrp->vdev->dev, &chinfo);
+-		if (ret)
+-			dev_err(dev, "rpmsg_destroy_channel failed: %d\n", ret);
+-	} else {
+-		newch = rpmsg_create_channel(vrp, &chinfo);
+-		if (!newch)
+-			dev_err(dev, "rpmsg_create_channel failed\n");
++	err = rpmsg_ctrldev_register_device(rpdev_ctrl);
++	if (err) {
++		kfree(vch);
++		return ERR_PTR(err);
+ 	}
+ 
+-	return 0;
++	return rpdev_ctrl;
++}
++
++static void rpmsg_virtio_del_ctrl_dev(struct rpmsg_device *rpdev_ctrl)
++{
++	if (!rpdev_ctrl)
++		return;
++	kfree(to_virtio_rpmsg_channel(rpdev_ctrl));
+ }
+ 
+ static int rpmsg_probe(struct virtio_device *vdev)
+@@ -883,6 +862,8 @@ static int rpmsg_probe(struct virtio_device *vdev)
+ 	static const char * const names[] = { "input", "output" };
+ 	struct virtqueue *vqs[2];
+ 	struct virtproc_info *vrp;
++	struct virtio_rpmsg_channel *vch = NULL;
++	struct rpmsg_device *rpdev_ns, *rpdev_ctrl;
+ 	void *bufs_va;
+ 	int err = 0, i;
+ 	size_t total_buf_space;
+@@ -956,16 +937,34 @@ static int rpmsg_probe(struct virtio_device *vdev)
+ 
+ 	vdev->priv = vrp;
+ 
++	rpdev_ctrl = rpmsg_virtio_add_ctrl_dev(vdev);
++	if (IS_ERR(rpdev_ctrl)) {
++		err = PTR_ERR(rpdev_ctrl);
++		goto free_coherent;
++	}
++
+ 	/* if supported by the remote processor, enable the name service */
+ 	if (virtio_has_feature(vdev, VIRTIO_RPMSG_F_NS)) {
+-		/* a dedicated endpoint handles the name service msgs */
+-		vrp->ns_ept = __rpmsg_create_ept(vrp, NULL, rpmsg_ns_cb,
+-						vrp, RPMSG_NS_ADDR);
+-		if (!vrp->ns_ept) {
+-			dev_err(&vdev->dev, "failed to create the ns ept\n");
++		vch = kzalloc(sizeof(*vch), GFP_KERNEL);
++		if (!vch) {
+ 			err = -ENOMEM;
+-			goto free_coherent;
++			goto free_ctrldev;
+ 		}
++
++		/* Link the channel to our vrp */
++		vch->vrp = vrp;
++
++		/* Assign public information to the rpmsg_device */
++		rpdev_ns = &vch->rpdev;
++		rpdev_ns->ops = &virtio_rpmsg_ops;
++		rpdev_ns->little_endian = virtio_is_little_endian(vrp->vdev);
++
++		rpdev_ns->dev.parent = &vrp->vdev->dev;
++		rpdev_ns->dev.release = virtio_rpmsg_release_device;
++
++		err = rpmsg_ns_register_device(rpdev_ns);
++		if (err)
++			goto free_vch;
+ 	}
+ 
+ 	/*
+@@ -989,6 +988,10 @@ static int rpmsg_probe(struct virtio_device *vdev)
+ 
+ 	return 0;
+ 
++free_vch:
++	kfree(vch);
++free_ctrldev:
++	rpmsg_virtio_del_ctrl_dev(rpdev_ctrl);
+ free_coherent:
+ 	dma_free_coherent(vdev->dev.parent, total_buf_space,
+ 			  bufs_va, vrp->bufs_dma);
+@@ -1018,9 +1021,6 @@ static void rpmsg_remove(struct virtio_device *vdev)
+ 	if (ret)
+ 		dev_warn(&vdev->dev, "can't remove rpmsg device: %d\n", ret);
+ 
+-	if (vrp->ns_ept)
+-		__rpmsg_destroy_ept(vrp, vrp->ns_ept);
+-
+ 	idr_destroy(&vrp->endpoints);
+ 
+ 	vdev->config->del_vqs(vrp->vdev);
+diff --git a/drivers/rtc/rtc-imx-sc.c b/drivers/rtc/rtc-imx-sc.c
+index a5f59e6f8..f4c5e8bfc 100644
+--- a/drivers/rtc/rtc-imx-sc.c
++++ b/drivers/rtc/rtc-imx-sc.c
+@@ -23,6 +23,7 @@
+ 
+ static struct imx_sc_ipc *rtc_ipc_handle;
+ static struct rtc_device *imx_sc_rtc;
++static bool readonly; /* true if not authorised to set time */
+ 
+ struct imx_sc_msg_timer_get_rtc_time {
+ 	struct imx_sc_rpc_msg hdr;
+@@ -65,6 +66,9 @@ static int imx_sc_rtc_set_time(struct device *dev, struct rtc_time *tm)
+ {
+ 	struct arm_smccc_res res;
+ 
++	if (readonly)
++		return 0;
++
+ 	/* pack 2 time parameters into 1 register, 16 bits for each */
+ 	arm_smccc_smc(IMX_SIP_SRTC, IMX_SIP_SRTC_SET_TIME,
+ 		      ((tm->tm_year + 1900) << 16) | (tm->tm_mon + 1),
+@@ -172,11 +176,19 @@ static int imx_sc_rtc_probe(struct platform_device *pdev)
+ 
+ 	imx_scu_irq_register_notifier(&imx_sc_rtc_alarm_sc_notifier);
+ 
++	if (of_property_read_bool(pdev->dev.of_node, "read-only")) {
++		readonly = true;
++		dev_info(&pdev->dev, "not allowed to change time\n");
++	} else {
++		readonly = false;
++	}
++
+ 	return 0;
+ }
+ 
+ static const struct of_device_id imx_sc_dt_ids[] = {
+ 	{ .compatible = "fsl,imx8qxp-sc-rtc", },
++	{ .compatible = "fsl,imx8qm-sc-rtc", },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, imx_sc_dt_ids);
+diff --git a/drivers/rtc/rtc-rx8025.c b/drivers/rtc/rtc-rx8025.c
+index a24f85893..17e9612e6 100644
+--- a/drivers/rtc/rtc-rx8025.c
++++ b/drivers/rtc/rtc-rx8025.c
+@@ -115,12 +115,12 @@ static int rx8025_check_validity(struct device *dev)
+ 	if (ctrl2 & RX8025_BIT_CTRL2_PON) {
+ 		dev_warn(dev, "power-on reset detected, date is invalid\n");
+ 		return -EINVAL;
+-	}
++	}   
+ 
+ 	if (!(ctrl2 & RX8025_BIT_CTRL2_XST)) {
+ 		dev_warn(dev, "crystal stopped, date is invalid\n");
+ 		return -EINVAL;
+-	}
++	}   
+ 
+ 	return 0;
+ }
+@@ -182,10 +182,6 @@ static int rx8025_get_time(struct device *dev, struct rtc_time *dt)
+ 	u8 date[7];
+ 	int err;
+ 
+-	err = rx8025_check_validity(dev);
+-	if (err)
+-		return err;
+-
+ 	err = rx8025_read_regs(client, RX8025_REG_SEC, 7, date);
+ 	if (err)
+ 		return err;
+@@ -201,6 +197,7 @@ static int rx8025_get_time(struct device *dev, struct rtc_time *dt)
+ 			+ (date[RX8025_REG_HOUR] & 0x20 ? 12 : 0);
+ 
+ 	dt->tm_mday = bcd2bin(date[RX8025_REG_MDAY] & 0x3f);
++	dt->tm_wday = bcd2bin(date[RX8025_REG_WDAY] & 0x7f);
+ 	dt->tm_mon = bcd2bin(date[RX8025_REG_MONTH] & 0x1f) - 1;
+ 	dt->tm_year = bcd2bin(date[RX8025_REG_YEAR]) + 100;
+ 

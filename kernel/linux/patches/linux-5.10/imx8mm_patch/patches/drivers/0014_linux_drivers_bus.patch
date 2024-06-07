@@ -1,0 +1,870 @@
+commit 459e68a33fc7b15da69caf08e1304e578c88c6cb
+Author: zhaoxc0502 <zhaoxc0502@thundersoft.com>
+Date:   Thu Jun 16 17:17:33 2022 +0800
+
+    linux_drivers_bus
+    
+    Change-Id: Ib4e19be35f96c3efd5aae827e7364cad4cc67392
+
+diff --git a/drivers/bus/fsl-mc/Kconfig b/drivers/bus/fsl-mc/Kconfig
+index c23c77c9b..cde6f408b 100644
+--- a/drivers/bus/fsl-mc/Kconfig
++++ b/drivers/bus/fsl-mc/Kconfig
+@@ -14,3 +14,10 @@ config FSL_MC_BUS
+ 	  architecture.  The fsl-mc bus driver handles discovery of
+ 	  DPAA2 objects (which are represented as Linux devices) and
+ 	  binding objects to drivers.
++
++config FSL_MC_UAPI_SUPPORT
++	bool "Management Complex (MC) userspace support"
++	depends on FSL_MC_BUS
++	help
++	  Provides userspace support for creating/destroying/configuring
++	  DPAA2 objects in the Management Complex.
+diff --git a/drivers/bus/fsl-mc/Makefile b/drivers/bus/fsl-mc/Makefile
+index 3c518c7e8..892946245 100644
+--- a/drivers/bus/fsl-mc/Makefile
++++ b/drivers/bus/fsl-mc/Makefile
+@@ -15,4 +15,8 @@ mc-bus-driver-objs := fsl-mc-bus.o \
+ 		      dprc-driver.o \
+ 		      fsl-mc-allocator.o \
+ 		      fsl-mc-msi.o \
+-		      dpmcp.o
++		      dpmcp.o \
++		      obj-api.o
++
++# MC userspace support
++obj-$(CONFIG_FSL_MC_UAPI_SUPPORT) += fsl-mc-uapi.o
+diff --git a/drivers/bus/fsl-mc/dprc-driver.c b/drivers/bus/fsl-mc/dprc-driver.c
+index 91dc01596..e3f6e41fe 100644
+--- a/drivers/bus/fsl-mc/dprc-driver.c
++++ b/drivers/bus/fsl-mc/dprc-driver.c
+@@ -237,8 +237,8 @@ static void dprc_add_new_devices(struct fsl_mc_device *mc_bus_dev,
+  * populated before they can get allocation requests from probe callbacks
+  * of the device drivers for the non-allocatable devices.
+  */
+-static int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
+-			    bool alloc_interrupts)
++int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
++		      bool alloc_interrupts)
+ {
+ 	int num_child_objects;
+ 	int dprc_get_obj_failures;
+@@ -373,6 +373,34 @@ int dprc_scan_container(struct fsl_mc_device *mc_bus_dev,
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(dprc_scan_container);
++
++static ssize_t rescan_store(struct device *dev,
++			    struct device_attribute *attr,
++			    const char *buf, size_t count)
++{
++	struct fsl_mc_device *root_mc_dev;
++	struct fsl_mc_bus *root_mc_bus;
++	unsigned long val;
++
++	if (!fsl_mc_is_root_dprc(dev))
++		return -EINVAL;
++
++	root_mc_dev = to_fsl_mc_device(dev);
++	root_mc_bus = to_fsl_mc_bus(root_mc_dev);
++
++	if (kstrtoul(buf, 0, &val) < 0)
++		return -EINVAL;
++
++	if (val) {
++		mutex_lock(&root_mc_bus->scan_mutex);
++		dprc_scan_objects(root_mc_dev, NULL);
++		mutex_unlock(&root_mc_bus->scan_mutex);
++	}
++
++	return count;
++}
++static DEVICE_ATTR_WO(rescan);
++
+ /**
+  * dprc_irq0_handler - Regular ISR for DPRC interrupt 0
+  *
+@@ -458,8 +486,9 @@ static irqreturn_t dprc_irq0_handler_thread(int irq_num, void *arg)
+ /*
+  * Disable and clear interrupt for a given DPRC object
+  */
+-static int disable_dprc_irq(struct fsl_mc_device *mc_dev)
++int disable_dprc_irq(struct fsl_mc_device *mc_dev)
+ {
++	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(mc_dev);
+ 	int error;
+ 	struct fsl_mc_io *mc_io = mc_dev->mc_io;
+ 
+@@ -496,9 +525,18 @@ static int disable_dprc_irq(struct fsl_mc_device *mc_dev)
+ 		return error;
+ 	}
+ 
++	mc_bus->irq_enabled = 0;
++
+ 	return 0;
+ }
+ 
++int get_dprc_irq_state(struct fsl_mc_device *mc_dev)
++{
++	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(mc_dev);
++
++	return mc_bus->irq_enabled;
++}
++
+ static int register_dprc_irq_handler(struct fsl_mc_device *mc_dev)
+ {
+ 	int error;
+@@ -525,8 +563,9 @@ static int register_dprc_irq_handler(struct fsl_mc_device *mc_dev)
+ 	return 0;
+ }
+ 
+-static int enable_dprc_irq(struct fsl_mc_device *mc_dev)
++int enable_dprc_irq(struct fsl_mc_device *mc_dev)
+ {
++	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(mc_dev);
+ 	int error;
+ 
+ 	/*
+@@ -554,6 +593,8 @@ static int enable_dprc_irq(struct fsl_mc_device *mc_dev)
+ 		return error;
+ 	}
+ 
++	mc_bus->irq_enabled = 1;
++
+ 	return 0;
+ }
+ 
+@@ -603,6 +644,7 @@ int dprc_setup(struct fsl_mc_device *mc_dev)
+ 	struct irq_domain *mc_msi_domain;
+ 	bool mc_io_created = false;
+ 	bool msi_domain_set = false;
++	bool uapi_created = false;
+ 	u16 major_ver, minor_ver;
+ 	size_t region_size;
+ 	int error;
+@@ -635,6 +677,12 @@ int dprc_setup(struct fsl_mc_device *mc_dev)
+ 			return error;
+ 
+ 		mc_io_created = true;
++	} else {
++		error = fsl_mc_uapi_create_device_file(mc_bus);
++		if (error < 0) {
++			return -EPROBE_DEFER;
++		}
++		uapi_created = true;
+ 	}
+ 
+ 	mc_msi_domain = fsl_mc_find_msi_domain(&mc_dev->dev);
+@@ -670,9 +718,7 @@ int dprc_setup(struct fsl_mc_device *mc_dev)
+ 		goto error_cleanup_open;
+ 	}
+ 
+-	if (major_ver < DPRC_MIN_VER_MAJOR ||
+-	    (major_ver == DPRC_MIN_VER_MAJOR &&
+-	     minor_ver < DPRC_MIN_VER_MINOR)) {
++	if (major_ver < DPRC_MIN_VER_MAJOR) {
+ 		dev_err(&mc_dev->dev,
+ 			"ERROR: DPRC version %d.%d not supported\n",
+ 			major_ver, minor_ver);
+@@ -680,6 +726,13 @@ int dprc_setup(struct fsl_mc_device *mc_dev)
+ 		goto error_cleanup_open;
+ 	}
+ 
++	error = device_create_file(&mc_dev->dev, &dev_attr_rescan);
++	if (error < 0) {
++		dev_err(&mc_dev->dev, "device_create_file() failed: %d\n",
++			error);
++		goto error_cleanup_open;
++	}
++
+ 	return 0;
+ 
+ error_cleanup_open:
+@@ -694,6 +747,9 @@ int dprc_setup(struct fsl_mc_device *mc_dev)
+ 		mc_dev->mc_io = NULL;
+ 	}
+ 
++	if (uapi_created)
++		fsl_mc_uapi_remove_device_file(mc_bus);
++
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(dprc_setup);
+@@ -765,6 +821,7 @@ static void dprc_teardown_irq(struct fsl_mc_device *mc_dev)
+ 
+ int dprc_cleanup(struct fsl_mc_device *mc_dev)
+ {
++	struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(mc_dev);
+ 	int error;
+ 
+ 	/* this function should be called only for DPRCs, it
+@@ -795,8 +852,12 @@ int dprc_cleanup(struct fsl_mc_device *mc_dev)
+ 	if (!fsl_mc_is_root_dprc(&mc_dev->dev)) {
+ 		fsl_destroy_mc_io(mc_dev->mc_io);
+ 		mc_dev->mc_io = NULL;
++	} else {
++		fsl_mc_uapi_remove_device_file(mc_bus);
+ 	}
+ 
++	device_remove_file(&mc_dev->dev, &dev_attr_rescan);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(dprc_cleanup);
+diff --git a/drivers/bus/fsl-mc/dprc.c b/drivers/bus/fsl-mc/dprc.c
+index 57b097caf..27b0a01ba 100644
+--- a/drivers/bus/fsl-mc/dprc.c
++++ b/drivers/bus/fsl-mc/dprc.c
+@@ -576,6 +576,8 @@ int dprc_get_obj_region(struct fsl_mc_io *mc_io,
+ 	rsp_params = (struct dprc_rsp_get_obj_region *)cmd.params;
+ 	region_desc->base_offset = le64_to_cpu(rsp_params->base_offset);
+ 	region_desc->size = le32_to_cpu(rsp_params->size);
++	region_desc->type = rsp_params->type;
++	region_desc->flags = le32_to_cpu(rsp_params->flags);
+ 	if (dprc_major_ver > 6 || (dprc_major_ver == 6 && dprc_minor_ver >= 3))
+ 		region_desc->base_address = le64_to_cpu(rsp_params->base_addr);
+ 	else
+diff --git a/drivers/bus/fsl-mc/fsl-mc-bus.c b/drivers/bus/fsl-mc/fsl-mc-bus.c
+index e329cdd71..b6070799a 100644
+--- a/drivers/bus/fsl-mc/fsl-mc-bus.c
++++ b/drivers/bus/fsl-mc/fsl-mc-bus.c
+@@ -207,12 +207,108 @@ static struct attribute *fsl_mc_dev_attrs[] = {
+ 
+ ATTRIBUTE_GROUPS(fsl_mc_dev);
+ 
++static int scan_fsl_mc_bus(struct device *dev, void *data)
++{
++	struct fsl_mc_device *root_mc_dev;
++	struct fsl_mc_bus *root_mc_bus;
++
++	if (!fsl_mc_is_root_dprc(dev))
++		goto exit;
++
++	root_mc_dev = to_fsl_mc_device(dev);
++	root_mc_bus = to_fsl_mc_bus(root_mc_dev);
++	mutex_lock(&root_mc_bus->scan_mutex);
++	dprc_scan_objects(root_mc_dev, NULL);
++	mutex_unlock(&root_mc_bus->scan_mutex);
++
++exit:
++	return 0;
++}
++
++static ssize_t rescan_store(struct bus_type *bus,
++			    const char *buf, size_t count)
++{
++	unsigned long val;
++
++	if (kstrtoul(buf, 0, &val) < 0)
++		return -EINVAL;
++
++	if (val)
++		bus_for_each_dev(bus, NULL, NULL, scan_fsl_mc_bus);
++
++	return count;
++}
++static BUS_ATTR_WO(rescan);
++
++static int fsl_mc_bus_set_autorescan(struct device *dev, void *data)
++{
++	struct fsl_mc_device *root_mc_dev;
++	unsigned long val;
++	char *buf = data;
++
++	if (!fsl_mc_is_root_dprc(dev))
++		goto exit;
++
++	root_mc_dev = to_fsl_mc_device(dev);
++
++	if (kstrtoul(buf, 0, &val) < 0)
++		return -EINVAL;
++
++	if (val)
++		enable_dprc_irq(root_mc_dev);
++	else
++		disable_dprc_irq(root_mc_dev);
++
++exit:
++	return 0;
++}
++
++static int fsl_mc_bus_get_autorescan(struct device *dev, void *data)
++{
++	struct fsl_mc_device *root_mc_dev;
++	char *buf = data;
++
++	if (!fsl_mc_is_root_dprc(dev))
++		goto exit;
++
++	root_mc_dev = to_fsl_mc_device(dev);
++
++	sprintf(buf, "%d\n", get_dprc_irq_state(root_mc_dev));
++exit:
++	return 0;
++}
++
++static ssize_t autorescan_store(struct bus_type *bus,
++				const char *buf, size_t count)
++{
++	bus_for_each_dev(bus, NULL, (void *)buf, fsl_mc_bus_set_autorescan);
++
++	return count;
++}
++
++static ssize_t autorescan_show(struct bus_type *bus, char *buf)
++{
++	bus_for_each_dev(bus, NULL, (void *)buf, fsl_mc_bus_get_autorescan);
++	return strlen(buf);
++}
++
++static BUS_ATTR_RW(autorescan);
++
++static struct attribute *fsl_mc_bus_attrs[] = {
++	&bus_attr_rescan.attr,
++	&bus_attr_autorescan.attr,
++	NULL,
++};
++
++ATTRIBUTE_GROUPS(fsl_mc_bus);
++
+ struct bus_type fsl_mc_bus_type = {
+ 	.name = "fsl-mc",
+ 	.match = fsl_mc_bus_match,
+ 	.uevent = fsl_mc_bus_uevent,
+ 	.dma_configure  = fsl_mc_dma_configure,
+ 	.dev_groups = fsl_mc_dev_groups,
++	.bus_groups = fsl_mc_bus_groups,
+ };
+ EXPORT_SYMBOL_GPL(fsl_mc_bus_type);
+ 
+@@ -291,6 +387,11 @@ struct device_type fsl_mc_bus_dpdmai_type = {
+ };
+ EXPORT_SYMBOL_GPL(fsl_mc_bus_dpdmai_type);
+ 
++struct device_type fsl_mc_bus_dpdbg_type = {
++	.name = "fsl_mc_bus_dpdbg"
++};
++EXPORT_SYMBOL_GPL(fsl_mc_bus_dpdbg_type);
++
+ static struct device_type *fsl_mc_get_device_type(const char *type)
+ {
+ 	static const struct {
+@@ -312,6 +413,7 @@ static struct device_type *fsl_mc_get_device_type(const char *type)
+ 		{ &fsl_mc_bus_dpaiop_type, "dpaiop" },
+ 		{ &fsl_mc_bus_dpci_type, "dpci" },
+ 		{ &fsl_mc_bus_dpdmai_type, "dpdmai" },
++		{ &fsl_mc_bus_dpdbg_type, "dpdbg" },
+ 		{ NULL, NULL }
+ 	};
+ 	int i;
+@@ -855,6 +957,32 @@ struct fsl_mc_device *fsl_mc_get_endpoint(struct fsl_mc_device *mc_dev)
+ 	endpoint_desc.id = endpoint2.id;
+ 	endpoint = fsl_mc_device_lookup(&endpoint_desc, mc_bus_dev);
+ 
++	/*
++	 * We know that the device has an endpoint because we verified by
++	 * interrogating the firmware. This is the case when the device was not
++	 * yet discovered by the fsl-mc bus, thus the lookup returned NULL.
++	 * Force a rescan of the devices in this container and retry the lookup.
++	 */
++	if (!endpoint) {
++		struct fsl_mc_bus *mc_bus = to_fsl_mc_bus(mc_bus_dev);
++
++		mutex_lock(&mc_bus->scan_mutex);
++		err = dprc_scan_objects(mc_bus_dev, true);
++		mutex_unlock(&mc_bus->scan_mutex);
++
++		if (err < 0)
++			return ERR_PTR(err);
++	}
++
++	endpoint = fsl_mc_device_lookup(&endpoint_desc, mc_bus_dev);
++	/*
++	 * This means that the endpoint might reside in a different isolation
++	 * context (DPRC/container). Not much to do, so return a permssion
++	 * error.
++	 */
++	if (!endpoint)
++		return ERR_PTR(-EPERM);
++
+ 	return endpoint;
+ }
+ EXPORT_SYMBOL_GPL(fsl_mc_get_endpoint);
+diff --git a/drivers/bus/fsl-mc/fsl-mc-private.h b/drivers/bus/fsl-mc/fsl-mc-private.h
+index 85ca5fdee..315524f0d 100644
+--- a/drivers/bus/fsl-mc/fsl-mc-private.h
++++ b/drivers/bus/fsl-mc/fsl-mc-private.h
+@@ -10,6 +10,8 @@
+ 
+ #include <linux/fsl/mc.h>
+ #include <linux/mutex.h>
++#include <linux/ioctl.h>
++#include <linux/miscdevice.h>
+ 
+ /*
+  * Data Path Management Complex (DPMNG) General API
+@@ -46,7 +48,6 @@ struct dpmng_rsp_get_version {
+ 
+ /* DPMCP command IDs */
+ #define DPMCP_CMDID_CLOSE		DPMCP_CMD(0x800)
+-#define DPMCP_CMDID_OPEN		DPMCP_CMD(0x80b)
+ #define DPMCP_CMDID_RESET		DPMCP_CMD(0x005)
+ 
+ struct dpmcp_cmd_open {
+@@ -89,7 +90,6 @@ int dpmcp_reset(struct fsl_mc_io *mc_io,
+ 
+ /* DPRC command IDs */
+ #define DPRC_CMDID_CLOSE                        DPRC_CMD(0x800)
+-#define DPRC_CMDID_OPEN                         DPRC_CMD(0x805)
+ #define DPRC_CMDID_GET_API_VERSION              DPRC_CMD(0xa05)
+ 
+ #define DPRC_CMDID_GET_ATTR                     DPRC_CMD(0x004)
+@@ -211,12 +211,13 @@ struct dprc_cmd_get_obj_region {
+ 
+ struct dprc_rsp_get_obj_region {
+ 	/* response word 0 */
+-	__le64 pad;
++	__le64 pad0;
+ 	/* response word 1 */
+ 	__le64 base_offset;
+ 	/* response word 2 */
+ 	__le32 size;
+-	__le32 pad2;
++	u8 type;
++	u8 pad2[3];
+ 	/* response word 3 */
+ 	__le32 flags;
+ 	__le32 pad3;
+@@ -450,7 +451,6 @@ int dprc_get_connection(struct fsl_mc_io *mc_io,
+ 
+ /* Command IDs */
+ #define DPBP_CMDID_CLOSE		DPBP_CMD(0x800)
+-#define DPBP_CMDID_OPEN			DPBP_CMD(0x804)
+ 
+ #define DPBP_CMDID_ENABLE		DPBP_CMD(0x002)
+ #define DPBP_CMDID_DISABLE		DPBP_CMD(0x003)
+@@ -489,7 +489,6 @@ struct dpbp_rsp_get_attributes {
+ 
+ /* Command IDs */
+ #define DPCON_CMDID_CLOSE			DPCON_CMD(0x800)
+-#define DPCON_CMDID_OPEN			DPCON_CMD(0x808)
+ 
+ #define DPCON_CMDID_ENABLE			DPCON_CMD(0x002)
+ #define DPCON_CMDID_DISABLE			DPCON_CMD(0x003)
+@@ -521,6 +520,38 @@ struct dpcon_cmd_set_notification {
+ 	__le64 user_ctx;
+ };
+ 
++/* generic command versioning */
++#define OBJ_CMD_BASE_VERSION		1
++#define OBJ_CMD_ID_OFFSET		4
++#define OBJ_CMD_MODULE_OFFSET           8
++
++#define OBJ_CMD(id)	(((id) << OBJ_CMD_ID_OFFSET) | OBJ_CMD_BASE_VERSION)
++
++/* open command codes */
++#define DPRTC_CMDID_OPEN		OBJ_CMD(0x810)
++#define DPNI_CMDID_OPEN		OBJ_CMD(0x801)
++#define DPSW_CMDID_OPEN		OBJ_CMD(0x802)
++#define DPIO_CMDID_OPEN		OBJ_CMD(0x803)
++#define DPBP_CMDID_OPEN		OBJ_CMD(0x804)
++#define DPRC_CMDID_OPEN		OBJ_CMD(0x805)
++#define DPDMUX_CMDID_OPEN		OBJ_CMD(0x806)
++#define DPCI_CMDID_OPEN		OBJ_CMD(0x807)
++#define DPCON_CMDID_OPEN		OBJ_CMD(0x808)
++#define DPSECI_CMDID_OPEN		OBJ_CMD(0x809)
++#define DPAIOP_CMDID_OPEN		OBJ_CMD(0x80a)
++#define DPMCP_CMDID_OPEN		OBJ_CMD(0x80b)
++#define DPMAC_CMDID_OPEN		OBJ_CMD(0x80c)
++#define DPDCEI_CMDID_OPEN		OBJ_CMD(0x80d)
++#define DPDMAI_CMDID_OPEN		OBJ_CMD(0x80e)
++#define DPDBG_CMDID_OPEN		OBJ_CMD(0x80f)
++
++/* Generic object command IDs */
++#define OBJ_CMDID_CLOSE		OBJ_CMD(0x800)
++#define OBJ_CMDID_RESET		OBJ_CMD(0x005)
++
++struct obj_cmd_open {
++	__le32 obj_id;
++};
+ 
+ /**
+  * struct fsl_mc_resource_pool - Pool of MC resources of a given
+@@ -541,6 +572,22 @@ struct fsl_mc_resource_pool {
+ 	struct fsl_mc_bus *mc_bus;
+ };
+ 
++/**
++ * struct fsl_mc_uapi - information associated with a device file
++ * @misc: struct miscdevice linked to the root dprc
++ * @device: newly created device in /dev
++ * @mutex: mutex lock to serialize the open/release operations
++ * @local_instance_in_use: local MC I/O instance in use or not
++ * @static_mc_io: pointer to the static MC I/O object
++ */
++struct fsl_mc_uapi {
++	struct miscdevice misc;
++	struct device *device;
++	struct mutex mutex; /* serialize open/release operations */
++	u32 local_instance_in_use;
++	struct fsl_mc_io *static_mc_io;
++};
++
+ /**
+  * struct fsl_mc_bus - logical bus that corresponds to a physical DPRC
+  * @mc_dev: fsl-mc device for the bus device itself.
+@@ -550,6 +597,7 @@ struct fsl_mc_resource_pool {
+  * @irq_resources: Pointer to array of IRQ objects for the IRQ pool
+  * @scan_mutex: Serializes bus scanning
+  * @dprc_attr: DPRC attributes
++ * @uapi_misc: struct that abstracts the interaction with userspace
+  */
+ struct fsl_mc_bus {
+ 	struct fsl_mc_device mc_dev;
+@@ -557,6 +605,8 @@ struct fsl_mc_bus {
+ 	struct fsl_mc_device_irq *irq_resources;
+ 	struct mutex scan_mutex;    /* serializes bus scanning */
+ 	struct dprc_attributes dprc_attr;
++	struct fsl_mc_uapi uapi_misc;
++	int irq_enabled;
+ };
+ 
+ #define to_fsl_mc_bus(_mc_dev) \
+@@ -573,6 +623,9 @@ int __init dprc_driver_init(void);
+ 
+ void dprc_driver_exit(void);
+ 
++int dprc_scan_objects(struct fsl_mc_device *mc_bus_dev,
++		      bool alloc_interrupts);
++
+ int __init fsl_mc_allocator_driver_init(void);
+ 
+ void fsl_mc_allocator_driver_exit(void);
+@@ -611,4 +664,27 @@ void fsl_mc_get_root_dprc(struct device *dev,
+ struct fsl_mc_device *fsl_mc_device_lookup(struct fsl_mc_obj_desc *obj_desc,
+ 					   struct fsl_mc_device *mc_bus_dev);
+ 
++#ifdef CONFIG_FSL_MC_UAPI_SUPPORT
++
++int fsl_mc_uapi_create_device_file(struct fsl_mc_bus *mc_bus);
++
++void fsl_mc_uapi_remove_device_file(struct fsl_mc_bus *mc_bus);
++
++#else
++
++static inline int fsl_mc_uapi_create_device_file(struct fsl_mc_bus *mc_bus)
++{
++	return 0;
++}
++
++static inline void fsl_mc_uapi_remove_device_file(struct fsl_mc_bus *mc_bus)
++{
++}
++
++#endif
++
++int disable_dprc_irq(struct fsl_mc_device *mc_dev);
++int enable_dprc_irq(struct fsl_mc_device *mc_dev);
++int get_dprc_irq_state(struct fsl_mc_device *mc_dev);
++
+ #endif /* _FSL_MC_PRIVATE_H_ */
+diff --git a/drivers/bus/fsl-mc/fsl-mc-uapi.c b/drivers/bus/fsl-mc/fsl-mc-uapi.c
+new file mode 100644
+index 000000000..b5bd5a249
+--- /dev/null
++++ b/drivers/bus/fsl-mc/fsl-mc-uapi.c
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Management Complex (MC) userspace support
++ *
++ * Copyright 2018 NXP
++ *
++ */
++
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/uaccess.h>
++#include <linux/miscdevice.h>
++
++#include "fsl-mc-private.h"
++
++struct uapi_priv_data {
++	struct fsl_mc_uapi *uapi;
++	struct fsl_mc_io *mc_io;
++};
++
++static int fsl_mc_uapi_send_command(unsigned long arg,
++				    struct fsl_mc_io *mc_io)
++{
++	struct fsl_mc_command mc_cmd;
++	int error;
++
++	error = copy_from_user(&mc_cmd, (void __user *)arg, sizeof(mc_cmd));
++	if (error)
++		return -EFAULT;
++
++	error = mc_send_command(mc_io, &mc_cmd);
++	if (error)
++		return error;
++
++	error = copy_to_user((void __user *)arg, &mc_cmd, sizeof(mc_cmd));
++	if (error)
++		return -EFAULT;
++
++	return 0;
++}
++
++static int fsl_mc_uapi_dev_open(struct inode *inode, struct file *filep)
++{
++	struct fsl_mc_device *root_mc_device;
++	struct uapi_priv_data *priv_data;
++	struct fsl_mc_io *dynamic_mc_io;
++	struct fsl_mc_uapi *mc_uapi;
++	struct fsl_mc_bus *mc_bus;
++	int error;
++
++	priv_data = kzalloc(sizeof(*priv_data), GFP_KERNEL);
++	if (!priv_data)
++		return -ENOMEM;
++
++	mc_uapi = container_of(filep->private_data, struct fsl_mc_uapi, misc);
++	mc_bus = container_of(mc_uapi, struct fsl_mc_bus, uapi_misc);
++	root_mc_device = &mc_bus->mc_dev;
++
++	mutex_lock(&mc_uapi->mutex);
++
++	if (!mc_uapi->local_instance_in_use) {
++		priv_data->mc_io = mc_uapi->static_mc_io;
++		mc_uapi->local_instance_in_use = 1;
++	} else {
++		error = fsl_mc_portal_allocate(root_mc_device, 0,
++					       &dynamic_mc_io);
++		if (error) {
++			dev_dbg(&root_mc_device->dev,
++				"Could not allocate MC portal\n");
++			goto error_portal_allocate;
++		}
++
++		priv_data->mc_io = dynamic_mc_io;
++	}
++	priv_data->uapi = mc_uapi;
++	filep->private_data = priv_data;
++
++	mutex_unlock(&mc_uapi->mutex);
++
++	return 0;
++
++error_portal_allocate:
++	mutex_unlock(&mc_uapi->mutex);
++	kfree(priv_data);
++
++	return error;
++}
++
++static int fsl_mc_uapi_dev_release(struct inode *inode, struct file *filep)
++{
++	struct uapi_priv_data *priv_data;
++	struct fsl_mc_uapi *mc_uapi;
++	struct fsl_mc_io *mc_io;
++
++	priv_data = filep->private_data;
++	mc_uapi = priv_data->uapi;
++	mc_io = priv_data->mc_io;
++
++	mutex_lock(&mc_uapi->mutex);
++
++	if (mc_io == mc_uapi->static_mc_io)
++		mc_uapi->local_instance_in_use = 0;
++	else
++		fsl_mc_portal_free(mc_io);
++
++	kfree(filep->private_data);
++	filep->private_data =  NULL;
++
++	mutex_unlock(&mc_uapi->mutex);
++
++	return 0;
++}
++
++static long fsl_mc_uapi_dev_ioctl(struct file *file,
++				  unsigned int cmd,
++				  unsigned long arg)
++{
++	struct uapi_priv_data *priv_data = file->private_data;
++	struct fsl_mc_device *root_mc_device;
++	struct fsl_mc_bus *mc_bus;
++	int error;
++
++	mc_bus = container_of(priv_data->uapi, struct fsl_mc_bus, uapi_misc);
++	root_mc_device = &mc_bus->mc_dev;
++
++	switch (cmd) {
++	case FSL_MC_SEND_MC_COMMAND:
++		error = fsl_mc_uapi_send_command(arg, priv_data->mc_io);
++		break;
++	default:
++		dev_dbg(&root_mc_device->dev, "unexpected ioctl call number\n");
++		error = -EINVAL;
++	}
++
++	return error;
++}
++
++static const struct file_operations fsl_mc_uapi_dev_fops = {
++	.owner = THIS_MODULE,
++	.open = fsl_mc_uapi_dev_open,
++	.release = fsl_mc_uapi_dev_release,
++	.unlocked_ioctl = fsl_mc_uapi_dev_ioctl,
++};
++
++int fsl_mc_uapi_create_device_file(struct fsl_mc_bus *mc_bus)
++{
++	struct fsl_mc_device *mc_dev = &mc_bus->mc_dev;
++	struct fsl_mc_uapi *mc_uapi = &mc_bus->uapi_misc;
++	int error;
++
++	mc_uapi->misc.minor = MISC_DYNAMIC_MINOR;
++	mc_uapi->misc.name = dev_name(&mc_dev->dev);
++	mc_uapi->misc.fops = &fsl_mc_uapi_dev_fops;
++
++	error = misc_register(&mc_uapi->misc);
++	if (error)
++		return error;
++
++	mc_uapi->static_mc_io = mc_bus->mc_dev.mc_io;
++
++	mutex_init(&mc_uapi->mutex);
++
++	return 0;
++}
++
++void fsl_mc_uapi_remove_device_file(struct fsl_mc_bus *mc_bus)
++{
++	misc_deregister(&mc_bus->uapi_misc.misc);
++}
+diff --git a/drivers/bus/fsl-mc/mc-sys.c b/drivers/bus/fsl-mc/mc-sys.c
+index 85a0225db..14d77dc61 100644
+--- a/drivers/bus/fsl-mc/mc-sys.c
++++ b/drivers/bus/fsl-mc/mc-sys.c
+@@ -19,7 +19,7 @@
+ /**
+  * Timeout in milliseconds to wait for the completion of an MC command
+  */
+-#define MC_CMD_COMPLETION_TIMEOUT_MS	500
++#define MC_CMD_COMPLETION_TIMEOUT_MS	15000
+ 
+ /*
+  * usleep_range() min and max values used to throttle down polling
+diff --git a/drivers/bus/fsl-mc/obj-api.c b/drivers/bus/fsl-mc/obj-api.c
+new file mode 100644
+index 000000000..2197368de
+--- /dev/null
++++ b/drivers/bus/fsl-mc/obj-api.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
++/*
++ * Copyright 2021 NXP
++ *
++ */
++#include <linux/kernel.h>
++#include <linux/fsl/mc.h>
++
++#include "fsl-mc-private.h"
++
++static int fsl_mc_get_open_cmd_id(const char *type)
++{
++	static const struct {
++		int cmd_id;
++		const char *type;
++	} dev_ids[] = {
++		{ DPRTC_CMDID_OPEN, "dprtc" },
++		{ DPRC_CMDID_OPEN, "dprc" },
++		{ DPNI_CMDID_OPEN, "dpni" },
++		{ DPIO_CMDID_OPEN, "dpio" },
++		{ DPSW_CMDID_OPEN, "dpsw" },
++		{ DPBP_CMDID_OPEN, "dpbp" },
++		{ DPCON_CMDID_OPEN, "dpcon" },
++		{ DPMCP_CMDID_OPEN, "dpmcp" },
++		{ DPMAC_CMDID_OPEN, "dpmac" },
++		{ DPSECI_CMDID_OPEN, "dpseci" },
++		{ DPDMUX_CMDID_OPEN, "dpdmux" },
++		{ DPDCEI_CMDID_OPEN, "dpdcei" },
++		{ DPAIOP_CMDID_OPEN, "dpaiop" },
++		{ DPCI_CMDID_OPEN, "dpci" },
++		{ DPDMAI_CMDID_OPEN, "dpdmai" },
++		{ DPDBG_CMDID_OPEN, "dpdbg" },
++		{ 0, NULL }
++	};
++	int i;
++
++	for (i = 0; dev_ids[i].type; i++)
++		if (!strcmp(dev_ids[i].type, type))
++			return dev_ids[i].cmd_id;
++
++	return -1;
++}
++
++int fsl_mc_obj_open(struct fsl_mc_io *mc_io,
++		    u32 cmd_flags,
++		    int obj_id,
++		    char *obj_type,
++		    u16 *token)
++{
++	struct fsl_mc_command cmd = { 0 };
++	struct obj_cmd_open *cmd_params;
++	int err = 0;
++	int cmd_id = fsl_mc_get_open_cmd_id(obj_type);
++
++	if (cmd_id == -1)
++		return -ENODEV;
++
++	/* prepare command */
++	cmd.header = mc_encode_cmd_header(fsl_mc_get_open_cmd_id(obj_type),
++					  cmd_flags, 0);
++	cmd_params = (struct obj_cmd_open *)cmd.params;
++	cmd_params->obj_id = cpu_to_le32(obj_id);
++
++	/* send command to mc*/
++	err = mc_send_command(mc_io, &cmd);
++	if (err)
++		return err;
++
++	/* retrieve response parameters */
++	*token = mc_cmd_hdr_read_token(&cmd);
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(fsl_mc_obj_open);
++
++int fsl_mc_obj_close(struct fsl_mc_io *mc_io,
++		     u32 cmd_flags,
++		     u16 token)
++{
++	struct fsl_mc_command cmd = { 0 };
++
++	/* prepare command */
++	cmd.header = mc_encode_cmd_header(OBJ_CMDID_CLOSE, cmd_flags,
++					  token);
++
++	/* send command to mc*/
++	return mc_send_command(mc_io, &cmd);
++}
++EXPORT_SYMBOL_GPL(fsl_mc_obj_close);
++
++int fsl_mc_obj_reset(struct fsl_mc_io *mc_io,
++		     u32 cmd_flags,
++		     u16 token)
++{
++	struct fsl_mc_command cmd = { 0 };
++
++	/* prepare command */
++	cmd.header = mc_encode_cmd_header(OBJ_CMDID_RESET, cmd_flags,
++					  token);
++
++	/* send command to mc*/
++	return mc_send_command(mc_io, &cmd);
++}
++EXPORT_SYMBOL_GPL(fsl_mc_obj_reset);
++

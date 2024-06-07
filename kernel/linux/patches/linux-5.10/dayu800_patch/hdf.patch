@@ -1,0 +1,34 @@
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+index cd2da3f9e..9f99233f8 100644
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -235,6 +235,8 @@ source "drivers/interconnect/Kconfig"
+ 
+ source "drivers/counter/Kconfig"
+ 
++source "drivers/hdf/khdf/Kconfig"
++
+ source "drivers/most/Kconfig"
+ 
+ source "drivers/gpu-viv/Kconfig"
+diff --git a/drivers/Makefile b/drivers/Makefile
+index d81423da1..47e652f79 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -189,6 +189,7 @@ obj-$(CONFIG_SIOX)		+= siox/
+ obj-$(CONFIG_GNSS)		+= gnss/
+ obj-$(CONFIG_INTERCONNECT)	+= interconnect/
+ obj-$(CONFIG_COUNTER)		+= counter/
++obj-$(CONFIG_DRIVERS_HDF)	+= hdf/
+ obj-$(CONFIG_MOST)		+= most/
+ obj-$(CONFIG_LIGHT_GPU_VIV)	+= gpu-viv/
+ obj-$(CONFIG_ACCESS_TOKENID)	+= accesstokenid/
+new file mode 100644
+index 000000000..5c5e1911c
+--- /dev/null
++++ b/drivers/hdf/Makefile
+@@ -0,0 +1,2 @@
++export PROJECT_ROOT := ../../../../../
++obj-$(CONFIG_DRIVERS_HDF) += khdf/
+-- 
+2.25.1

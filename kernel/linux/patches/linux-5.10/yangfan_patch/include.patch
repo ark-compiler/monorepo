@@ -1,0 +1,3975 @@
+diff --git a/include/drm/bridge/analogix_dp.h b/include/drm/bridge/analogix_dp.h
+index b0dcc0733..291eb8787 100644
+--- a/include/drm/bridge/analogix_dp.h
++++ b/include/drm/bridge/analogix_dp.h
+@@ -8,6 +8,7 @@
+ #define _ANALOGIX_DP_H_
+ 
+ #include <drm/drm_crtc.h>
++#include <sound/hdmi-codec.h>
+ 
+ struct analogix_dp_device;
+ 
+@@ -25,21 +26,32 @@ static inline bool is_rockchip(enum analogix_dp_devtype type)
+ struct analogix_dp_plat_data {
+ 	enum analogix_dp_devtype dev_type;
+ 	struct drm_panel *panel;
++	struct drm_bridge *bridge;
+ 	struct drm_encoder *encoder;
+ 	struct drm_connector *connector;
+ 	bool skip_connector;
++	bool ssc;
++
++	bool split_mode;
++	struct analogix_dp_device *left;
++	struct analogix_dp_device *right;
+ 
+ 	int (*power_on_start)(struct analogix_dp_plat_data *);
+ 	int (*power_on_end)(struct analogix_dp_plat_data *);
+ 	int (*power_off)(struct analogix_dp_plat_data *);
+ 	int (*attach)(struct analogix_dp_plat_data *, struct drm_bridge *,
+ 		      struct drm_connector *);
++	void (*detach)(struct analogix_dp_plat_data *, struct drm_bridge *);
+ 	int (*get_modes)(struct analogix_dp_plat_data *,
+ 			 struct drm_connector *);
++	void (*convert_to_split_mode)(struct drm_display_mode *);
++	void (*convert_to_origin_mode)(struct drm_display_mode *);
+ };
+ 
+ int analogix_dp_resume(struct analogix_dp_device *dp);
+ int analogix_dp_suspend(struct analogix_dp_device *dp);
++int analogix_dp_runtime_resume(struct analogix_dp_device *dp);
++int analogix_dp_runtime_suspend(struct analogix_dp_device *dp);
+ 
+ struct analogix_dp_device *
+ analogix_dp_probe(struct device *dev, struct analogix_dp_plat_data *plat_data);
+@@ -50,4 +62,13 @@ void analogix_dp_remove(struct analogix_dp_device *dp);
+ int analogix_dp_start_crc(struct drm_connector *connector);
+ int analogix_dp_stop_crc(struct drm_connector *connector);
+ 
++int analogix_dp_audio_hw_params(struct analogix_dp_device *dp,
++				struct hdmi_codec_daifmt *daifmt,
++				struct hdmi_codec_params *params);
++void analogix_dp_audio_shutdown(struct analogix_dp_device *dp);
++int analogix_dp_audio_startup(struct analogix_dp_device *dp);
++int analogix_dp_audio_get_eld(struct analogix_dp_device *dp,
++			      u8 *buf, size_t len);
++int analogix_dp_loader_protect(struct analogix_dp_device *dp);
++
+ #endif /* _ANALOGIX_DP_H_ */
+diff --git a/include/drm/bridge/dw_hdmi.h b/include/drm/bridge/dw_hdmi.h
+index ea34ca146..0b7f860d9 100644
+--- a/include/drm/bridge/dw_hdmi.h
++++ b/include/drm/bridge/dw_hdmi.h
+@@ -6,12 +6,15 @@
+ #ifndef __DW_HDMI__
+ #define __DW_HDMI__
+ 
++#include <drm/drm_property.h>
+ #include <sound/hdmi-codec.h>
++#include <media/cec.h>
+ 
+ struct drm_display_info;
+ struct drm_display_mode;
+ struct drm_encoder;
+ struct dw_hdmi;
++struct dw_hdmi_qp;
+ struct platform_device;
+ 
+ /**
+@@ -92,6 +95,13 @@ enum dw_hdmi_phy_type {
+ 	DW_HDMI_PHY_VENDOR_PHY = 0xfe,
+ };
+ 
++struct dw_hdmi_audio_tmds_n {
++	unsigned long tmds;
++	unsigned int n_32k;
++	unsigned int n_44k1;
++	unsigned int n_48k;
++};
++
+ struct dw_hdmi_mpll_config {
+ 	unsigned long mpixelclock;
+ 	struct {
+@@ -112,6 +122,15 @@ struct dw_hdmi_phy_config {
+ 	u16 vlev_ctr;   /* voltage level control */
+ };
+ 
++struct dw_hdmi_link_config {
++	bool dsc_mode;
++	bool frl_mode;
++	int frl_lanes;
++	int rate_per_lane;
++	int hcactive;
++	u8 pps_payload[128];
++};
++
+ struct dw_hdmi_phy_ops {
+ 	int (*init)(struct dw_hdmi *hdmi, void *data,
+ 		    const struct drm_display_info *display,
+@@ -123,12 +142,48 @@ struct dw_hdmi_phy_ops {
+ 	void (*setup_hpd)(struct dw_hdmi *hdmi, void *data);
+ };
+ 
++struct dw_hdmi_qp_phy_ops {
++	int (*init)(struct dw_hdmi_qp *hdmi, void *data,
++		    struct drm_display_mode *mode);
++	void (*disable)(struct dw_hdmi_qp *hdmi, void *data);
++	enum drm_connector_status (*read_hpd)(struct dw_hdmi_qp *hdmi,
++					      void *data);
++	void (*update_hpd)(struct dw_hdmi_qp *hdmi, void *data,
++			   bool force, bool disabled, bool rxsense);
++	void (*setup_hpd)(struct dw_hdmi_qp *hdmi, void *data);
++	void (*set_mode)(struct dw_hdmi_qp *dw_hdmi, void *data,
++			 u32 mode_mask, bool enable);
++};
++
++struct dw_hdmi_property_ops {
++	void (*attach_properties)(struct drm_connector *connector,
++				  unsigned int color, int version,
++				  void *data);
++	void (*destroy_properties)(struct drm_connector *connector,
++				   void *data);
++	int (*set_property)(struct drm_connector *connector,
++			    struct drm_connector_state *state,
++			    struct drm_property *property,
++			    u64 val,
++			    void *data);
++	int (*get_property)(struct drm_connector *connector,
++			    const struct drm_connector_state *state,
++			    struct drm_property *property,
++			    u64 *val,
++			    void *data);
++};
++
+ struct dw_hdmi_plat_data {
+ 	struct regmap *regm;
+ 
++	unsigned long input_bus_format;
+ 	unsigned long input_bus_encoding;
++	unsigned int max_tmdsclk;
+ 	bool use_drm_infoframe;
+ 	bool ycbcr_420_allowed;
++	bool unsupported_yuv_input;
++	bool unsupported_deep_color;
++	bool is_hdmi_qp;
+ 
+ 	/*
+ 	 * Private data passed to all the .mode_valid() and .configure_phy()
+@@ -137,22 +192,55 @@ struct dw_hdmi_plat_data {
+ 	void *priv_data;
+ 
+ 	/* Platform-specific mode validation (optional). */
+-	enum drm_mode_status (*mode_valid)(struct dw_hdmi *hdmi, void *data,
++	enum drm_mode_status (*mode_valid)(struct drm_connector *connector,
++					   void *data,
+ 					   const struct drm_display_info *info,
+ 					   const struct drm_display_mode *mode);
+ 
+ 	/* Vendor PHY support */
+ 	const struct dw_hdmi_phy_ops *phy_ops;
++	const struct dw_hdmi_qp_phy_ops *qp_phy_ops;
+ 	const char *phy_name;
+ 	void *phy_data;
+ 	unsigned int phy_force_vendor;
++	const struct dw_hdmi_audio_tmds_n *tmds_n_table;
++
++	/* split mode */
++	bool split_mode;
++	bool first_screen;
++	struct dw_hdmi_qp *left;
++	struct dw_hdmi_qp *right;
+ 
+ 	/* Synopsys PHY support */
+ 	const struct dw_hdmi_mpll_config *mpll_cfg;
++	const struct dw_hdmi_mpll_config *mpll_cfg_420;
+ 	const struct dw_hdmi_curr_ctrl *cur_ctr;
+ 	const struct dw_hdmi_phy_config *phy_config;
+ 	int (*configure_phy)(struct dw_hdmi *hdmi, void *data,
+ 			     unsigned long mpixelclock);
++
++	unsigned long (*get_input_bus_format)(void *data);
++	unsigned long (*get_output_bus_format)(void *data);
++	unsigned long (*get_enc_in_encoding)(void *data);
++	unsigned long (*get_enc_out_encoding)(void *data);
++	unsigned long (*get_quant_range)(void *data);
++	struct drm_property *(*get_hdr_property)(void *data);
++	struct drm_property_blob *(*get_hdr_blob)(void *data);
++	bool (*get_color_changed)(void *data);
++	int (*get_yuv422_format)(struct drm_connector *connector,
++				 struct edid *edid);
++	int (*get_edid_dsc_info)(void *data, struct edid *edid);
++	int (*get_next_hdr_data)(void *data, struct edid *edid,
++				 struct drm_connector *connector);
++	struct dw_hdmi_link_config *(*get_link_cfg)(void *data);
++	void (*set_grf_cfg)(void *data);
++	void (*convert_to_split_mode)(struct drm_display_mode *mode);
++	void (*convert_to_origin_mode)(struct drm_display_mode *mode);
++	int (*dclk_set)(void *data, bool enable);
++
++	/* Vendor Property support */
++	const struct dw_hdmi_property_ops *property_ops;
++	struct drm_connector *connector;
+ };
+ 
+ struct dw_hdmi *dw_hdmi_probe(struct platform_device *pdev,
+@@ -161,8 +249,9 @@ void dw_hdmi_remove(struct dw_hdmi *hdmi);
+ void dw_hdmi_unbind(struct dw_hdmi *hdmi);
+ struct dw_hdmi *dw_hdmi_bind(struct platform_device *pdev,
+ 			     struct drm_encoder *encoder,
+-			     const struct dw_hdmi_plat_data *plat_data);
++			     struct dw_hdmi_plat_data *plat_data);
+ 
++void dw_hdmi_suspend(struct dw_hdmi *hdmi);
+ void dw_hdmi_resume(struct dw_hdmi *hdmi);
+ 
+ void dw_hdmi_setup_rx_sense(struct dw_hdmi *hdmi, bool hpd, bool rx_sense);
+@@ -192,5 +281,31 @@ enum drm_connector_status dw_hdmi_phy_read_hpd(struct dw_hdmi *hdmi,
+ void dw_hdmi_phy_update_hpd(struct dw_hdmi *hdmi, void *data,
+ 			    bool force, bool disabled, bool rxsense);
+ void dw_hdmi_phy_setup_hpd(struct dw_hdmi *hdmi, void *data);
++void dw_hdmi_set_quant_range(struct dw_hdmi *hdmi);
++void dw_hdmi_set_output_type(struct dw_hdmi *hdmi, u64 val);
++bool dw_hdmi_get_output_whether_hdmi(struct dw_hdmi *hdmi);
++int dw_hdmi_get_output_type_cap(struct dw_hdmi *hdmi);
++void dw_hdmi_set_cec_adap(struct dw_hdmi *hdmi, struct cec_adapter *adap);
++
++void dw_hdmi_qp_unbind(struct dw_hdmi_qp *hdmi);
++struct dw_hdmi_qp *dw_hdmi_qp_bind(struct platform_device *pdev,
++				struct drm_encoder *encoder,
++				struct dw_hdmi_plat_data *plat_data);
++void dw_hdmi_qp_suspend(struct device *dev, struct dw_hdmi_qp *hdmi);
++void dw_hdmi_qp_resume(struct device *dev, struct dw_hdmi_qp *hdmi);
++void dw_hdmi_qp_cec_set_hpd(struct dw_hdmi_qp *hdmi, bool plug_in, bool change);
++void dw_hdmi_qp_set_cec_adap(struct dw_hdmi_qp *hdmi, struct cec_adapter *adap);
++int dw_hdmi_qp_set_earc(struct dw_hdmi_qp *hdmi);
++void dw_hdmi_qp_set_sample_rate(struct dw_hdmi_qp *hdmi, unsigned int rate);
++void dw_hdmi_qp_set_channel_count(struct dw_hdmi_qp *hdmi, unsigned int cnt);
++void dw_hdmi_qp_set_channel_status(struct dw_hdmi_qp *hdmi, u8 *channel_status,
++				   bool ref2stream);
++void dw_hdmi_qp_set_channel_allocation(struct dw_hdmi_qp *hdmi, unsigned int ca);
++void dw_hdmi_qp_set_audio_infoframe(struct dw_hdmi_qp *hdmi,
++				    struct hdmi_codec_params *hparms);
++void dw_hdmi_qp_audio_enable(struct dw_hdmi_qp *hdmi);
++void dw_hdmi_qp_audio_disable(struct dw_hdmi_qp *hdmi);
++int dw_hdmi_qp_set_plugged_cb(struct dw_hdmi_qp *hdmi, hdmi_codec_plugged_cb fn,
++			      struct device *codec_dev);
+ 
+ #endif /* __IMX_HDMI_H__ */
+diff --git a/include/drm/bridge/dw_mipi_dsi.h b/include/drm/bridge/dw_mipi_dsi.h
+index bda8aa7c2..f89b0476a 100644
+--- a/include/drm/bridge/dw_mipi_dsi.h
++++ b/include/drm/bridge/dw_mipi_dsi.h
+@@ -66,5 +66,6 @@ void dw_mipi_dsi_remove(struct dw_mipi_dsi *dsi);
+ int dw_mipi_dsi_bind(struct dw_mipi_dsi *dsi, struct drm_encoder *encoder);
+ void dw_mipi_dsi_unbind(struct dw_mipi_dsi *dsi);
+ void dw_mipi_dsi_set_slave(struct dw_mipi_dsi *dsi, struct dw_mipi_dsi *slave);
++struct drm_connector *dw_mipi_dsi_get_connector(struct dw_mipi_dsi *dsi);
+ 
+ #endif /* __DW_MIPI_DSI__ */
+diff --git a/include/drm/drm_auth.h b/include/drm/drm_auth.h
+index f99d3417f..6bf8b2b78 100644
+--- a/include/drm/drm_auth.h
++++ b/include/drm/drm_auth.h
+@@ -107,7 +107,6 @@ struct drm_master {
+ };
+ 
+ struct drm_master *drm_master_get(struct drm_master *master);
+-struct drm_master *drm_file_get_master(struct drm_file *file_priv);
+ void drm_master_put(struct drm_master **master);
+ bool drm_is_current_master(struct drm_file *fpriv);
+ 
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index 928136556..f8cd5d8e5 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -175,6 +175,48 @@ struct drm_scdc {
+ 	struct drm_scrambling scrambling;
+ };
+ 
++#ifdef CONFIG_NO_GKI
++/**
++ * struct drm_hdmi_dsc_cap - DSC capabilities of HDMI sink
++ *
++ * Describes the DSC support provided by HDMI 2.1 sink.
++ * The information is fetched fom additional HFVSDB blocks defined
++ * for HDMI 2.1.
++ */
++struct drm_hdmi_dsc_cap {
++	/** @v_1p2: flag for dsc1.2 version support by sink */
++	bool v_1p2;
++
++	/** @native_420: Does sink support DSC with 4:2:0 compression */
++	bool native_420;
++
++	/**
++	 * @all_bpp: Does sink support all bpp with 4:4:4: or 4:2:2
++	 * compressed formats
++	 */
++	bool all_bpp;
++
++	/**
++	 * @bpc_supported: compressed bpc supported by sink : 10, 12 or 16 bpc
++	 */
++	u8 bpc_supported;
++
++	/** @max_slices: maximum number of Horizontal slices supported by */
++	u8 max_slices;
++
++	/** @clk_per_slice : max pixel clock in MHz supported per slice */
++	int clk_per_slice;
++
++	/** @max_lanes : dsc max lanes supported for Fixed rate Link training */
++	u8 max_lanes;
++
++	/** @max_frl_rate_per_lane : maximum frl rate with DSC per lane */
++	u8 max_frl_rate_per_lane;
++
++	/** @total_chunk_kbytes: max size of chunks in KBs supported per line*/
++	u8 total_chunk_kbytes;
++};
++#endif
+ 
+ /**
+  * struct drm_hdmi_info - runtime information about the connected HDMI sink
+@@ -207,6 +249,17 @@ struct drm_hdmi_info {
+ 
+ 	/** @y420_dc_modes: bitmap of deep color support index */
+ 	u8 y420_dc_modes;
++
++#ifdef CONFIG_NO_GKI
++	/** @max_frl_rate_per_lane: support fixed rate link */
++	u8 max_frl_rate_per_lane;
++
++	/** @max_lanes: supported by sink */
++	u8 max_lanes;
++
++	/** @dsc_cap: DSC capabilities of the sink */
++	struct drm_hdmi_dsc_cap dsc_cap;
++#endif
+ };
+ 
+ /**
+@@ -1596,6 +1649,7 @@ drm_connector_is_unregistered(struct drm_connector *connector)
+ 		DRM_CONNECTOR_UNREGISTERED;
+ }
+ 
++void drm_connector_oob_hotplug_event(struct fwnode_handle *connector_fwnode);
+ const char *drm_get_connector_type_name(unsigned int connector_type);
+ const char *drm_get_connector_status_name(enum drm_connector_status status);
+ const char *drm_get_subpixel_order_name(enum subpixel_order order);
+diff --git a/include/drm/drm_crtc.h b/include/drm/drm_crtc.h
+index 59b51a09c..3a3d9d887 100644
+--- a/include/drm/drm_crtc.h
++++ b/include/drm/drm_crtc.h
+@@ -287,7 +287,16 @@ struct drm_crtc_state {
+ 	 * NULL) is an array of &struct drm_color_lut.
+ 	 */
+ 	struct drm_property_blob *gamma_lut;
+-
++#if defined(CONFIG_ROCKCHIP_DRM_CUBIC_LUT)
++	/**
++	 * @cubic_lut:
++	 *
++	 * Cubic Lookup table for converting pixel data. See
++	 * drm_crtc_enable_color_mgmt(). The blob (if not NULL) is a 3D array
++	 * of &struct drm_color_lut.
++	 */
++	struct drm_property_blob *cubic_lut;
++#endif
+ 	/**
+ 	 * @target_vblank:
+ 	 *
+diff --git a/include/drm/drm_drv.h b/include/drm/drm_drv.h
+index e57d0440f..e395d1fc1 100644
+--- a/include/drm/drm_drv.h
++++ b/include/drm/drm_drv.h
+@@ -29,6 +29,7 @@
+ 
+ #include <linux/list.h>
+ #include <linux/irqreturn.h>
++#include <linux/uuid.h>
+ 
+ #include <drm/drm_device.h>
+ 
+@@ -460,6 +461,15 @@ struct drm_driver {
+ 	int (*gem_prime_mmap)(struct drm_gem_object *obj,
+ 				struct vm_area_struct *vma);
+ 
++	/**
++	 * @gem_prime_get_uuid
++	 *
++	 * get_uuid hook for GEM drivers. Retrieves the virtio uuid of the
++	 * given GEM buffer.
++	 */
++	int (*gem_prime_get_uuid)(struct drm_gem_object *obj,
++				  uuid_t *uuid);
++
+ 	/**
+ 	 * @dumb_create:
+ 	 *
+diff --git a/include/drm/drm_edid.h b/include/drm/drm_edid.h
+index e97daf6ff..043491c74 100644
+--- a/include/drm/drm_edid.h
++++ b/include/drm/drm_edid.h
+@@ -229,6 +229,38 @@ struct detailed_timing {
+ 				    DRM_EDID_YCBCR420_DC_36 | \
+ 				    DRM_EDID_YCBCR420_DC_30)
+ 
++#ifdef CONFIG_NO_GKI
++/* HDMI 2.1 additional fields */
++#define DRM_EDID_MAX_FRL_RATE_MASK		0xf0
++#define DRM_EDID_FAPA_START_LOCATION		(1 << 0)
++#define DRM_EDID_ALLM				(1 << 1)
++#define DRM_EDID_FVA				(1 << 2)
++
++/* Deep Color specific */
++#define DRM_EDID_DC_30BIT_420			(1 << 0)
++#define DRM_EDID_DC_36BIT_420			(1 << 1)
++#define DRM_EDID_DC_48BIT_420			(1 << 2)
++
++/* VRR specific */
++#define DRM_EDID_CNMVRR				(1 << 3)
++#define DRM_EDID_CINEMA_VRR			(1 << 4)
++#define DRM_EDID_MDELTA				(1 << 5)
++#define DRM_EDID_VRR_MAX_UPPER_MASK		0xc0
++#define DRM_EDID_VRR_MAX_LOWER_MASK		0xff
++#define DRM_EDID_VRR_MIN_MASK			0x3f
++
++/* DSC specific */
++#define DRM_EDID_DSC_10BPC			(1 << 0)
++#define DRM_EDID_DSC_12BPC			(1 << 1)
++#define DRM_EDID_DSC_16BPC			(1 << 2)
++#define DRM_EDID_DSC_ALL_BPP			(1 << 3)
++#define DRM_EDID_DSC_NATIVE_420			(1 << 6)
++#define DRM_EDID_DSC_1P2			(1 << 7)
++#define DRM_EDID_DSC_MAX_FRL_RATE_MASK		0xf0
++#define DRM_EDID_DSC_MAX_SLICES			0xf
++#define DRM_EDID_DSC_TOTAL_CHUNK_KBYTES		0x3f
++#endif
++
+ /* ELD Header Block */
+ #define DRM_ELD_HEADER_BLOCK_SIZE	4
+ 
+@@ -359,8 +391,6 @@ drm_load_edid_firmware(struct drm_connector *connector)
+ }
+ #endif
+ 
+-bool drm_edid_are_equal(const struct edid *edid1, const struct edid *edid2);
+-
+ int
+ drm_hdmi_avi_infoframe_from_display_mode(struct hdmi_avi_infoframe *frame,
+ 					 const struct drm_connector *connector,
+@@ -483,35 +513,99 @@ struct edid *drm_do_get_edid(struct drm_connector *connector,
+ 	int (*get_edid_block)(void *data, u8 *buf, unsigned int block,
+ 			      size_t len),
+ 	void *data);
+-struct edid *drm_get_edid(struct drm_connector *connector,
+-			  struct i2c_adapter *adapter);
+ struct edid *drm_get_edid_switcheroo(struct drm_connector *connector,
+ 				     struct i2c_adapter *adapter);
+-struct edid *drm_edid_duplicate(const struct edid *edid);
+-int drm_add_edid_modes(struct drm_connector *connector, struct edid *edid);
+-int drm_add_override_edid_modes(struct drm_connector *connector);
+ 
+-u8 drm_match_cea_mode(const struct drm_display_mode *to_match);
+ bool drm_detect_hdmi_monitor(struct edid *edid);
+-bool drm_detect_monitor_audio(struct edid *edid);
+ enum hdmi_quantization_range
+ drm_default_rgb_quant_range(const struct drm_display_mode *mode);
+-int drm_add_modes_noedid(struct drm_connector *connector,
+-			 int hdisplay, int vdisplay);
+ void drm_set_preferred_mode(struct drm_connector *connector,
+ 			    int hpref, int vpref);
+ 
+ int drm_edid_header_is_valid(const u8 *raw_edid);
+ bool drm_edid_block_valid(u8 *raw_edid, int block, bool print_bad_edid,
+ 			  bool *edid_corrupt);
+-bool drm_edid_is_valid(struct edid *edid);
++struct drm_display_mode *
++drm_display_mode_from_cea_vic(struct drm_device *dev,
++			      u8 video_code);
++
++#ifdef CONFIG_DRM_EDID
++struct edid *drm_get_edid(struct drm_connector *connector,
++			  struct i2c_adapter *adapter);
++struct edid *drm_edid_duplicate(const struct edid *edid);
++int drm_add_edid_modes(struct drm_connector *connector, struct edid *edid);
++int drm_add_override_edid_modes(struct drm_connector *connector);
++u8 drm_match_cea_mode(const struct drm_display_mode *to_match);
++int drm_add_modes_noedid(struct drm_connector *connector,
++			 int hdisplay, int vdisplay);
++bool drm_detect_monitor_audio(struct edid *edid);
+ void drm_edid_get_monitor_name(struct edid *edid, char *name,
+ 			       int buflen);
++bool drm_edid_is_valid(struct edid *edid);
++bool drm_edid_are_equal(const struct edid *edid1, const struct edid *edid2);
+ struct drm_display_mode *drm_mode_find_dmt(struct drm_device *dev,
+ 					   int hsize, int vsize, int fresh,
+ 					   bool rb);
+-struct drm_display_mode *
+-drm_display_mode_from_cea_vic(struct drm_device *dev,
+-			      u8 video_code);
++#else
++static inline struct edid *drm_get_edid(struct drm_connector *connector,
++					struct i2c_adapter *adapter)
++{
++	return NULL;
++}
++
++static inline struct edid *drm_edid_duplicate(const struct edid *edid)
++{
++	return NULL;
++}
++
++static inline int drm_add_edid_modes(struct drm_connector *connector,
++				     struct edid *edid)
++{
++	return 0;
++}
++
++static inline int drm_add_override_edid_modes(struct drm_connector *connector)
++{
++	return 0;
++}
++
++static inline u8 drm_match_cea_mode(const struct drm_display_mode *to_match)
++{
++	return 0;
++}
++
++static inline int drm_add_modes_noedid(struct drm_connector *connector,
++				       int hdisplay, int vdisplay)
++{
++	return 0;
++}
++
++static inline bool drm_detect_monitor_audio(struct edid *edid)
++{
++	return false;
++}
++
++static inline void drm_edid_get_monitor_name(struct edid *edid, char *name,
++					     int buflen)
++{
++}
++
++static inline bool drm_edid_is_valid(struct edid *edid)
++{
++	return false;
++}
++
++static inline bool drm_edid_are_equal(const struct edid *edid1, const struct edid *edid2)
++{
++	return false;
++}
++
++static inline struct drm_display_mode *drm_mode_find_dmt(struct drm_device *dev,
++					   int hsize, int vsize, int fresh,
++					   bool rb)
++{
++	return NULL;
++}
++#endif
+ 
+ #endif /* __DRM_EDID_H__ */
+diff --git a/include/drm/drm_file.h b/include/drm/drm_file.h
+index 42d04607d..b81b3bfb0 100644
+--- a/include/drm/drm_file.h
++++ b/include/drm/drm_file.h
+@@ -226,27 +226,15 @@ struct drm_file {
+ 	/**
+ 	 * @master:
+ 	 *
+-	 * Master this node is currently associated with. Protected by struct
+-	 * &drm_device.master_mutex, and serialized by @master_lookup_lock.
+-	 *
+-	 * Only relevant if drm_is_primary_client() returns true. Note that
+-	 * this only matches &drm_device.master if the master is the currently
+-	 * active one.
+-	 *
+-	 * When dereferencing this pointer, either hold struct
+-	 * &drm_device.master_mutex for the duration of the pointer's use, or
+-	 * use drm_file_get_master() if struct &drm_device.master_mutex is not
+-	 * currently held and there is no other need to hold it. This prevents
+-	 * @master from being freed during use.
++	 * Master this node is currently associated with. Only relevant if
++	 * drm_is_primary_client() returns true. Note that this only
++	 * matches &drm_device.master if the master is the currently active one.
+ 	 *
+ 	 * See also @authentication and @is_master and the :ref:`section on
+ 	 * primary nodes and authentication <drm_primary_node>`.
+ 	 */
+ 	struct drm_master *master;
+ 
+-	/** @master_lock: Serializes @master. */
+-	spinlock_t master_lookup_lock;
+-
+ 	/** @pid: Process that opened this file. */
+ 	struct pid *pid;
+ 
+@@ -411,6 +399,9 @@ void drm_event_cancel_free(struct drm_device *dev,
+ 			   struct drm_pending_event *p);
+ void drm_send_event_locked(struct drm_device *dev, struct drm_pending_event *e);
+ void drm_send_event(struct drm_device *dev, struct drm_pending_event *e);
++void drm_send_event_timestamp_locked(struct drm_device *dev,
++				     struct drm_pending_event *e,
++				     ktime_t timestamp);
+ 
+ struct file *mock_drm_getfile(struct drm_minor *minor, unsigned int flags);
+ 
+diff --git a/include/drm/drm_mipi_dsi.h b/include/drm/drm_mipi_dsi.h
+index 360e6377e..952f475a6 100644
+--- a/include/drm/drm_mipi_dsi.h
++++ b/include/drm/drm_mipi_dsi.h
+@@ -19,12 +19,18 @@ struct drm_dsc_picture_parameter_set;
+ #define MIPI_DSI_MSG_REQ_ACK	BIT(0)
+ /* use Low Power Mode to transmit message */
+ #define MIPI_DSI_MSG_USE_LPM	BIT(1)
++/* read mipi_dsi_msg.ctrl and unicast to only that ctrls */
++#define MIPI_DSI_MSG_UNICAST	BIT(2)
++/* Stack all commands until lastcommand bit and trigger all in one go */
++#define MIPI_DSI_MSG_LASTCOMMAND BIT(3)
+ 
+ /**
+  * struct mipi_dsi_msg - read/write DSI buffer
+  * @channel: virtual channel id
+  * @type: payload data type
+  * @flags: flags controlling this message transmission
++ * @ctrl: ctrl index to transmit on
++ * @wait_ms: duration in ms to wait after message transmission
+  * @tx_len: length of @tx_buf
+  * @tx_buf: data to be written
+  * @rx_len: length of @rx_buf
+@@ -34,6 +40,8 @@ struct mipi_dsi_msg {
+ 	u8 channel;
+ 	u8 type;
+ 	u16 flags;
++	u32 ctrl;
++	u32 wait_ms;
+ 
+ 	size_t tx_len;
+ 	const void *tx_buf;
+@@ -132,6 +140,10 @@ struct mipi_dsi_host *of_find_mipi_dsi_host_by_node(struct device_node *node);
+ #define MIPI_DSI_CLOCK_NON_CONTINUOUS	BIT(10)
+ /* transmit data in low power */
+ #define MIPI_DSI_MODE_LPM		BIT(11)
++/* disable BLLP area */
++#define MIPI_DSI_MODE_VIDEO_BLLP	BIT(12)
++/* disable EOF BLLP area */
++#define MIPI_DSI_MODE_VIDEO_EOF_BLLP	BIT(13)
+ 
+ enum mipi_dsi_pixel_format {
+ 	MIPI_DSI_FMT_RGB888,
+diff --git a/include/drm/drm_mode_config.h b/include/drm/drm_mode_config.h
+index a18f73eb3..76d114569 100644
+--- a/include/drm/drm_mode_config.h
++++ b/include/drm/drm_mode_config.h
+@@ -794,6 +794,19 @@ struct drm_mode_config {
+ 	 */
+ 	struct drm_property *gamma_lut_size_property;
+ 
++#if defined(CONFIG_ROCKCHIP_DRM_CUBIC_LUT)
++	/**
++	 * @cubic_lut_property: Optional CRTC property to set the 3D LUT used to
++	 * convert color spaces.
++	 */
++	struct drm_property *cubic_lut_property;
++	/**
++	 * @cubic_lut_size_property: Optional CRTC property for the size of the
++	 * 3D LUT as supported by the driver (read-only).
++	 */
++	struct drm_property *cubic_lut_size_property;
++#endif
++
+ 	/**
+ 	 * @suggested_x_property: Optional connector property with a hint for
+ 	 * the position of the output on the host's screen.
+diff --git a/include/drm/drm_mode_object.h b/include/drm/drm_mode_object.h
+index c34a3e803..6292fa663 100644
+--- a/include/drm/drm_mode_object.h
++++ b/include/drm/drm_mode_object.h
+@@ -60,7 +60,7 @@ struct drm_mode_object {
+ 	void (*free_cb)(struct kref *kref);
+ };
+ 
+-#define DRM_OBJECT_MAX_PROPERTY 24
++#define DRM_OBJECT_MAX_PROPERTY 64
+ /**
+  * struct drm_object_properties - property tracking for &drm_mode_object
+  */
+diff --git a/include/drm/drm_prime.h b/include/drm/drm_prime.h
+index 0f69f9fbf..a9d0c6b08 100644
+--- a/include/drm/drm_prime.h
++++ b/include/drm/drm_prime.h
+@@ -107,5 +107,6 @@ void drm_prime_gem_destroy(struct drm_gem_object *obj, struct sg_table *sg);
+ int drm_prime_sg_to_page_addr_arrays(struct sg_table *sgt, struct page **pages,
+ 				     dma_addr_t *addrs, int max_pages);
+ 
++int drm_gem_dmabuf_get_uuid(struct dma_buf *dma_buf, uuid_t *uuid);
+ 
+ #endif /* __DRM_PRIME_H__ */
+diff --git a/include/dt-bindings/clock/rk3399-cru.h b/include/dt-bindings/clock/rk3399-cru.h
+index 44e0a319f..b541bdce1 100644
+--- a/include/dt-bindings/clock/rk3399-cru.h
++++ b/include/dt-bindings/clock/rk3399-cru.h
+@@ -7,6 +7,8 @@
+ #ifndef _DT_BINDINGS_CLK_ROCKCHIP_RK3399_H
+ #define _DT_BINDINGS_CLK_ROCKCHIP_RK3399_H
+ 
++#define RK3399_TWO_PLL_FOR_VOP
++
+ /* core clocks */
+ #define PLL_APLLL			1
+ #define PLL_APLLB			2
+@@ -19,6 +21,7 @@
+ #define ARMCLKB				9
+ 
+ /* sclk gates (special clocks) */
++#define SCLK_I2SOUT_SRC			64
+ #define SCLK_I2C1			65
+ #define SCLK_I2C2			66
+ #define SCLK_I2C3			67
+@@ -122,9 +125,18 @@
+ #define SCLK_DPHY_RX0_CFG		165
+ #define SCLK_RMII_SRC			166
+ #define SCLK_PCIEPHY_REF100M		167
+-#define SCLK_DDRC			168
+-#define SCLK_TESTCLKOUT1		169
+-#define SCLK_TESTCLKOUT2		170
++#define SCLK_USBPHY0_480M_SRC		168
++#define SCLK_USBPHY1_480M_SRC		169
++#define SCLK_DDRC			170
++#define SCLK_TESTCLKOUT2		171
++#define SCLK_UART0_SRC			172
++#define SCLK_UART_SRC			173
++#define SCLK_I2S0_DIV			174
++#define SCLK_I2S1_DIV			175
++#define SCLK_I2S2_DIV			176
++#define SCLK_SPDIF_DIV			177
++#define SCLK_TESTCLKOUT1		179
++#define SCLK_CIF_OUT_SRC		178
+ 
+ #define DCLK_VOP0			180
+ #define DCLK_VOP1			181
+@@ -351,6 +363,7 @@
+ #define SCLK_I2C0_PMU			9
+ #define SCLK_I2C4_PMU			10
+ #define SCLK_I2C8_PMU			11
++#define SCLK_UART4_SRC			12
+ 
+ #define PCLK_SRC_PMU			19
+ #define PCLK_PMU			20
+@@ -421,7 +434,7 @@
+ #define SRST_A_ADB400_GIC2COREB		40
+ #define SRST_A_ADB400_COREB2GIC		41
+ #define SRST_P_DBG_B			42
+-#define SRST_L2_B_T			43
++#define SRST_L2_B_T			44
+ #define SRST_ADB_B_T			45
+ #define SRST_A_RKPERF_B			46
+ #define SRST_PVTM_CORE_B		47
+@@ -594,13 +607,13 @@
+ #define SRST_P_SPI0			214
+ #define SRST_P_SPI1			215
+ #define SRST_P_SPI2			216
+-#define SRST_P_SPI3			217
+-#define SRST_P_SPI4			218
++#define SRST_P_SPI4			217
++#define SRST_P_SPI5			218
+ #define SRST_SPI0			219
+ #define SRST_SPI1			220
+ #define SRST_SPI2			221
+-#define SRST_SPI3			222
+-#define SRST_SPI4			223
++#define SRST_SPI4			222
++#define SRST_SPI5			223
+ 
+ /* cru_softrst_con14 */
+ #define SRST_I2S0_8CH			224
+@@ -722,8 +735,8 @@
+ #define SRST_H_CM0S_NOC			3
+ #define SRST_DBG_CM0S			4
+ #define SRST_PO_CM0S			5
+-#define SRST_P_SPI6			6
+-#define SRST_SPI6			7
++#define SRST_P_SPI3			6
++#define SRST_SPI3			7
+ #define SRST_P_TIMER_0_1		8
+ #define SRST_P_TIMER_0			9
+ #define SRST_P_TIMER_1			10
+diff --git a/include/dt-bindings/soc/rockchip,boot-mode.h b/include/dt-bindings/soc/rockchip,boot-mode.h
+index 4b0914c09..1436e1d32 100644
+--- a/include/dt-bindings/soc/rockchip,boot-mode.h
++++ b/include/dt-bindings/soc/rockchip,boot-mode.h
+@@ -10,7 +10,15 @@
+ #define BOOT_BL_DOWNLOAD	(REBOOT_FLAG + 1)
+ /* enter recovery */
+ #define BOOT_RECOVERY		(REBOOT_FLAG + 3)
+- /* enter fastboot mode */
++/* reboot by panic */
++#define BOOT_PANIC		(REBOOT_FLAG + 7)
++/* reboot by watchdog */
++#define BOOT_WATCHDOG		(REBOOT_FLAG + 8)
++/* enter fastboot mode */
+ #define BOOT_FASTBOOT		(REBOOT_FLAG + 9)
++/* enter charging mode */
++#define BOOT_CHARGING		(REBOOT_FLAG + 11)
++/* enter usb mass storage mode */
++#define BOOT_UMS		(REBOOT_FLAG + 12)
+ 
+ #endif
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index d9b69bbde..ebfb4e7c1 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -46,6 +46,7 @@ struct block_device {
+ 	int			bd_fsfreeze_count;
+ 	/* Mutex for freeze */
+ 	struct mutex		bd_fsfreeze_mutex;
++	struct super_block	*bd_fsfreeze_sb;
+ } __randomize_layout;
+ 
+ /*
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a8b2625e5..469fa0f9f 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -173,7 +173,7 @@ struct bpf_map {
+ 	atomic64_t usercnt;
+ 	struct work_struct work;
+ 	struct mutex freeze_mutex;
+-	atomic64_t writecnt;
++	u64 writecnt; /* writable mmap cnt; protected by freeze_mutex */
+ };
+ 
+ static inline bool map_value_has_spin_lock(const struct bpf_map *map)
+@@ -1333,7 +1333,6 @@ void bpf_map_charge_move(struct bpf_map_memory *dst,
+ void *bpf_map_area_alloc(u64 size, int numa_node);
+ void *bpf_map_area_mmapable_alloc(u64 size, int numa_node);
+ void bpf_map_area_free(void *base);
+-bool bpf_map_write_active(const struct bpf_map *map);
+ void bpf_map_init_from_attr(struct bpf_map *map, union bpf_attr *attr);
+ int  generic_map_lookup_batch(struct bpf_map *map,
+ 			      const union bpf_attr *attr,
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 9c88b7da3..14b808b02 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -676,6 +676,8 @@ static inline struct psi_group *cgroup_psi(struct cgroup *cgrp)
+ 	return &cgrp->psi;
+ }
+ 
++bool cgroup_psi_enabled(void);
++
+ static inline void cgroup_init_kthreadd(void)
+ {
+ 	/*
+@@ -735,6 +737,11 @@ static inline struct psi_group *cgroup_psi(struct cgroup *cgrp)
+ 	return NULL;
+ }
+ 
++static inline bool cgroup_psi_enabled(void)
++{
++	return false;
++}
++
+ static inline bool task_under_cgroup_hierarchy(struct task_struct *task,
+ 					       struct cgroup *ancestor)
+ {
+@@ -816,13 +823,33 @@ static inline void cgroup_account_cputime_field(struct task_struct *task,
+  */
+ #ifdef CONFIG_SOCK_CGROUP_DATA
+ 
++#if defined(CONFIG_CGROUP_NET_PRIO) || defined(CONFIG_CGROUP_NET_CLASSID)
++extern spinlock_t cgroup_sk_update_lock;
++#endif
++
++void cgroup_sk_alloc_disable(void);
+ void cgroup_sk_alloc(struct sock_cgroup_data *skcd);
+ void cgroup_sk_clone(struct sock_cgroup_data *skcd);
+ void cgroup_sk_free(struct sock_cgroup_data *skcd);
+ 
+ static inline struct cgroup *sock_cgroup_ptr(struct sock_cgroup_data *skcd)
+ {
+-	return skcd->cgroup;
++#if defined(CONFIG_CGROUP_NET_PRIO) || defined(CONFIG_CGROUP_NET_CLASSID)
++	unsigned long v;
++
++	/*
++	 * @skcd->val is 64bit but the following is safe on 32bit too as we
++	 * just need the lower ulong to be written and read atomically.
++	 */
++	v = READ_ONCE(skcd->val);
++
++	if (v & 3)
++		return &cgrp_dfl_root.cgrp;
++
++	return (struct cgroup *)(unsigned long)v ?: &cgrp_dfl_root.cgrp;
++#else
++	return (struct cgroup *)(unsigned long)skcd->val;
++#endif
+ }
+ 
+ #else	/* CONFIG_CGROUP_DATA */
+diff --git a/include/linux/clk-provider.h b/include/linux/clk-provider.h
+index 03a5de5f9..d9897d0b1 100644
+--- a/include/linux/clk-provider.h
++++ b/include/linux/clk-provider.h
+@@ -599,6 +599,7 @@ struct clk_divider {
+ 	u8		shift;
+ 	u8		width;
+ 	u8		flags;
++	unsigned long	max_prate;
+ 	const struct clk_div_table	*table;
+ 	spinlock_t	*lock;
+ };
+@@ -936,6 +937,8 @@ void clk_hw_unregister_fixed_factor(struct clk_hw *hw);
+  * CLK_FRAC_DIVIDER_BIG_ENDIAN - By default little endian register accesses are
+  *	used for the divider register.  Setting this flag makes the register
+  *	accesses big endian.
++ * CLK_FRAC_DIVIDER_NO_LIMIT - not need to follow the 20 times limit on
++ *	fractional divider
+  */
+ struct clk_fractional_divider {
+ 	struct clk_hw	hw;
+@@ -947,6 +950,7 @@ struct clk_fractional_divider {
+ 	u8		nwidth;
+ 	u32		nmask;
+ 	u8		flags;
++	unsigned long	max_prate;
+ 	void		(*approximation)(struct clk_hw *hw,
+ 				unsigned long rate, unsigned long *parent_rate,
+ 				unsigned long *m, unsigned long *n);
+@@ -957,6 +961,7 @@ struct clk_fractional_divider {
+ 
+ #define CLK_FRAC_DIVIDER_ZERO_BASED		BIT(0)
+ #define CLK_FRAC_DIVIDER_BIG_ENDIAN		BIT(1)
++#define CLK_FRAC_DIVIDER_NO_LIMIT		BIT(2)
+ 
+ extern const struct clk_ops clk_fractional_divider_ops;
+ struct clk *clk_register_fractional_divider(struct device *dev,
+@@ -1017,6 +1022,9 @@ extern const struct clk_ops clk_multiplier_ops;
+  * @mux_hw:	handle between composite and hardware-specific mux clock
+  * @rate_hw:	handle between composite and hardware-specific rate clock
+  * @gate_hw:	handle between composite and hardware-specific gate clock
++ * @brother_hw: a member of clk_composite who has the common parent clocks
++ *              with another clk_composite, and it's also a handle between
++ *              common and hardware-specific interfaces
+  * @mux_ops:	clock ops for mux
+  * @rate_ops:	clock ops for rate
+  * @gate_ops:	clock ops for gate
+@@ -1028,6 +1036,7 @@ struct clk_composite {
+ 	struct clk_hw	*mux_hw;
+ 	struct clk_hw	*rate_hw;
+ 	struct clk_hw	*gate_hw;
++	struct clk_hw	*brother_hw;
+ 
+ 	const struct clk_ops	*mux_ops;
+ 	const struct clk_ops	*rate_ops;
+diff --git a/include/linux/cpuset.h b/include/linux/cpuset.h
+index 04c20de66..047f449d3 100644
+--- a/include/linux/cpuset.h
++++ b/include/linux/cpuset.h
+@@ -15,6 +15,7 @@
+ #include <linux/cpumask.h>
+ #include <linux/nodemask.h>
+ #include <linux/mm.h>
++#include <linux/mmu_context.h>
+ #include <linux/jump_label.h>
+ 
+ #ifdef CONFIG_CPUSETS
+@@ -162,6 +163,8 @@ static inline void set_mems_allowed(nodemask_t nodemask)
+ 	task_unlock(current);
+ }
+ 
++extern void cpuset_hotplug_workfn(struct work_struct *work);
++
+ #else /* !CONFIG_CPUSETS */
+ 
+ static inline bool cpusets_enabled(void) { return false; }
+@@ -184,7 +187,7 @@ static inline void cpuset_read_unlock(void) { }
+ static inline void cpuset_cpus_allowed(struct task_struct *p,
+ 				       struct cpumask *mask)
+ {
+-	cpumask_copy(mask, cpu_possible_mask);
++	cpumask_copy(mask, task_cpu_possible_mask(p));
+ }
+ 
+ static inline void cpuset_cpus_allowed_fallback(struct task_struct *p)
+@@ -280,6 +283,8 @@ static inline bool read_mems_allowed_retry(unsigned int seq)
+ 	return false;
+ }
+ 
++static inline void cpuset_hotplug_workfn(struct work_struct *work) {}
++
+ #endif /* !CONFIG_CPUSETS */
+ 
+ #endif /* _LINUX_CPUSET_H */
+diff --git a/include/linux/dma-buf.h b/include/linux/dma-buf.h
+index 0c5706abb..fc3c3f21f 100644
+--- a/include/linux/dma-buf.h
++++ b/include/linux/dma-buf.h
+@@ -209,6 +209,41 @@ struct dma_buf_ops {
+ 	 */
+ 	int (*begin_cpu_access)(struct dma_buf *, enum dma_data_direction);
+ 
++	/**
++	 * @begin_cpu_access_partial:
++	 *
++	 * This is called from dma_buf_begin_cpu_access_partial() and allows the
++	 * exporter to ensure that the memory specified in the range is
++	 * available for cpu access - the exporter might need to allocate or
++	 * swap-in and pin the backing storage.
++	 * The exporter also needs to ensure that cpu access is
++	 * coherent for the access direction. The direction can be used by the
++	 * exporter to optimize the cache flushing, i.e. access with a different
++	 * direction (read instead of write) might return stale or even bogus
++	 * data (e.g. when the exporter needs to copy the data to temporary
++	 * storage).
++	 *
++	 * This callback is optional.
++	 *
++	 * FIXME: This is both called through the DMA_BUF_IOCTL_SYNC command
++	 * from userspace (where storage shouldn't be pinned to avoid handing
++	 * de-factor mlock rights to userspace) and for the kernel-internal
++	 * users of the various kmap interfaces, where the backing storage must
++	 * be pinned to guarantee that the atomic kmap calls can succeed. Since
++	 * there's no in-kernel users of the kmap interfaces yet this isn't a
++	 * real problem.
++	 *
++	 * Returns:
++	 *
++	 * 0 on success or a negative error code on failure. This can for
++	 * example fail when the backing storage can't be allocated. Can also
++	 * return -ERESTARTSYS or -EINTR when the call has been interrupted and
++	 * needs to be restarted.
++	 */
++	int (*begin_cpu_access_partial)(struct dma_buf *dmabuf,
++					enum dma_data_direction,
++					unsigned int offset, unsigned int len);
++
+ 	/**
+ 	 * @end_cpu_access:
+ 	 *
+@@ -228,6 +263,28 @@ struct dma_buf_ops {
+ 	 */
+ 	int (*end_cpu_access)(struct dma_buf *, enum dma_data_direction);
+ 
++	/**
++	 * @end_cpu_access_partial:
++	 *
++	 * This is called from dma_buf_end_cpu_access_partial() when the
++	 * importer is done accessing the CPU. The exporter can use to limit
++	 * cache flushing to only the range specefied and to unpin any
++	 * resources pinned in @begin_cpu_access_umapped.
++	 * The result of any dma_buf kmap calls after end_cpu_access_partial is
++	 * undefined.
++	 *
++	 * This callback is optional.
++	 *
++	 * Returns:
++	 *
++	 * 0 on success or a negative error code on failure. Can return
++	 * -ERESTARTSYS or -EINTR when the call has been interrupted and needs
++	 * to be restarted.
++	 */
++	int (*end_cpu_access_partial)(struct dma_buf *dmabuf,
++				      enum dma_data_direction,
++				      unsigned int offset, unsigned int len);
++
+ 	/**
+ 	 * @mmap:
+ 	 *
+@@ -267,6 +324,35 @@ struct dma_buf_ops {
+ 
+ 	void *(*vmap)(struct dma_buf *);
+ 	void (*vunmap)(struct dma_buf *, void *vaddr);
++
++	/**
++	 * @get_uuid
++	 *
++	 * This is called by dma_buf_get_uuid to get the UUID which identifies
++	 * the buffer to virtio devices.
++	 *
++	 * This callback is optional.
++	 *
++	 * Returns:
++	 *
++	 * 0 on success or a negative error code on failure. On success uuid
++	 * will be populated with the buffer's UUID.
++	 */
++	int (*get_uuid)(struct dma_buf *dmabuf, uuid_t *uuid);
++
++	/**
++	 * @get_flags:
++	 *
++	 * This is called by dma_buf_get_flags and is used to get the buffer's
++	 * flags.
++	 * This callback is optional.
++	 *
++	 * Returns:
++	 *
++	 * 0 on success or a negative error code on failure. On success flags
++	 * will be populated with the buffer's flags.
++	 */
++	int (*get_flags)(struct dma_buf *dmabuf, unsigned long *flags);
+ };
+ 
+ /**
+@@ -297,6 +383,9 @@ struct dma_buf_ops {
+  * @sysfs_entry: for exposing information about this buffer in sysfs.
+  * The attachment_uid member of @sysfs_entry is protected by dma_resv lock
+  * and is incremented on each attach.
++ * @mmap_count: number of times buffer has been mmapped.
++ * @exp_vm_ops: the vm ops provided by the buffer exporter.
++ * @vm_ops: the overridden vm_ops used to track mmap_count of the buffer.
+  *
+  * This represents a shared buffer, created by calling dma_buf_export(). The
+  * userspace representation is a normal file descriptor, which can be created by
+@@ -341,7 +430,12 @@ struct dma_buf {
+ 	struct dma_buf_sysfs_entry {
+ 		struct kobject kobj;
+ 		struct dma_buf *dmabuf;
++		unsigned int attachment_uid;
++		struct kset *attach_stats_kset;
+ 	} *sysfs_entry;
++	int mmap_count;
++	const struct vm_operations_struct *exp_vm_ops;
++	struct vm_operations_struct vm_ops;
+ #endif
+ };
+ 
+@@ -392,6 +486,9 @@ struct dma_buf_attach_ops {
+  * @importer_ops: importer operations for this attachment, if provided
+  * dma_buf_map/unmap_attachment() must be called with the dma_resv lock held.
+  * @importer_priv: importer specific attachment data.
++ * @dma_map_attrs: DMA attributes to be used when the exporter maps the buffer
++ * through dma_buf_map_attachment.
++ * @sysfs_entry: For exposing information about this attachment in sysfs.
+  *
+  * This structure holds the attachment information between the dma_buf buffer
+  * and its user device(s). The list contains one attachment struct per device
+@@ -412,6 +509,14 @@ struct dma_buf_attachment {
+ 	const struct dma_buf_attach_ops *importer_ops;
+ 	void *importer_priv;
+ 	void *priv;
++	unsigned long dma_map_attrs;
++#ifdef CONFIG_DMABUF_SYSFS_STATS
++	/* for sysfs stats */
++	struct dma_buf_attach_sysfs_entry {
++		struct kobject kobj;
++		unsigned int map_counter;
++	} *sysfs_entry;
++#endif
+ };
+ 
+ /**
+@@ -489,6 +594,9 @@ dma_buf_attachment_is_dynamic(struct dma_buf_attachment *attach)
+ 	return !!attach->importer_ops;
+ }
+ 
++int get_each_dmabuf(int (*callback)(const struct dma_buf *dmabuf,
++		    void *private), void *private);
++int is_dma_buf_file(struct file *file);
+ struct dma_buf_attachment *dma_buf_attach(struct dma_buf *dmabuf,
+ 					  struct device *dev);
+ struct dma_buf_attachment *
+@@ -513,13 +621,21 @@ void dma_buf_unmap_attachment(struct dma_buf_attachment *, struct sg_table *,
+ void dma_buf_move_notify(struct dma_buf *dma_buf);
+ int dma_buf_begin_cpu_access(struct dma_buf *dma_buf,
+ 			     enum dma_data_direction dir);
++int dma_buf_begin_cpu_access_partial(struct dma_buf *dma_buf,
++				     enum dma_data_direction dir,
++				     unsigned int offset, unsigned int len);
+ int dma_buf_end_cpu_access(struct dma_buf *dma_buf,
+ 			   enum dma_data_direction dir);
++int dma_buf_end_cpu_access_partial(struct dma_buf *dma_buf,
++				     enum dma_data_direction dir,
++				     unsigned int offset, unsigned int len);
+ 
+ int dma_buf_mmap(struct dma_buf *, struct vm_area_struct *,
+ 		 unsigned long);
+ void *dma_buf_vmap(struct dma_buf *);
+ void dma_buf_vunmap(struct dma_buf *, void *vaddr);
++int dma_buf_get_flags(struct dma_buf *dmabuf, unsigned long *flags);
++int dma_buf_get_uuid(struct dma_buf *dmabuf, uuid_t *uuid);
+ 
+ #ifdef CONFIG_DMABUF_PROCESS_INFO
+ /**
+diff --git a/include/linux/dma-fence.h b/include/linux/dma-fence.h
+index 09e23adb3..9f12efaaa 100644
+--- a/include/linux/dma-fence.h
++++ b/include/linux/dma-fence.h
+@@ -372,6 +372,9 @@ static inline void __dma_fence_might_wait(void) {}
+ 
+ int dma_fence_signal(struct dma_fence *fence);
+ int dma_fence_signal_locked(struct dma_fence *fence);
++int dma_fence_signal_timestamp(struct dma_fence *fence, ktime_t timestamp);
++int dma_fence_signal_timestamp_locked(struct dma_fence *fence,
++				      ktime_t timestamp);
+ signed long dma_fence_default_wait(struct dma_fence *fence,
+ 				   bool intr, signed long timeout);
+ int dma_fence_add_callback(struct dma_fence *fence,
+diff --git a/include/linux/dma-heap.h b/include/linux/dma-heap.h
+index 83b8cfb2d..e8f0e92c2 100644
+--- a/include/linux/dma-heap.h
++++ b/include/linux/dma-heap.h
+@@ -16,15 +16,17 @@ struct dma_heap;
+ 
+ /**
+  * struct dma_heap_ops - ops to operate on a given heap
+- * @allocate:		allocate dmabuf and return fd
++ * @allocate:		allocate dmabuf and return struct dma_buf ptr
++ * @get_pool_size:	if heap maintains memory pools, get pool size in bytes
+  *
+- * allocate returns dmabuf fd  on success, -errno on error.
++ * allocate returns dmabuf on success, ERR_PTR(-errno) on error.
+  */
+ struct dma_heap_ops {
+-	int (*allocate)(struct dma_heap *heap,
++	struct dma_buf *(*allocate)(struct dma_heap *heap,
+ 			unsigned long len,
+ 			unsigned long fd_flags,
+ 			unsigned long heap_flags);
++	long (*get_pool_size)(struct dma_heap *heap);
+ };
+ 
+ /**
+@@ -50,6 +52,15 @@ struct dma_heap_export_info {
+  */
+ void *dma_heap_get_drvdata(struct dma_heap *heap);
+ 
++/**
++ * dma_heap_get_dev() - get device struct for the heap
++ * @heap: DMA-Heap to retrieve device struct from
++ *
++ * Returns:
++ * The device struct for the heap.
++ */
++struct device *dma_heap_get_dev(struct dma_heap *heap);
++
+ /**
+  * dma_heap_get_name() - get heap name
+  * @heap: DMA-Heap to retrieve private data for
+@@ -65,4 +76,49 @@ const char *dma_heap_get_name(struct dma_heap *heap);
+  */
+ struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info);
+ 
++/**
++ * dma_heap_put - drops a reference to a dmabuf heaps, potentially freeing it
++ * @heap:		heap pointer
++ */
++void dma_heap_put(struct dma_heap *heap);
++
++/**
++ * dma_heap_find - Returns the registered dma_heap with the specified name
++ * @name: Name of the heap to find
++ *
++ * NOTE: dma_heaps returned from this function MUST be released
++ * using dma_heap_put() when the user is done.
++ */
++struct dma_heap *dma_heap_find(const char *name);
++
++/**
++ * dma_heap_buffer_alloc - Allocate dma-buf from a dma_heap
++ * @heap:	dma_heap to allocate from
++ * @len:	size to allocate
++ * @fd_flags:	flags to set on returned dma-buf fd
++ * @heap_flags:	flags to pass to the dma heap
++ *
++ * This is for internal dma-buf allocations only.
++ */
++struct dma_buf *dma_heap_buffer_alloc(struct dma_heap *heap, size_t len,
++				      unsigned int fd_flags,
++				      unsigned int heap_flags);
++
++/** dma_heap_buffer_free - Free dma_buf allocated by dma_heap_buffer_alloc
++ * @dma_buf:	dma_buf to free
++ *
++ * This is really only a simple wrapper to dma_buf_put()
++ */
++void dma_heap_buffer_free(struct dma_buf *);
++
++/**
++ * dma_heap_bufferfd_alloc - Allocate dma-buf fd from a dma_heap
++ * @heap:	dma_heap to allocate from
++ * @len:	size to allocate
++ * @fd_flags:	flags to set on returned dma-buf fd
++ * @heap_flags:	flags to pass to the dma heap
++ */
++int dma_heap_bufferfd_alloc(struct dma_heap *heap, size_t len,
++			    unsigned int fd_flags,
++			    unsigned int heap_flags);
+ #endif /* _DMA_HEAPS_H */
+diff --git a/include/linux/dma-iommu.h b/include/linux/dma-iommu.h
+index 2112f21f7..f51561eda 100644
+--- a/include/linux/dma-iommu.h
++++ b/include/linux/dma-iommu.h
+@@ -37,6 +37,11 @@ void iommu_dma_compose_msi_msg(struct msi_desc *desc,
+ 
+ void iommu_dma_get_resv_regions(struct device *dev, struct list_head *list);
+ 
++int iommu_dma_reserve_iova(struct device *dev, dma_addr_t base,
++			   u64 size);
++
++int iommu_dma_enable_best_fit_algo(struct device *dev);
++
+ #else /* CONFIG_IOMMU_DMA */
+ 
+ struct iommu_domain;
+@@ -78,5 +83,16 @@ static inline void iommu_dma_get_resv_regions(struct device *dev, struct list_he
+ {
+ }
+ 
++static inline int iommu_dma_reserve_iova(struct device *dev, dma_addr_t base,
++					 u64 size)
++{
++	return -ENODEV;
++}
++
++static inline int iommu_dma_enable_best_fit_algo(struct device *dev)
++{
++	return -ENODEV;
++}
++
+ #endif	/* CONFIG_IOMMU_DMA */
+ #endif	/* __DMA_IOMMU_H */
+diff --git a/include/linux/dma-map-ops.h b/include/linux/dma-map-ops.h
+index a5f89fc4d..a3ff9280f 100644
+--- a/include/linux/dma-map-ops.h
++++ b/include/linux/dma-map-ops.h
+@@ -258,6 +258,14 @@ void arch_dma_free(struct device *dev, size_t size, void *cpu_addr,
+ #define pgprot_dmacoherent(prot)	pgprot_noncached(prot)
+ #endif
+ 
++/*
++ * If there is no system cache pgprot, then fallback to dmacoherent
++ * pgprot, as the expectation is that the device is not coherent.
++ */
++#ifndef pgprot_syscached
++#define pgprot_syscached(prot)		pgprot_dmacoherent(prot)
++#endif
++
+ pgprot_t dma_pgprot(struct device *dev, pgprot_t prot, unsigned long attrs);
+ #else
+ static inline pgprot_t dma_pgprot(struct device *dev, pgprot_t prot,
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index a7d70cdee..7270f12e2 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -61,6 +61,23 @@
+  */
+ #define DMA_ATTR_PRIVILEGED		(1UL << 9)
+ 
++/*
++ * DMA_ATTR_SYS_CACHE_ONLY: used to indicate that the buffer should be mapped
++ * with the correct memory attributes so that it can be cached in the system
++ * or last level cache. This is useful for buffers that are being mapped for
++ * devices that are non-coherent, but can use the system cache.
++ */
++#define DMA_ATTR_SYS_CACHE_ONLY		(1UL << 10)
++
++/*
++ * DMA_ATTR_SYS_CACHE_ONLY_NWA: used to indicate that the buffer should be
++ * mapped with the correct memory attributes so that it can be cached in the
++ * system or last level cache, with a no write allocate cache policy. This is
++ * useful for buffers that are being mapped for devices that are non-coherent,
++ * but can use the system cache.
++ */
++#define DMA_ATTR_SYS_CACHE_ONLY_NWA	(1UL << 11)
++
+ /*
+  * A dma_addr_t can hold any valid DMA or bus address for the platform.  It can
+  * be given to a device to use as a DMA source or target.  It is specific to a
+diff --git a/include/linux/dmaengine.h b/include/linux/dmaengine.h
+index dd357a747..493a047ed 100644
+--- a/include/linux/dmaengine.h
++++ b/include/linux/dmaengine.h
+@@ -418,6 +418,9 @@ enum dma_slave_buswidth {
+  * @slave_id: Slave requester id. Only valid for slave channels. The dma
+  * slave peripheral will have unique id as dma requester which need to be
+  * pass as slave config.
++ * @peripheral_config: peripheral configuration for programming peripheral
++ * for dmaengine transfer
++ * @peripheral_size: peripheral configuration buffer size
+  *
+  * This struct is passed in as configuration data to a DMA engine
+  * in order to set up a certain channel for DMA transport at runtime.
+@@ -443,6 +446,8 @@ struct dma_slave_config {
+ 	u32 dst_port_window_size;
+ 	bool device_fc;
+ 	unsigned int slave_id;
++	void *peripheral_config;
++	size_t peripheral_size;
+ };
+ 
+ /**
+diff --git a/include/linux/energy_model.h b/include/linux/energy_model.h
+index 5f04a2b35..9ca1ea02f 100644
+--- a/include/linux/energy_model.h
++++ b/include/linux/energy_model.h
+@@ -29,6 +29,8 @@ struct em_perf_state {
+  * em_perf_domain - Performance domain
+  * @table:		List of performance states, in ascending order
+  * @nr_perf_states:	Number of performance states
++ * @milliwatts:		Flag indicating the power values are in milli-Watts
++ *			or some other scale.
+  * @cpus:		Cpumask covering the CPUs of the domain. It's here
+  *			for performance reasons to avoid potential cache
+  *			misses during energy calculations in the scheduler
+@@ -43,6 +45,7 @@ struct em_perf_state {
+ struct em_perf_domain {
+ 	struct em_perf_state *table;
+ 	int nr_perf_states;
++	int milliwatts;
+ 	unsigned long cpus[];
+ };
+ 
+@@ -95,7 +98,8 @@ struct em_data_callback {
+ struct em_perf_domain *em_cpu_get(int cpu);
+ struct em_perf_domain *em_pd_get(struct device *dev);
+ int em_dev_register_perf_domain(struct device *dev, unsigned int nr_states,
+-				struct em_data_callback *cb, cpumask_t *span);
++				struct em_data_callback *cb, cpumask_t *span,
++				bool milliwatts);
+ void em_dev_unregister_perf_domain(struct device *dev);
+ 
+ /**
+@@ -119,6 +123,9 @@ static inline unsigned long em_cpu_energy(struct em_perf_domain *pd,
+ 	struct em_perf_state *ps;
+ 	int i, cpu;
+ 
++	if (!sum_util)
++		return 0;
++
+ 	/*
+ 	 * In order to predict the performance state, map the utilization of
+ 	 * the most utilized CPU of the performance domain to a requested
+@@ -202,7 +209,8 @@ struct em_data_callback {};
+ 
+ static inline
+ int em_dev_register_perf_domain(struct device *dev, unsigned int nr_states,
+-				struct em_data_callback *cb, cpumask_t *span)
++				struct em_data_callback *cb, cpumask_t *span,
++				bool milliwatts)
+ {
+ 	return -EINVAL;
+ }
+diff --git a/include/linux/extcon.h b/include/linux/extcon.h
+index 0c19010da..9c4ff7f7d 100644
+--- a/include/linux/extcon.h
++++ b/include/linux/extcon.h
+@@ -37,6 +37,7 @@
+ /* USB external connector */
+ #define EXTCON_USB		1
+ #define EXTCON_USB_HOST		2
++#define EXTCON_USB_VBUS_EN	3
+ 
+ /*
+  * Charging external connector
+diff --git a/include/linux/freezer.h b/include/linux/freezer.h
+index 27828145c..f753c307b 100644
+--- a/include/linux/freezer.h
++++ b/include/linux/freezer.h
+@@ -27,6 +27,11 @@ static inline bool frozen(struct task_struct *p)
+ 	return p->flags & PF_FROZEN;
+ }
+ 
++static inline bool frozen_or_skipped(struct task_struct *p)
++{
++	return p->flags & (PF_FROZEN | PF_FREEZER_SKIP);
++}
++
+ extern bool freezing_slow_path(struct task_struct *p);
+ 
+ /*
+@@ -270,6 +275,7 @@ static inline int freezable_schedule_hrtimeout_range(ktime_t *expires,
+ 
+ #else /* !CONFIG_FREEZER */
+ static inline bool frozen(struct task_struct *p) { return false; }
++static inline bool frozen_or_skipped(struct task_struct *p) { return false; }
+ static inline bool freezing(struct task_struct *p) { return false; }
+ static inline void __thaw_task(struct task_struct *t) {}
+ 
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index e90c267e7..f94cfde78 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -31,6 +31,26 @@
+  * if the IOMMU page table format is equivalent.
+  */
+ #define IOMMU_PRIV	(1 << 5)
++/*
++ * Non-coherent masters can use this page protection flag to set cacheable
++ * memory attributes for only a transparent outer level of cache, also known as
++ * the last-level or system cache.
++ */
++#define IOMMU_SYS_CACHE_ONLY	(1 << 6)
++/*
++ * Non-coherent masters can use this page protection flag to set cacheable
++ * memory attributes with a no write allocation cache policy for only a
++ * transparent outer level of cache, also known as the last-level or system
++ * cache.
++ */
++#define IOMMU_SYS_CACHE_ONLY_NWA (1 << 7)
++
++#ifdef CONFIG_NO_GKI
++
++/* For shoting entire IOMMU tlb once */
++#define IOMMU_TLB_SHOT_ENTIRE	(1 << 8)
++
++#endif
+ 
+ struct iommu_ops;
+ struct iommu_group;
+@@ -190,7 +210,12 @@ struct iommu_iotlb_gather {
+  * @attach_dev: attach device to an iommu domain
+  * @detach_dev: detach device from an iommu domain
+  * @map: map a physically contiguous memory region to an iommu domain
++ * @map_pages: map a physically contiguous set of pages of the same size to
++ *             an iommu domain.
++ * @map_sg: map a scatter-gather list of physically contiguous chunks to
++ *          an iommu domain.
+  * @unmap: unmap a physically contiguous memory region from an iommu domain
++ * @unmap_pages: unmap a number of pages of the same size from an iommu domain
+  * @flush_iotlb_all: Synchronously flush all hardware TLBs for this domain
+  * @iotlb_sync_map: Sync mappings created recently using @map to the hardware
+  * @iotlb_sync: Flush all queued ranges from the hardware TLBs and empty flush
+@@ -241,10 +266,20 @@ struct iommu_ops {
+ 	void (*detach_dev)(struct iommu_domain *domain, struct device *dev);
+ 	int (*map)(struct iommu_domain *domain, unsigned long iova,
+ 		   phys_addr_t paddr, size_t size, int prot, gfp_t gfp);
++	int (*map_pages)(struct iommu_domain *domain, unsigned long iova,
++			 phys_addr_t paddr, size_t pgsize, size_t pgcount,
++			 int prot, gfp_t gfp, size_t *mapped);
++	int (*map_sg)(struct iommu_domain *domain, unsigned long iova,
++		      struct scatterlist *sg, unsigned int nents, int prot,
++		      gfp_t gfp, size_t *mapped);
+ 	size_t (*unmap)(struct iommu_domain *domain, unsigned long iova,
+ 		     size_t size, struct iommu_iotlb_gather *iotlb_gather);
++	size_t (*unmap_pages)(struct iommu_domain *domain, unsigned long iova,
++			      size_t pgsize, size_t pgcount,
++			      struct iommu_iotlb_gather *iotlb_gather);
+ 	void (*flush_iotlb_all)(struct iommu_domain *domain);
+-	void (*iotlb_sync_map)(struct iommu_domain *domain);
++	void (*iotlb_sync_map)(struct iommu_domain *domain, unsigned long iova,
++			       size_t size);
+ 	void (*iotlb_sync)(struct iommu_domain *domain,
+ 			   struct iommu_iotlb_gather *iotlb_gather);
+ 	phys_addr_t (*iova_to_phys)(struct iommu_domain *domain, dma_addr_t iova);
+@@ -561,6 +596,8 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
+ extern struct iommu_group *pci_device_group(struct device *dev);
+ /* Generic device grouping function */
+ extern struct iommu_group *generic_device_group(struct device *dev);
++extern void rk_iommu_mask_irq(struct device *dev);
++extern void rk_iommu_unmask_irq(struct device *dev);
+ /* FSL-MC device grouping function */
+ struct iommu_group *fsl_mc_device_group(struct device *dev);
+ 
+@@ -1069,6 +1106,14 @@ static inline struct iommu_fwspec *dev_iommu_fwspec_get(struct device *dev)
+ {
+ 	return NULL;
+ }
++
++static inline void rk_iommu_mask_irq(struct device *dev)
++{
++}
++
++static inline void rk_iommu_unmask_irq(struct device *dev)
++{
++}
+ #endif /* CONFIG_IOMMU_API */
+ 
+ /**
+diff --git a/include/linux/iova.h b/include/linux/iova.h
+index a0637abff..58713bb72 100644
+--- a/include/linux/iova.h
++++ b/include/linux/iova.h
+@@ -95,6 +95,7 @@ struct iova_domain {
+ 						   flush-queues */
+ 	atomic_t fq_timer_on;			/* 1 when timer is active, 0
+ 						   when not */
++	bool best_fit;
+ };
+ 
+ static inline unsigned long iova_size(struct iova *iova)
+diff --git a/include/linux/irqchip/arm-gic-v3.h b/include/linux/irqchip/arm-gic-v3.h
+index f6d092fdb..ffb0a8705 100644
+--- a/include/linux/irqchip/arm-gic-v3.h
++++ b/include/linux/irqchip/arm-gic-v3.h
+@@ -708,6 +708,8 @@ static inline bool gic_enable_sre(void)
+ 	return !!(val & ICC_SRE_EL1_SRE);
+ }
+ 
++void gic_resume(void);
++
+ #endif
+ 
+ #endif
+diff --git a/include/linux/irqchip/arm-gic-v4.h b/include/linux/irqchip/arm-gic-v4.h
+index 6976b8331..943c3411c 100644
+--- a/include/linux/irqchip/arm-gic-v4.h
++++ b/include/linux/irqchip/arm-gic-v4.h
+@@ -39,6 +39,8 @@ struct its_vpe {
+ 	irq_hw_number_t		vpe_db_lpi;
+ 	/* VPE resident */
+ 	bool			resident;
++	/* VPT parse complete */
++	bool			ready;
+ 	union {
+ 		/* GICv4.0 implementations */
+ 		struct {
+@@ -104,6 +106,7 @@ enum its_vcpu_info_cmd_type {
+ 	PROP_UPDATE_AND_INV_VLPI,
+ 	SCHEDULE_VPE,
+ 	DESCHEDULE_VPE,
++	COMMIT_VPE,
+ 	INVALL_VPE,
+ 	PROP_UPDATE_VSGI,
+ };
+@@ -129,6 +132,7 @@ int its_alloc_vcpu_irqs(struct its_vm *vm);
+ void its_free_vcpu_irqs(struct its_vm *vm);
+ int its_make_vpe_resident(struct its_vpe *vpe, bool g0en, bool g1en);
+ int its_make_vpe_non_resident(struct its_vpe *vpe, bool db);
++int its_commit_vpe(struct its_vpe *vpe);
+ int its_invall_vpe(struct its_vpe *vpe);
+ int its_map_vlpi(int irq, struct its_vlpi_map *map);
+ int its_get_vlpi(int irq, struct its_vlpi_map *map);
+diff --git a/include/linux/memblock.h b/include/linux/memblock.h
+index 3baea2ef3..2b770134c 100644
+--- a/include/linux/memblock.h
++++ b/include/linux/memblock.h
+@@ -25,6 +25,10 @@ extern unsigned long max_pfn;
+  */
+ extern unsigned long long max_possible_pfn;
+ 
++#ifdef CONFIG_ROCKCHIP_THUNDER_BOOT
++extern int defer_free_memblock(void *unused);
++#endif
++
+ /**
+  * enum memblock_flags - definition of memory region attributes
+  * @MEMBLOCK_NONE: no special request
+@@ -404,13 +408,13 @@ void *memblock_alloc_try_nid(phys_addr_t size, phys_addr_t align,
+ 			     phys_addr_t min_addr, phys_addr_t max_addr,
+ 			     int nid);
+ 
+-static inline void * __init memblock_alloc(phys_addr_t size,  phys_addr_t align)
++static __always_inline void *memblock_alloc(phys_addr_t size, phys_addr_t align)
+ {
+ 	return memblock_alloc_try_nid(size, align, MEMBLOCK_LOW_LIMIT,
+ 				      MEMBLOCK_ALLOC_ACCESSIBLE, NUMA_NO_NODE);
+ }
+ 
+-static inline void * __init memblock_alloc_raw(phys_addr_t size,
++static inline void *memblock_alloc_raw(phys_addr_t size,
+ 					       phys_addr_t align)
+ {
+ 	return memblock_alloc_try_nid_raw(size, align, MEMBLOCK_LOW_LIMIT,
+@@ -418,7 +422,7 @@ static inline void * __init memblock_alloc_raw(phys_addr_t size,
+ 					  NUMA_NO_NODE);
+ }
+ 
+-static inline void * __init memblock_alloc_from(phys_addr_t size,
++static inline void *memblock_alloc_from(phys_addr_t size,
+ 						phys_addr_t align,
+ 						phys_addr_t min_addr)
+ {
+@@ -426,33 +430,33 @@ static inline void * __init memblock_alloc_from(phys_addr_t size,
+ 				      MEMBLOCK_ALLOC_ACCESSIBLE, NUMA_NO_NODE);
+ }
+ 
+-static inline void * __init memblock_alloc_low(phys_addr_t size,
++static inline void *memblock_alloc_low(phys_addr_t size,
+ 					       phys_addr_t align)
+ {
+ 	return memblock_alloc_try_nid(size, align, MEMBLOCK_LOW_LIMIT,
+ 				      ARCH_LOW_ADDRESS_LIMIT, NUMA_NO_NODE);
+ }
+ 
+-static inline void * __init memblock_alloc_node(phys_addr_t size,
++static inline void *memblock_alloc_node(phys_addr_t size,
+ 						phys_addr_t align, int nid)
+ {
+ 	return memblock_alloc_try_nid(size, align, MEMBLOCK_LOW_LIMIT,
+ 				      MEMBLOCK_ALLOC_ACCESSIBLE, nid);
+ }
+ 
+-static inline void __init memblock_free_early(phys_addr_t base,
++static inline void memblock_free_early(phys_addr_t base,
+ 					      phys_addr_t size)
+ {
+ 	memblock_free(base, size);
+ }
+ 
+-static inline void __init memblock_free_early_nid(phys_addr_t base,
++static inline void memblock_free_early_nid(phys_addr_t base,
+ 						  phys_addr_t size, int nid)
+ {
+ 	memblock_free(base, size);
+ }
+ 
+-static inline void __init memblock_free_late(phys_addr_t base, phys_addr_t size)
++static inline void memblock_free_late(phys_addr_t base, phys_addr_t size)
+ {
+ 	__memblock_free_late(base, size);
+ }
+@@ -460,7 +464,7 @@ static inline void __init memblock_free_late(phys_addr_t base, phys_addr_t size)
+ /*
+  * Set the allocation direction to bottom-up or top-down.
+  */
+-static inline void __init memblock_set_bottom_up(bool enable)
++static inline __init void memblock_set_bottom_up(bool enable)
+ {
+ 	memblock.bottom_up = enable;
+ }
+@@ -470,7 +474,7 @@ static inline void __init memblock_set_bottom_up(bool enable)
+  * if this is true, that said, memblock will allocate memory
+  * in bottom-up direction.
+  */
+-static inline bool memblock_bottom_up(void)
++static inline __init bool memblock_bottom_up(void)
+ {
+ 	return memblock.bottom_up;
+ }
+diff --git a/include/linux/mfd/rk808.h b/include/linux/mfd/rk808.h
+index e07f6e61c..7cdc5dfa4 100644
+--- a/include/linux/mfd/rk808.h
++++ b/include/linux/mfd/rk808.h
+@@ -113,6 +113,235 @@ enum rk808_reg {
+ #define RK808_INT_STS_MSK_REG2	0x4f
+ #define RK808_IO_POL_REG	0x50
+ 
++/* RK816 */
++enum rk816_reg {
++	RK816_ID_DCDC1,
++	RK816_ID_DCDC2,
++	RK816_ID_DCDC3,
++	RK816_ID_DCDC4,
++	RK816_ID_LDO1,
++	RK816_ID_LDO2,
++	RK816_ID_LDO3,
++	RK816_ID_LDO4,
++	RK816_ID_LDO5,
++	RK816_ID_LDO6,
++};
++
++/*VERSION REGISTER*/
++#define RK816_CHIP_NAME_REG			0x17
++#define RK816_CHIP_VER_REG			0x18
++#define RK816_OTP_VER_REG			0x19
++#define RK816_NUM_REGULATORS			10
++
++/*POWER ON/OFF REGISTER*/
++#define RK816_VB_MON_REG			0x21
++#define RK816_THERMAL_REG			0x22
++#define RK816_PWRON_LP_INT_TIME_REG		0x47
++#define RK816_PWRON_DB_REG			0x48
++#define RK816_DEV_CTRL_REG			0x4B
++#define RK816_ON_SOURCE_REG			0xAE
++#define RK816_OFF_SOURCE_REG			0xAF
++
++/*POWER CHANNELS ENABLE REGISTER*/
++#define RK816_DCDC_EN_REG1			0x23
++#define RK816_DCDC_EN_REG2			0x24
++#define RK816_SLP_DCDC_EN_REG			0x25
++#define RK816_SLP_LDO_EN_REG			0x26
++#define RK816_LDO_EN_REG1			0x27
++#define RK816_LDO_EN_REG2			0x28
++
++/*BUCK AND LDO CONFIG REGISTER*/
++#define RK816_BUCK1_CONFIG_REG			0x2E
++#define RK816_BUCK1_ON_VSEL_REG			0x2F
++#define RK816_BUCK1_SLP_VSEL_REG		0x30
++#define RK816_BUCK2_CONFIG_REG			0x32
++#define RK816_BUCK2_ON_VSEL_REG			0x33
++#define RK816_BUCK2_SLP_VSEL_REG		0x34
++#define RK816_BUCK3_CONFIG_REG			0x36
++#define RK816_BUCK4_CONFIG_REG			0x37
++#define RK816_BUCK4_ON_VSEL_REG			0x38
++#define RK816_BUCK4_SLP_VSEL_REG		0x39
++#define RK816_LDO1_ON_VSEL_REG			0x3B
++#define RK816_LDO1_SLP_VSEL_REG			0x3C
++#define RK816_LDO2_ON_VSEL_REG			0x3D
++#define RK816_LDO2_SLP_VSEL_REG			0x3E
++#define RK816_LDO3_ON_VSEL_REG			0x3F
++#define RK816_LDO3_SLP_VSEL_REG			0x40
++#define RK816_LDO4_ON_VSEL_REG			0x41
++#define RK816_LDO4_SLP_VSEL_REG			0x42
++#define RK816_LDO5_ON_VSEL_REG			0x43
++#define RK816_LDO5_SLP_VSEL_REG			0x44
++#define RK816_LDO6_ON_VSEL_REG			0x45
++#define RK816_LDO6_SLP_VSEL_REG			0x46
++#define RK816_GPIO_IO_POL_REG			0x50
++
++/*CHARGER BOOST AND OTG REGISTER*/
++#define RK816_OTG_BUCK_LDO_CONFIG_REG           0x2A
++#define RK816_CHRG_CONFIG_REG                   0x2B
++#define RK816_BOOST_ON_VESL_REG                 0x54
++#define RK816_BOOST_SLP_VSEL_REG                0x55
++#define RK816_CHRG_BOOST_CONFIG_REG             0x9A
++#define RK816_SUP_STS_REG                       0xA0
++#define RK816_USB_CTRL_REG                      0xA1
++#define RK816_CHRG_CTRL_REG1                    0xA3
++#define RK816_CHRG_CTRL_REG2                    0xA4
++#define RK816_CHRG_CTRL_REG3                    0xA5
++#define RK816_BAT_CTRL_REG                      0xA6
++#define RK816_BAT_HTS_TS_REG                    0xA8
++#define RK816_BAT_LTS_TS_REG                    0xA9
++
++#define RK816_TS_CTRL_REG			0xAC
++#define RK816_ADC_CTRL_REG			0xAD
++#define RK816_GGCON_REG				0xB0
++#define RK816_GGSTS_REG				0xB1
++#define RK816_ZERO_CUR_ADC_REGH			0xB2
++#define RK816_ZERO_CUR_ADC_REGL			0xB3
++#define RK816_GASCNT_CAL_REG3			0xB4
++#define RK816_GASCNT_CAL_REG2			0xB5
++#define RK816_GASCNT_CAL_REG1			0xB6
++#define RK816_GASCNT_CAL_REG0			0xB7
++#define RK816_GASCNT_REG3			0xB8
++#define RK816_GASCNT_REG2			0xB9
++#define RK816_GASCNT_REG1			0xBA
++#define RK816_GASCNT_REG0			0xBB
++#define RK816_BAT_CUR_AVG_REGH			0xBC
++#define RK816_BAT_CUR_AVG_REGL			0xBD
++#define RK816_TS_ADC_REGH			0xBE
++#define RK816_TS_ADC_REGL			0xBF
++#define RK816_USB_ADC_REGH			0xC0
++#define RK816_USB_ADC_REGL			0xC1
++#define RK816_BAT_OCV_REGH			0xC2
++#define RK816_BAT_OCV_REGL			0xC3
++#define RK816_BAT_VOL_REGH			0xC4
++#define RK816_BAT_VOL_REGL			0xC5
++#define RK816_RELAX_ENTRY_THRES_REGH		0xC6
++#define RK816_RELAX_ENTRY_THRES_REGL		0xC7
++#define RK816_RELAX_EXIT_THRES_REGH		0xC8
++#define RK816_RELAX_EXIT_THRES_REGL		0xC9
++#define RK816_RELAX_VOL1_REGH			0xCA
++#define RK816_RELAX_VOL1_REGL			0xCB
++#define RK816_RELAX_VOL2_REGH			0xCC
++#define RK816_RELAX_VOL2_REGL			0xCD
++#define RK816_RELAX_CUR1_REGH			0xCE
++#define RK816_RELAX_CUR1_REGL			0xCF
++#define RK816_RELAX_CUR2_REGH			0xD0
++#define RK816_RELAX_CUR2_REGL			0xD1
++#define RK816_CAL_OFFSET_REGH			0xD2
++#define RK816_CAL_OFFSET_REGL			0xD3
++#define RK816_NON_ACT_TIMER_CNT_REG		0xD4
++#define RK816_VCALIB0_REGH			0xD5
++#define RK816_VCALIB0_REGL			0xD6
++#define RK816_VCALIB1_REGH			0xD7
++#define RK816_VCALIB1_REGL			0xD8
++#define RK816_FCC_GASCNT_REG3			0xD9
++#define RK816_FCC_GASCNT_REG2			0xDA
++#define RK816_FCC_GASCNT_REG1			0xDB
++#define RK816_FCC_GASCNT_REG0			0xDC
++#define RK816_IOFFSET_REGH			0xDD
++#define RK816_IOFFSET_REGL			0xDE
++#define RK816_SLEEP_CON_SAMP_CUR_REG		0xDF
++
++/*DATA REGISTER*/
++#define RK816_SOC_REG				0xE0
++#define RK816_REMAIN_CAP_REG3			0xE1
++#define RK816_REMAIN_CAP_REG2			0xE2
++#define RK816_REMAIN_CAP_REG1			0xE3
++#define RK816_REMAIN_CAP_REG0			0xE4
++#define RK816_UPDATE_LEVE_REG			0xE5
++#define RK816_NEW_FCC_REG3			0xE6
++#define RK816_NEW_FCC_REG2			0xE7
++#define RK816_NEW_FCC_REG1			0xE8
++#define RK816_NEW_FCC_REG0			0xE9
++#define RK816_NON_ACT_TIMER_CNT_REG_SAVE	0xEA
++#define RK816_OCV_VOL_VALID_REG			0xEB
++#define RK816_REBOOT_CNT_REG			0xEC
++#define RK816_PCB_IOFFSET_REG			0xED
++#define RK816_MISC_MARK_REG			0xEE
++#define RK816_HALT_CNT_REG			0xEF
++#define RK816_CALC_REST_REGH			0xF0
++#define RK816_CALC_REST_REGL			0xF1
++#define DATA18_REG				0xF2
++
++/*INTERRUPT REGISTER*/
++#define RK816_INT_STS_REG1			0x49
++#define RK816_INT_STS_MSK_REG1			0x4A
++#define RK816_INT_STS_REG2			0x4C
++#define RK816_INT_STS_MSK_REG2			0x4D
++#define RK816_INT_STS_REG3			0x4E
++#define RK816_INT_STS_MSK_REG3			0x4F
++#define RK816_GPIO_IO_POL_REG			0x50
++
++#define RK816_DATA18_REG			0xF2
++
++/* IRQ Definitions */
++#define RK816_IRQ_PWRON_FALL			0
++#define RK816_IRQ_PWRON_RISE			1
++#define RK816_IRQ_VB_LOW			2
++#define RK816_IRQ_PWRON				3
++#define RK816_IRQ_PWRON_LP			4
++#define RK816_IRQ_HOTDIE			5
++#define RK816_IRQ_RTC_ALARM			6
++#define RK816_IRQ_RTC_PERIOD			7
++#define RK816_IRQ_USB_OV			8
++#define RK816_IRQ_PLUG_IN			9
++#define RK816_IRQ_PLUG_OUT			10
++#define RK816_IRQ_CHG_OK			11
++#define RK816_IRQ_CHG_TE			12
++#define RK816_IRQ_CHG_TS			13
++#define RK816_IRQ_CHG_CVTLIM			14
++#define RK816_IRQ_DISCHG_ILIM			15
++
++#define RK816_IRQ_PWRON_FALL_MSK		BIT(5)
++#define RK816_IRQ_PWRON_RISE_MSK		BIT(6)
++#define RK816_IRQ_VB_LOW_MSK			BIT(1)
++#define RK816_IRQ_PWRON_MSK			BIT(2)
++#define RK816_IRQ_PWRON_LP_MSK			BIT(3)
++#define RK816_IRQ_HOTDIE_MSK			BIT(4)
++#define RK816_IRQ_RTC_ALARM_MSK			BIT(5)
++#define RK816_IRQ_RTC_PERIOD_MSK		BIT(6)
++#define RK816_IRQ_USB_OV_MSK			BIT(7)
++#define RK816_IRQ_PLUG_IN_MSK			BIT(0)
++#define RK816_IRQ_PLUG_OUT_MSK			BIT(1)
++#define RK816_IRQ_CHG_OK_MSK			BIT(2)
++#define RK816_IRQ_CHG_TE_MSK			BIT(3)
++#define RK816_IRQ_CHG_TS_MSK			BIT(4)
++#define RK816_IRQ_CHG_CVTLIM_MSK		BIT(6)
++#define RK816_IRQ_DISCHG_ILIM_MSK		BIT(7)
++
++#define RK816_VBAT_LOW_2V8			0x00
++#define RK816_VBAT_LOW_2V9			0x01
++#define RK816_VBAT_LOW_3V0			0x02
++#define RK816_VBAT_LOW_3V1			0x03
++#define RK816_VBAT_LOW_3V2			0x04
++#define RK816_VBAT_LOW_3V3			0x05
++#define RK816_VBAT_LOW_3V4			0x06
++#define RK816_VBAT_LOW_3V5			0x07
++#define RK816_PWR_FALL_INT_STATUS		(0x1 << 5)
++#define RK816_PWR_RISE_INT_STATUS		(0x1 << 6)
++#define RK816_ALARM_INT_STATUS			(0x1 << 5)
++#define EN_VBAT_LOW_IRQ				(0x1 << 4)
++#define VBAT_LOW_ACT_MASK			(0x1 << 4)
++#define RTC_TIMER_ALARM_INT_MSK			(0x3 << 2)
++#define RTC_TIMER_ALARM_INT_DIS			(0x0 << 2)
++#define RTC_PERIOD_ALARM_INT_MSK		(0x3 << 5)
++#define RTC_PERIOD_ALARM_INT_ST			(0x3 << 5)
++#define RTC_PERIOD_ALARM_INT_DIS		(0x3 << 5)
++#define RTC_PERIOD_ALARM_INT_EN			(0x9f)
++#define REG_WRITE_MSK				0xff
++#define BUCK4_MAX_ILIMIT			0x2c
++#define BUCK_RATE_MSK				(0x3 << 3)
++#define BUCK_RATE_12_5MV_US			(0x2 << 3)
++#define ALL_INT_FLAGS_ST			0xff
++#define PLUGIN_OUT_INT_EN			0xfc
++#define RK816_PWRON_FALL_RISE_INT_EN		0x9f
++#define BUCK1_2_IMAX_MAX			(0x3 << 6)
++#define BUCK3_4_IMAX_MAX			(0x3 << 3)
++#define BOOST_DISABLE				((0x1 << 5) | (0x0 << 1))
++#define BUCK4_VRP_3PERCENT			0xc0
++#define RK816_BUCK_DVS_CONFIRM			(0x1 << 7)
++#define RK816_TYPE_ES2				0x05
++#define RK816_CHIP_VERSION_MASK			0x0f
++
+ /* RK818 */
+ #define RK818_DCDC1			0
+ #define RK818_LDO1			4
+@@ -138,6 +367,8 @@ enum rk818_reg {
+ 	RK818_ID_OTG_SWITCH,
+ };
+ 
++#define RK818_VB_MON_REG		0x21
++#define RK818_THERMAL_REG		0x22
+ #define RK818_DCDC_EN_REG		0x23
+ #define RK818_LDO_EN_REG		0x24
+ #define RK818_SLEEP_SET_OFF_REG1	0x25
+@@ -190,7 +421,84 @@ enum rk818_reg {
+ #define RK818_BOOST_LDO9_SLP_VSEL_REG	0x55
+ #define RK818_BOOST_CTRL_REG		0x56
+ #define RK818_DCDC_ILMAX		0x90
++#define RK818_CHRG_COMP_REG		0x9a
++#define RK818_SUP_STS_REG		0xa0
+ #define RK818_USB_CTRL_REG		0xa1
++#define RK818_CHRG_CTRL_REG1		0xa3
++#define RK818_CHRG_CTRL_REG2		0xa4
++#define RK818_CHRG_CTRL_REG3		0xa5
++#define RK818_BAT_CTRL_REG		0xa6
++#define RK818_BAT_HTS_TS1_REG		0xa8
++#define RK818_BAT_LTS_TS1_REG		0xa9
++#define RK818_BAT_HTS_TS2_REG		0xaa
++#define RK818_BAT_LTS_TS2_REG		0xab
++#define RK818_TS_CTRL_REG		0xac
++#define RK818_ADC_CTRL_REG		0xad
++#define RK818_ON_SOURCE_REG		0xae
++#define RK818_OFF_SOURCE_REG		0xaf
++#define RK818_GGCON_REG			0xb0
++#define RK818_GGSTS_REG			0xb1
++#define RK818_FRAME_SMP_INTERV_REG	0xb2
++#define RK818_AUTO_SLP_CUR_THR_REG	0xb3
++#define RK818_GASCNT_CAL_REG3		0xb4
++#define RK818_GASCNT_CAL_REG2		0xb5
++#define RK818_GASCNT_CAL_REG1		0xb6
++#define RK818_GASCNT_CAL_REG0		0xb7
++#define RK818_GASCNT3_REG		0xb8
++#define RK818_GASCNT2_REG		0xb9
++#define RK818_GASCNT1_REG		0xba
++#define RK818_GASCNT0_REG		0xbb
++#define RK818_BAT_CUR_AVG_REGH		0xbc
++#define RK818_BAT_CUR_AVG_REGL		0xbd
++#define RK818_TS1_ADC_REGH		0xbe
++#define RK818_TS1_ADC_REGL		0xbf
++#define RK818_TS2_ADC_REGH		0xc0
++#define RK818_TS2_ADC_REGL		0xc1
++#define RK818_BAT_OCV_REGH		0xc2
++#define RK818_BAT_OCV_REGL		0xc3
++#define RK818_BAT_VOL_REGH		0xc4
++#define RK818_BAT_VOL_REGL		0xc5
++#define RK818_RELAX_ENTRY_THRES_REGH	0xc6
++#define RK818_RELAX_ENTRY_THRES_REGL	0xc7
++#define RK818_RELAX_EXIT_THRES_REGH	0xc8
++#define RK818_RELAX_EXIT_THRES_REGL	0xc9
++#define RK818_RELAX_VOL1_REGH		0xca
++#define RK818_RELAX_VOL1_REGL		0xcb
++#define RK818_RELAX_VOL2_REGH		0xcc
++#define RK818_RELAX_VOL2_REGL		0xcd
++#define RK818_BAT_CUR_R_CALC_REGH	0xce
++#define RK818_BAT_CUR_R_CALC_REGL	0xcf
++#define RK818_BAT_VOL_R_CALC_REGH	0xd0
++#define RK818_BAT_VOL_R_CALC_REGL	0xd1
++#define RK818_CAL_OFFSET_REGH		0xd2
++#define RK818_CAL_OFFSET_REGL		0xd3
++#define RK818_NON_ACT_TIMER_CNT_REG	0xd4
++#define RK818_VCALIB0_REGH		0xd5
++#define RK818_VCALIB0_REGL		0xd6
++#define RK818_VCALIB1_REGH		0xd7
++#define RK818_VCALIB1_REGL		0xd8
++#define RK818_IOFFSET_REGH		0xdd
++#define RK818_IOFFSET_REGL		0xde
++#define RK818_SOC_REG			0xe0
++#define RK818_REMAIN_CAP_REG3		0xe1
++#define RK818_REMAIN_CAP_REG2		0xe2
++#define RK818_REMAIN_CAP_REG1		0xe3
++#define RK818_REMAIN_CAP_REG0		0xe4
++#define RK818_UPDAT_LEVE_REG		0xe5
++#define RK818_NEW_FCC_REG3		0xe6
++#define RK818_NEW_FCC_REG2		0xe7
++#define RK818_NEW_FCC_REG1		0xe8
++#define RK818_NEW_FCC_REG0		0xe9
++#define RK818_NON_ACT_TIMER_CNT_SAVE_REG	0xea
++#define RK818_OCV_VOL_VALID_REG		0xeb
++#define RK818_REBOOT_CNT_REG		0xec
++#define RK818_POFFSET_REG		0xed
++#define RK818_MISC_MARK_REG		0xee
++#define RK818_HALT_CNT_REG		0xef
++#define RK818_CALC_REST_REGH		0xf0
++#define RK818_CALC_REST_REGL		0xf1
++#define RK818_SAVE_DATA19		0xf2
++#define RK818_NUM_REGULATOR		17
+ 
+ #define RK818_H5V_EN			BIT(0)
+ #define RK818_REF_RDY_CTRL		BIT(1)
+@@ -255,14 +563,22 @@ enum rk805_reg {
+ #define RK805_PWRON_FALL_RISE_INT_MSK	0x81
+ 
+ /* RK805 IRQ Definitions */
+-#define RK805_IRQ_PWRON_RISE		0
+ #define RK805_IRQ_VB_LOW		1
+ #define RK805_IRQ_PWRON			2
+ #define RK805_IRQ_PWRON_LP		3
+ #define RK805_IRQ_HOTDIE		4
+ #define RK805_IRQ_RTC_ALARM		5
+ #define RK805_IRQ_RTC_PERIOD		6
+-#define RK805_IRQ_PWRON_FALL		7
++
++/*
++ * When PMIC irq occurs, regmap-irq.c will traverse all PMIC child
++ * interrupts from low index 0 to high index, we give fall interrupt
++ * high priority to be called earlier than rise, so that it can be
++ * override by late rise event. This can helps to solve key release
++ * glitch which make a wrongly fall event immediately after rise.
++ */
++#define RK805_IRQ_PWRON_FALL		0
++#define RK805_IRQ_PWRON_RISE		7
+ 
+ #define RK805_IRQ_PWRON_RISE_MSK	BIT(0)
+ #define RK805_IRQ_VB_LOW_MSK		BIT(1)
+@@ -289,6 +605,16 @@ enum rk805_reg {
+ #define RK805_INT_ALARM_EN		(1 << 3)
+ #define RK805_INT_TIMER_EN		(1 << 2)
+ 
++#define RK805_SLP_LDO_EN_OFFSET		-1
++#define RK805_SLP_DCDC_EN_OFFSET	2
++
++#define RK805_RAMP_RATE_OFFSET		3
++#define RK805_RAMP_RATE_MASK		(3 << RK805_RAMP_RATE_OFFSET)
++#define RK805_RAMP_RATE_3MV_PER_US	(0 << RK805_RAMP_RATE_OFFSET)
++#define RK805_RAMP_RATE_6MV_PER_US	(1 << RK805_RAMP_RATE_OFFSET)
++#define RK805_RAMP_RATE_12_5MV_PER_US	(2 << RK805_RAMP_RATE_OFFSET)
++#define RK805_RAMP_RATE_25MV_PER_US	(3 << RK805_RAMP_RATE_OFFSET)
++
+ /* RK808 IRQ Definitions */
+ #define RK808_IRQ_VOUT_LO	0
+ #define RK808_IRQ_VB_LO		1
+@@ -348,6 +674,107 @@ enum rk805_reg {
+ 
+ #define RK818_NUM_IRQ		16
+ 
++/*RK818_DCDC_EN_REG*/
++#define BUCK1_EN_MASK		BIT(0)
++#define BUCK2_EN_MASK		BIT(1)
++#define BUCK3_EN_MASK		BIT(2)
++#define BUCK4_EN_MASK		BIT(3)
++#define BOOST_EN_MASK		BIT(4)
++#define LDO9_EN_MASK		BIT(5)
++#define SWITCH_EN_MASK		BIT(6)
++#define OTG_EN_MASK		BIT(7)
++
++#define BUCK1_EN_ENABLE		BIT(0)
++#define BUCK2_EN_ENABLE		BIT(1)
++#define BUCK3_EN_ENABLE		BIT(2)
++#define BUCK4_EN_ENABLE		BIT(3)
++#define BOOST_EN_ENABLE		BIT(4)
++#define LDO9_EN_ENABLE		BIT(5)
++#define SWITCH_EN_ENABLE	BIT(6)
++#define OTG_EN_ENABLE		BIT(7)
++
++#define BUCK1_SLP_SET_MASK	BIT(0)
++#define BUCK2_SLP_SET_MASK	BIT(1)
++#define BUCK3_SLP_SET_MASK	BIT(2)
++#define BUCK4_SLP_SET_MASK	BIT(3)
++#define BOOST_SLP_SET_MASK	BIT(4)
++#define LDO9_SLP_SET_MASK	BIT(5)
++#define SWITCH_SLP_SET_MASK	BIT(6)
++#define OTG_SLP_SET_MASK	BIT(7)
++
++#define BUCK1_SLP_SET_OFF	BIT(0)
++#define BUCK2_SLP_SET_OFF	BIT(1)
++#define BUCK3_SLP_SET_OFF	BIT(2)
++#define BUCK4_SLP_SET_OFF	BIT(3)
++#define BOOST_SLP_SET_OFF	BIT(4)
++#define LDO9_SLP_SET_OFF	BIT(5)
++#define SWITCH_SLP_SET_OFF	BIT(6)
++#define OTG_SLP_SET_OFF		BIT(7)
++#define OTG_BOOST_SLP_OFF	(BOOST_SLP_SET_OFF | OTG_SLP_SET_OFF)
++
++#define BUCK1_SLP_SET_ON	BIT(0)
++#define BUCK2_SLP_SET_ON	BIT(1)
++#define BUCK3_SLP_SET_ON	BIT(2)
++#define BUCK4_SLP_SET_ON	BIT(3)
++#define BOOST_SLP_SET_ON	BIT(4)
++#define LDO9_SLP_SET_ON		BIT(5)
++#define SWITCH_SLP_SET_ON	BIT(6)
++#define OTG_SLP_SET_ON		BIT(7)
++
++#define VOUT_LO_MASK		BIT(0)
++#define VB_LO_MASK		BIT(1)
++#define PWRON_MASK		BIT(2)
++#define PWRON_LP_MASK		BIT(3)
++#define HOTDIE_MASK		BIT(4)
++#define RTC_ALARM_MASK		BIT(5)
++#define RTC_PERIOD_MASK		BIT(6)
++#define USB_OV_MASK		BIT(7)
++
++#define VOUT_LO_DISABLE		BIT(0)
++#define VB_LO_DISABLE		BIT(1)
++#define PWRON_DISABLE		BIT(2)
++#define PWRON_LP_DISABLE	BIT(3)
++#define HOTDIE_DISABLE		BIT(4)
++#define RTC_ALARM_DISABLE	BIT(5)
++#define RTC_PERIOD_DISABLE	BIT(6)
++#define USB_OV_INT_DISABLE	BIT(7)
++
++#define VOUT_LO_ENABLE		(0 << 0)
++#define VB_LO_ENABLE		(0 << 1)
++#define PWRON_ENABLE		(0 << 2)
++#define PWRON_LP_ENABLE		(0 << 3)
++#define HOTDIE_ENABLE		(0 << 4)
++#define RTC_ALARM_ENABLE	(0 << 5)
++#define RTC_PERIOD_ENABLE	(0 << 6)
++#define USB_OV_INT_ENABLE	(0 << 7)
++
++#define PLUG_IN_MASK		BIT(0)
++#define PLUG_OUT_MASK		BIT(1)
++#define CHGOK_MASK		BIT(2)
++#define CHGTE_MASK		BIT(3)
++#define CHGTS1_MASK		BIT(4)
++#define TS2_MASK		BIT(5)
++#define CHG_CVTLIM_MASK		BIT(6)
++#define DISCHG_ILIM_MASK	BIT(7)
++
++#define PLUG_IN_DISABLE		BIT(0)
++#define PLUG_OUT_DISABLE	BIT(1)
++#define CHGOK_DISABLE		BIT(2)
++#define CHGTE_DISABLE		BIT(3)
++#define CHGTS1_DISABLE		BIT(4)
++#define TS2_DISABLE		BIT(5)
++#define CHG_CVTLIM_DISABLE	BIT(6)
++#define DISCHG_ILIM_DISABLE	BIT(7)
++
++#define PLUG_IN_ENABLE		BIT(0)
++#define PLUG_OUT_ENABLE		BIT(1)
++#define CHGOK_ENABLE		BIT(2)
++#define CHGTE_ENABLE		BIT(3)
++#define CHGTS1_ENABLE		BIT(4)
++#define TS2_ENABLE		BIT(5)
++#define CHG_CVTLIM_ENABLE	BIT(6)
++#define DISCHG_ILIM_ENABLE	BIT(7)
++
+ #define RK808_VBAT_LOW_2V8	0x00
+ #define RK808_VBAT_LOW_2V9	0x01
+ #define RK808_VBAT_LOW_3V0	0x02
+@@ -381,7 +808,10 @@ enum rk805_reg {
+ 
+ #define VOUT_LO_INT	BIT(0)
+ #define CLK32KOUT2_EN	BIT(0)
++#define CLK32KOUT2_FUNC		(0 << 1)
++#define CLK32KOUT2_FUNC_MASK	BIT(1)
+ 
++#define TEMP105C			0x08
+ #define TEMP115C			0x0c
+ #define TEMP_HOTDIE_MSK			0x0c
+ #define SLP_SD_MSK			(0x3 << 2)
+@@ -391,6 +821,7 @@ enum rk805_reg {
+ #define PWM_MODE_MSK			BIT(7)
+ #define FPWM_MODE			BIT(7)
+ #define AUTO_PWM_MODE			0
++#define REGS_WMSK			0xf0
+ 
+ enum rk817_reg_id {
+ 	RK817_ID_DCDC1 = 0,
+@@ -436,6 +867,10 @@ enum rk809_reg_id {
+ #define RK817_RTC_INT_REG		0xf
+ #define RK817_RTC_COMP_LSB_REG		0x10
+ #define RK817_RTC_COMP_MSB_REG		0x11
++#define RK817_ADC_CONFIG0		0x50
++#define RK817_CURE_ADC_K0		0xb0
++#define RK817_POWER_EN_SAVE0            0x99
++#define RK817_POWER_EN_SAVE1            0xa4
+ 
+ #define RK817_POWER_EN_REG(i)		(0xb1 + (i))
+ #define RK817_POWER_SLP_EN_REG(i)	(0xb5 + (i))
+@@ -462,6 +897,9 @@ enum rk809_reg_id {
+ #define RK817_LDO_ON_VSEL_REG(idx)	(0xcc + (idx) * 2)
+ #define RK817_BOOST_OTG_CFG		(0xde)
+ 
++#define RK817_CHRG_OUT			0xe4
++#define RK817_CHRG_IN			0xe5
++#define RK817_CHRG_STS			0xeb
+ #define RK817_ID_MSB			0xed
+ #define RK817_ID_LSB			0xee
+ 
+@@ -609,16 +1047,27 @@ enum {
+ 	RK805_ID = 0x8050,
+ 	RK808_ID = 0x0000,
+ 	RK809_ID = 0x8090,
++	RK816_ID = 0x8160,
+ 	RK817_ID = 0x8170,
+ 	RK818_ID = 0x8180,
+ };
+ 
++struct rk808_pin_info {
++	struct pinctrl *p;
++	struct pinctrl_state *reset;
++	struct pinctrl_state *power_off;
++	struct pinctrl_state *sleep;
++};
++
+ struct rk808 {
+ 	struct i2c_client		*i2c;
+ 	struct regmap_irq_chip_data	*irq_data;
++	struct regmap_irq_chip_data	*battery_irq_data;
+ 	struct regmap			*regmap;
+ 	long				variant;
+ 	const struct regmap_config	*regmap_cfg;
+ 	const struct regmap_irq_chip	*regmap_irq_chip;
++	void				(*pm_pwroff_prep_fn)(void);
++	struct rk808_pin_info *pins;
+ };
+ #endif /* __LINUX_REGULATOR_RK808_H */
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 40d7e98fc..819f6119d 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -141,6 +141,7 @@ struct mmc_host_ops {
+ 
+ 	/* Check if the card is pulling dat[0:3] low */
+ 	int	(*card_busy)(struct mmc_host *host);
++	int     (*set_sdio_status)(struct mmc_host *host, int val);
+ 
+ 	/* The tuning command opcode value is different for SD and eMMC cards */
+ 	int	(*execute_tuning)(struct mmc_host *host, u32 opcode);
+@@ -483,6 +484,9 @@ void mmc_free_host(struct mmc_host *);
+ int mmc_of_parse(struct mmc_host *host);
+ int mmc_of_parse_voltage(struct device_node *np, u32 *mask);
+ 
++extern struct mmc_host *primary_sdio_host;
++int mmc_host_rescan(struct mmc_host *host, int val, int is_cap_sdio_irq);
++
+ static inline void *mmc_priv(struct mmc_host *host)
+ {
+ 	return (void *)host->private;
+diff --git a/include/linux/mmu_context.h b/include/linux/mmu_context.h
+index 03dee12d2..bc4ac3c52 100644
+--- a/include/linux/mmu_context.h
++++ b/include/linux/mmu_context.h
+@@ -14,4 +14,12 @@
+ static inline void leave_mm(int cpu) { }
+ #endif
+ 
++/*
++ * CPUs that are capable of running task @p. By default, we assume a sane,
++ * homogeneous system. Must contain at least one active CPU.
++ */
++#ifndef task_cpu_possible_mask
++# define task_cpu_possible_mask(p)	cpu_possible_mask
++#endif
++
+ #endif
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index 81a55e974..aefa0b0bc 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -49,6 +49,12 @@ enum {
+ 	POWER_SUPPLY_CHARGE_TYPE_ADAPTIVE,	/* dynamically adjusted speed */
+ 	POWER_SUPPLY_CHARGE_TYPE_CUSTOM,	/* use CHARGE_CONTROL_* props */
+ 	POWER_SUPPLY_CHARGE_TYPE_LONGLIFE,	/* slow speed, longer life */
++
++	/*
++	 * force to 50 to minimize the chances of userspace binary
++	 * incompatibility on newer upstream kernels
++	 */
++	POWER_SUPPLY_CHARGE_TYPE_TAPER = 50,	/* charging in CV phase */
+ };
+ 
+ enum {
+@@ -386,12 +392,22 @@ extern void power_supply_put(struct power_supply *psy);
+ #ifdef CONFIG_OF
+ extern struct power_supply *power_supply_get_by_phandle(struct device_node *np,
+ 							const char *property);
++extern int power_supply_get_by_phandle_array(struct device_node *np,
++					     const char *property,
++					     struct power_supply **psy,
++					     ssize_t size);
+ extern struct power_supply *devm_power_supply_get_by_phandle(
+ 				    struct device *dev, const char *property);
+ #else /* !CONFIG_OF */
+ static inline struct power_supply *
+ power_supply_get_by_phandle(struct device_node *np, const char *property)
+ { return NULL; }
++static inline int
++power_supply_get_by_phandle_array(struct device_node *np,
++				  const char *property,
++				  struct power_supply **psy,
++				  int size)
++{ return 0; }
+ static inline struct power_supply *
+ devm_power_supply_get_by_phandle(struct device *dev, const char *property)
+ { return NULL; }
+@@ -426,9 +442,16 @@ static inline int power_supply_is_system_supplied(void) { return -ENOSYS; }
+ extern int power_supply_get_property(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    union power_supply_propval *val);
++#if IS_ENABLED(CONFIG_POWER_SUPPLY)
+ extern int power_supply_set_property(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    const union power_supply_propval *val);
++#else
++static inline int power_supply_set_property(struct power_supply *psy,
++			    enum power_supply_property psp,
++			    const union power_supply_propval *val)
++{ return 0; }
++#endif
+ extern int power_supply_property_is_writeable(struct power_supply *psy,
+ 					enum power_supply_property psp);
+ extern void power_supply_external_power_changed(struct power_supply *psy);
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 17d74f62c..541b45881 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -154,6 +154,7 @@ struct psi_group {
+ 	struct timer_list poll_timer;
+ 	wait_queue_head_t poll_wait;
+ 	atomic_t poll_wakeup;
++	atomic_t poll_scheduled;
+ 
+ 	/* Protects data used by the monitor */
+ 	struct mutex trigger_lock;
+diff --git a/include/linux/pwm.h b/include/linux/pwm.h
+index a13ff383f..6b2a7fb80 100644
+--- a/include/linux/pwm.h
++++ b/include/linux/pwm.h
+@@ -59,6 +59,9 @@ struct pwm_state {
+ 	u64 period;
+ 	u64 duty_cycle;
+ 	enum pwm_polarity polarity;
++#ifdef CONFIG_PWM_ROCKCHIP_ONESHOT
++	u64 oneshot_count;
++#endif /* CONFIG_PWM_ROCKCHIP_ONESHOT */
+ 	bool enabled;
+ };
+ 
+diff --git a/include/linux/reboot.h b/include/linux/reboot.h
+index 3734cd8f3..1c8d7856c 100644
+--- a/include/linux/reboot.h
++++ b/include/linux/reboot.h
+@@ -49,6 +49,26 @@ extern int register_restart_handler(struct notifier_block *);
+ extern int unregister_restart_handler(struct notifier_block *);
+ extern void do_kernel_restart(char *cmd);
+ 
++#ifdef CONFIG_NO_GKI
++extern int register_pre_restart_handler(struct notifier_block *nb);
++extern int unregister_pre_restart_handler(struct notifier_block *nb);
++extern void do_kernel_pre_restart(char *cmd);
++#else
++static inline int register_pre_restart_handler(struct notifier_block *nb)
++{
++	return 0;
++}
++
++static inline int unregister_pre_restart_handler(struct notifier_block *nb)
++{
++	return 0;
++}
++
++static inline void do_kernel_pre_restart(char *cmd)
++{
++}
++#endif
++
+ /*
+  * Architecture-specific implementations of sys_reboot commands.
+  */
+diff --git a/include/linux/regulator/driver.h b/include/linux/regulator/driver.h
+index 11cade737..d7c77ee37 100644
+--- a/include/linux/regulator/driver.h
++++ b/include/linux/regulator/driver.h
+@@ -223,6 +223,8 @@ enum regulator_type {
+  * @name: Identifying name for the regulator.
+  * @supply_name: Identifying the regulator supply
+  * @of_match: Name used to identify regulator in DT.
++ * @of_match_full_name: A flag to indicate that the of_match string, if
++ *			present, should be matched against the node full_name.
+  * @regulators_node: Name of node containing regulator definitions in DT.
+  * @of_parse_cb: Optional callback called only if of_match is present.
+  *               Will be called for each regulator parsed from DT, during
+@@ -314,6 +316,7 @@ struct regulator_desc {
+ 	const char *name;
+ 	const char *supply_name;
+ 	const char *of_match;
++	bool of_match_full_name;
+ 	const char *regulators_node;
+ 	int (*of_parse_cb)(struct device_node *,
+ 			    const struct regulator_desc *,
+diff --git a/include/linux/regulator/fan53555.h b/include/linux/regulator/fan53555.h
+index ce8df2186..e8703b6fc 100644
+--- a/include/linux/regulator/fan53555.h
++++ b/include/linux/regulator/fan53555.h
+@@ -52,6 +52,8 @@ struct fan53555_platform_data {
+ 	unsigned int slew_rate;
+ 	/* Sleep VSEL ID */
+ 	unsigned int sleep_vsel_id;
++	int limit_volt;
++	struct gpio_desc *vsel_gpio;
+ };
+ 
+ #endif /* __FAN53555_H__ */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 3dca22f2a..ef9d4a196 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1356,7 +1356,7 @@ struct task_struct {
+ 	u64				timer_slack_ns;
+ 	u64				default_timer_slack_ns;
+ 
+-#ifdef CONFIG_KASAN
++#if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
+ 	unsigned int			kasan_depth;
+ #endif
+ 
+diff --git a/include/linux/sched/hotplug.h b/include/linux/sched/hotplug.h
+index 9a62ffdd2..89fb9b027 100644
+--- a/include/linux/sched/hotplug.h
++++ b/include/linux/sched/hotplug.h
+@@ -8,7 +8,11 @@
+ 
+ extern int sched_cpu_starting(unsigned int cpu);
+ extern int sched_cpu_activate(unsigned int cpu);
++extern int sched_cpus_activate(struct cpumask *cpus);
+ extern int sched_cpu_deactivate(unsigned int cpu);
++extern int sched_cpus_deactivate_nosync(struct cpumask *cpus);
++extern int sched_cpu_drain_rq(unsigned int cpu);
++extern void sched_cpu_drain_rq_wait(unsigned int cpu);
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+ extern int sched_cpu_dying(unsigned int cpu);
+diff --git a/include/linux/sched/isolation.h b/include/linux/sched/isolation.h
+index 22420b45b..cc9f393e2 100644
+--- a/include/linux/sched/isolation.h
++++ b/include/linux/sched/isolation.h
+@@ -28,25 +28,10 @@ extern void __init housekeeping_init(void);
+ 
+ #else
+ 
+-#ifdef CONFIG_CPU_ISOLATION_OPT
+-static inline int housekeeping_any_cpu(enum hk_flags flags)
+-{
+-	cpumask_t available;
+-	int cpu;
+-
+-	cpumask_andnot(&available, cpu_online_mask, cpu_isolated_mask);
+-	cpu = cpumask_any(&available);
+-	if (cpu >= nr_cpu_ids)
+-		cpu = smp_processor_id();
+-
+-	return cpu;
+-}
+-#else
+ static inline int housekeeping_any_cpu(enum hk_flags flags)
+ {
+ 	return smp_processor_id();
+ }
+-#endif
+ 
+ static inline const struct cpumask *housekeeping_cpumask(enum hk_flags flags)
+ {
+@@ -69,11 +54,7 @@ static inline bool housekeeping_cpu(int cpu, enum hk_flags flags)
+ 	if (static_branch_unlikely(&housekeeping_overridden))
+ 		return housekeeping_test_cpu(cpu, flags);
+ #endif
+-#ifdef CONFIG_CPU_ISOLATION_OPT
+-	return !cpu_isolated(cpu);
+-#else
+ 	return true;
+-#endif
+ }
+ 
+ #endif /* _LINUX_SCHED_ISOLATION_H */
+diff --git a/include/linux/sched/wake_q.h b/include/linux/sched/wake_q.h
+index 26a2013ac..1e05e5669 100644
+--- a/include/linux/sched/wake_q.h
++++ b/include/linux/sched/wake_q.h
+@@ -38,6 +38,7 @@
+ struct wake_q_head {
+ 	struct wake_q_node *first;
+ 	struct wake_q_node **lastp;
++	int count;
+ };
+ 
+ #define WAKE_Q_TAIL ((struct wake_q_node *) 0x01)
+@@ -49,6 +50,7 @@ static inline void wake_q_init(struct wake_q_head *head)
+ {
+ 	head->first = WAKE_Q_TAIL;
+ 	head->lastp = &head->first;
++	head->count = 0;
+ }
+ 
+ static inline bool wake_q_empty(struct wake_q_head *head)
+diff --git a/include/linux/sched/xacct.h b/include/linux/sched/xacct.h
+index c078f0a94..9544c9d9d 100644
+--- a/include/linux/sched/xacct.h
++++ b/include/linux/sched/xacct.h
+@@ -28,6 +28,11 @@ static inline void inc_syscw(struct task_struct *tsk)
+ {
+ 	tsk->ioac.syscw++;
+ }
++
++static inline void inc_syscfs(struct task_struct *tsk)
++{
++	tsk->ioac.syscfs++;
++}
+ #else
+ static inline void add_rchar(struct task_struct *tsk, ssize_t amt)
+ {
+@@ -44,6 +49,10 @@ static inline void inc_syscr(struct task_struct *tsk)
+ static inline void inc_syscw(struct task_struct *tsk)
+ {
+ }
++
++static inline void inc_syscfs(struct task_struct *tsk)
++{
++}
+ #endif
+ 
+ #endif /* _LINUX_SCHED_XACCT_H */
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index b56e1dedc..ba4246721 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -183,6 +183,7 @@ struct plat_stmmacenet_data {
+ 	void (*serdes_powerdown)(struct net_device *ndev, void *priv);
+ 	int (*init)(struct platform_device *pdev, void *priv);
+ 	void (*exit)(struct platform_device *pdev, void *priv);
++	void (*get_eth_addr)(void *priv, unsigned char *addr);
+ 	struct mac_device_info *(*setup)(void *priv);
+ 	void *bsp_priv;
+ 	struct clk *stmmac_clk;
+diff --git a/include/linux/thermal.h b/include/linux/thermal.h
+index 176d9454e..aa4b4114b 100644
+--- a/include/linux/thermal.h
++++ b/include/linux/thermal.h
+@@ -399,6 +399,7 @@ void thermal_cdev_update(struct thermal_cooling_device *);
+ void thermal_notify_framework(struct thermal_zone_device *, int);
+ int thermal_zone_device_enable(struct thermal_zone_device *tz);
+ int thermal_zone_device_disable(struct thermal_zone_device *tz);
++int thermal_zone_device_is_enabled(struct thermal_zone_device *tz);
+ #else
+ static inline struct thermal_zone_device *thermal_zone_device_register(
+ 	const char *type, int trips, int mask, void *devdata,
+@@ -453,6 +454,10 @@ static inline int thermal_zone_device_enable(struct thermal_zone_device *tz)
+ 
+ static inline int thermal_zone_device_disable(struct thermal_zone_device *tz)
+ { return -ENODEV; }
++
++static inline int
++thermal_zone_device_is_enabled(struct thermal_zone_device *tz)
++{ return -ENODEV; }
+ #endif /* CONFIG_THERMAL */
+ 
+ #endif /* __THERMAL_H__ */
+diff --git a/include/linux/usb/audio-v2.h b/include/linux/usb/audio-v2.h
+index ead8c9a47..899c84e7c 100644
+--- a/include/linux/usb/audio-v2.h
++++ b/include/linux/usb/audio-v2.h
+@@ -168,6 +168,20 @@ struct uac2_effect_unit_descriptor {
+ 	__u8 bmaControls[]; /* variable length */
+ } __attribute__((packed));
+ 
++#define UAC2_DT_FEATURE_UNIT_SIZE(ch)		(6 + ((ch) + 1) * 4)
++
++/* As above, but more useful for defining your own descriptors: */
++#define DECLARE_UAC2_FEATURE_UNIT_DESCRIPTOR(ch)		\
++struct uac2_feature_unit_descriptor_##ch {			\
++	__u8  bLength;						\
++	__u8  bDescriptorType;					\
++	__u8  bDescriptorSubtype;				\
++	__u8  bUnitID;						\
++	__u8  bSourceID;					\
++	__le32 bmaControls[ch + 1];				\
++	__u8  iFeature;						\
++} __attribute__((packed))
++
+ /* 4.9.2 Class-Specific AS Interface Descriptor */
+ 
+ struct uac2_as_header_descriptor {
+@@ -331,6 +345,9 @@ struct uac2_interrupt_data_msg {
+ #define UAC2_FU_OVERFLOW		0x0f
+ #define UAC2_FU_LATENCY			0x10
+ 
++#define UAC2_CONTROL_BIT_RO(CS)		(0x01 << (((CS) - 1) << 1))
++#define UAC2_CONTROL_BIT_RW(CS)		(0x03 << (((CS) - 1) << 1))
++
+ /* A.17.8.1 Parametric Equalizer Section Effect Unit Control Selectors */
+ #define UAC2_PE_UNDEFINED		0x00
+ #define UAC2_PE_ENABLE			0x01
+diff --git a/include/linux/usb/audio.h b/include/linux/usb/audio.h
+index 170acd500..646cb0a8d 100644
+--- a/include/linux/usb/audio.h
++++ b/include/linux/usb/audio.h
+@@ -31,6 +31,7 @@ struct usb_audio_control {
+ 	int data[5];
+ 	int (*set)(struct usb_audio_control *con, u8 cmd, int value);
+ 	int (*get)(struct usb_audio_control *con, u8 cmd);
++	void *context;
+ };
+ 
+ struct usb_audio_control_selector {
+diff --git a/include/linux/usb/composite.h b/include/linux/usb/composite.h
+index a2d229ab6..4d352204e 100644
+--- a/include/linux/usb/composite.h
++++ b/include/linux/usb/composite.h
+@@ -525,6 +525,8 @@ extern struct usb_string *usb_gstrings_attach(struct usb_composite_dev *cdev,
+ extern int usb_string_ids_n(struct usb_composite_dev *c, unsigned n);
+ 
+ extern void composite_disconnect(struct usb_gadget *gadget);
++extern void composite_reset(struct usb_gadget *gadget);
++
+ extern int composite_setup(struct usb_gadget *gadget,
+ 		const struct usb_ctrlrequest *ctrl);
+ extern void composite_suspend(struct usb_gadget *gadget);
+@@ -590,6 +592,7 @@ struct usb_function_instance {
+ 	struct config_group group;
+ 	struct list_head cfs_list;
+ 	struct usb_function_driver *fd;
++	struct usb_function *f;
+ 	int (*set_inst_name)(struct usb_function_instance *inst,
+ 			      const char *name);
+ 	void (*free_func_inst)(struct usb_function_instance *inst);
+diff --git a/include/linux/usb/gadget.h b/include/linux/usb/gadget.h
+index e7351d64f..a15700a40 100644
+--- a/include/linux/usb/gadget.h
++++ b/include/linux/usb/gadget.h
+@@ -217,6 +217,7 @@ struct usb_ep_caps {
+  *	enabled and remains valid until the endpoint is disabled.
+  * @comp_desc: In case of SuperSpeed support, this is the endpoint companion
+  *	descriptor that is used to configure the endpoint
++ * @transfer_type: Used to specify transfer type of EP.
+  *
+  * the bus controller driver lists all the general purpose endpoints in
+  * gadget->ep_list.  the control endpoint (gadget->ep0) is not in that list,
+@@ -240,6 +241,9 @@ struct usb_ep {
+ 	u8			address;
+ 	const struct usb_endpoint_descriptor	*desc;
+ 	const struct usb_ss_ep_comp_descriptor	*comp_desc;
++#if defined(CONFIG_ARCH_ROCKCHIP) && defined(CONFIG_NO_GKI)
++	u8			transfer_type;
++#endif
+ };
+ 
+ /*-------------------------------------------------------------------------*/
+@@ -323,6 +327,8 @@ struct usb_gadget_ops {
+ 			struct usb_gadget_driver *);
+ 	int	(*udc_stop)(struct usb_gadget *);
+ 	void	(*udc_set_speed)(struct usb_gadget *, enum usb_device_speed);
++	void	(*udc_set_ssp_rate)(struct usb_gadget *gadget,
++			enum usb_ssp_rate rate);
+ 	struct usb_ep *(*match_ep)(struct usb_gadget *,
+ 			struct usb_endpoint_descriptor *,
+ 			struct usb_ss_ep_comp_descriptor *);
+@@ -339,6 +345,10 @@ struct usb_gadget_ops {
+  * @speed: Speed of current connection to USB host.
+  * @max_speed: Maximal speed the UDC can handle.  UDC must support this
+  *      and all slower speeds.
++ * @ssp_rate: Current connected SuperSpeed Plus signaling rate and lane count.
++ * @max_ssp_rate: Maximum SuperSpeed Plus signaling rate and lane count the UDC
++ *	can handle. The UDC must support this and all slower speeds and lower
++ *	number of lanes.
+  * @state: the state we are now (attached, suspended, configured, etc)
+  * @name: Identifies the controller hardware type.  Used in diagnostics
+  *	and sometimes configuration.
+@@ -406,6 +416,11 @@ struct usb_gadget {
+ 	struct list_head		ep_list;	/* of usb_ep */
+ 	enum usb_device_speed		speed;
+ 	enum usb_device_speed		max_speed;
++
++	/* USB SuperSpeed Plus only */
++	enum usb_ssp_rate		ssp_rate;
++	enum usb_ssp_rate		max_ssp_rate;
++
+ 	enum usb_device_state		state;
+ 	const char			*name;
+ 	struct device			dev;
+diff --git a/include/linux/usb/pd.h b/include/linux/usb/pd.h
+index 433040ff8..96b7ff66f 100644
+--- a/include/linux/usb/pd.h
++++ b/include/linux/usb/pd.h
+@@ -225,6 +225,7 @@ enum pd_pdo_type {
+ #define PDO_FIXED_EXTPOWER		BIT(27) /* Externally powered */
+ #define PDO_FIXED_USB_COMM		BIT(26) /* USB communications capable */
+ #define PDO_FIXED_DATA_SWAP		BIT(25) /* Data role swap supported */
++#define PDO_FIXED_UNCHUNK_EXT		BIT(24) /* Unchunked Extended Message supported (Source) */
+ #define PDO_FIXED_FRS_CURR_MASK		(BIT(24) | BIT(23)) /* FR_Swap Current (Sink) */
+ #define PDO_FIXED_FRS_CURR_SHIFT	23
+ #define PDO_FIXED_VOLT_SHIFT		10	/* 50mV units */
+@@ -466,6 +467,7 @@ static inline unsigned int rdo_max_power(u32 rdo)
+ #define PD_T_DRP_SRC		30
+ #define PD_T_PS_SOURCE_OFF	920
+ #define PD_T_PS_SOURCE_ON	480
++#define PD_T_PS_SOURCE_ON_PRS	450	/* 390 - 480ms */
+ #define PD_T_PS_HARD_RESET	30
+ #define PD_T_SRC_RECOVER	760
+ #define PD_T_SRC_RECOVER_MAX	1000
+@@ -478,14 +480,19 @@ static inline unsigned int rdo_max_power(u32 rdo)
+ #define PD_T_NEWSRC		250	/* Maximum of 275ms */
+ #define PD_T_SWAP_SRC_START	20	/* Minimum of 20ms */
+ #define PD_T_BIST_CONT_MODE	50	/* 30 - 60 ms */
++#define PD_T_SINK_TX		16	/* 16 - 20 ms */
++#define PD_T_CHUNK_NOT_SUPP	42	/* 40 - 50 ms */
+ 
+ #define PD_T_DRP_TRY		100	/* 75 - 150 ms */
+ #define PD_T_DRP_TRYWAIT	600	/* 400 - 800 ms */
+ 
+ #define PD_T_CC_DEBOUNCE	200	/* 100 - 200 ms */
+ #define PD_T_PD_DEBOUNCE	20	/* 10 - 20 ms */
++#define PD_T_TRY_CC_DEBOUNCE	15	/* 10 - 20 ms */
+ 
+ #define PD_N_CAPS_COUNT		(PD_T_NO_RESPONSE / PD_T_SEND_SOURCE_CAP)
+ #define PD_N_HARD_RESET_COUNT	2
+ 
++#define PD_P_SNK_STDBY_MW	2500	/* 2500 mW */
++
+ #endif /* __LINUX_USB_PD_H */
+diff --git a/include/linux/usb/pd_ext_sdb.h b/include/linux/usb/pd_ext_sdb.h
+index 0eb83ce19..b517ebc8f 100644
+--- a/include/linux/usb/pd_ext_sdb.h
++++ b/include/linux/usb/pd_ext_sdb.h
+@@ -24,8 +24,4 @@ enum usb_pd_ext_sdb_fields {
+ #define USB_PD_EXT_SDB_EVENT_OVP		BIT(3)
+ #define USB_PD_EXT_SDB_EVENT_CF_CV_MODE		BIT(4)
+ 
+-#define USB_PD_EXT_SDB_PPS_EVENTS	(USB_PD_EXT_SDB_EVENT_OCP |	\
+-					 USB_PD_EXT_SDB_EVENT_OTP |	\
+-					 USB_PD_EXT_SDB_EVENT_OVP)
+-
+ #endif /* __LINUX_USB_PD_EXT_SDB_H */
+diff --git a/include/linux/usb/pd_vdo.h b/include/linux/usb/pd_vdo.h
+index 68bdc4e2f..7f5e330a6 100644
+--- a/include/linux/usb/pd_vdo.h
++++ b/include/linux/usb/pd_vdo.h
+@@ -21,22 +21,24 @@
+  * ----------
+  * <31:16>  :: SVID
+  * <15>     :: VDM type ( 1b == structured, 0b == unstructured )
+- * <14:13>  :: Structured VDM version (can only be 00 == 1.0 currently)
++ * <14:13>  :: Structured VDM version
+  * <12:11>  :: reserved
+  * <10:8>   :: object position (1-7 valid ... used for enter/exit mode only)
+  * <7:6>    :: command type (SVDM only?)
+  * <5>      :: reserved (SVDM), command type (UVDM)
+  * <4:0>    :: command
+  */
+-#define VDO(vid, type, custom)				\
++#define VDO(vid, type, ver, custom)			\
+ 	(((vid) << 16) |				\
+ 	 ((type) << 15) |				\
++	 ((ver) << 13) |				\
+ 	 ((custom) & 0x7FFF))
+ 
+ #define VDO_SVDM_TYPE		(1 << 15)
+ #define VDO_SVDM_VERS(x)	((x) << 13)
+ #define VDO_OPOS(x)		((x) << 8)
+ #define VDO_CMDT(x)		((x) << 6)
++#define VDO_SVDM_VERS_MASK	VDO_SVDM_VERS(0x3)
+ #define VDO_OPOS_MASK		VDO_OPOS(0x7)
+ #define VDO_CMDT_MASK		VDO_CMDT(0x3)
+ 
+@@ -74,6 +76,7 @@
+ 
+ #define PD_VDO_VID(vdo)		((vdo) >> 16)
+ #define PD_VDO_SVDM(vdo)	(((vdo) >> 15) & 1)
++#define PD_VDO_SVDM_VER(vdo)	(((vdo) >> 13) & 0x3)
+ #define PD_VDO_OPOS(vdo)	(((vdo) >> 8) & 0x7)
+ #define PD_VDO_CMD(vdo)		((vdo) & 0x1f)
+ #define PD_VDO_CMDT(vdo)	(((vdo) >> 6) & 0x3)
+@@ -103,25 +106,50 @@
+  * --------------------
+  * <31>     :: data capable as a USB host
+  * <30>     :: data capable as a USB device
+- * <29:27>  :: product type
++ * <29:27>  :: product type (UFP / Cable / VPD)
+  * <26>     :: modal operation supported (1b == yes)
+- * <25:16>  :: Reserved, Shall be set to zero
++ * <25:23>  :: product type (DFP) (SVDM version 2.0+ only; set to zero in version 1.0)
++ * <22:21>  :: connector type (SVDM version 2.0+ only; set to zero in version 1.0)
++ * <20:16>  :: Reserved, Shall be set to zero
+  * <15:0>   :: USB-IF assigned VID for this cable vendor
+  */
++
++/* PD Rev2.0 definition */
+ #define IDH_PTYPE_UNDEF		0
++
++/* SOP Product Type (UFP) */
++#define IDH_PTYPE_NOT_UFP	0
+ #define IDH_PTYPE_HUB		1
+ #define IDH_PTYPE_PERIPH	2
++#define IDH_PTYPE_PSD		3
++#define IDH_PTYPE_AMA		5
++
++/* SOP' Product Type (Cable Plug / VPD) */
++#define IDH_PTYPE_NOT_CABLE	0
+ #define IDH_PTYPE_PCABLE	3
+ #define IDH_PTYPE_ACABLE	4
+-#define IDH_PTYPE_AMA		5
++#define IDH_PTYPE_VPD		6
+ 
+-#define VDO_IDH(usbh, usbd, ptype, is_modal, vid)		\
+-	((usbh) << 31 | (usbd) << 30 | ((ptype) & 0x7) << 27	\
+-	 | (is_modal) << 26 | ((vid) & 0xffff))
++/* SOP Product Type (DFP) */
++#define IDH_PTYPE_NOT_DFP	0
++#define IDH_PTYPE_DFP_HUB	1
++#define IDH_PTYPE_DFP_HOST	2
++#define IDH_PTYPE_DFP_PB	3
++
++/* ID Header Mask */
++#define IDH_DFP_MASK		GENMASK(25, 23)
++#define IDH_CONN_MASK		GENMASK(22, 21)
++
++#define VDO_IDH(usbh, usbd, ufp_cable, is_modal, dfp, conn, vid)		\
++	((usbh) << 31 | (usbd) << 30 | ((ufp_cable) & 0x7) << 27		\
++	 | (is_modal) << 26 | ((dfp) & 0x7) << 23 | ((conn) & 0x3) << 21	\
++	 | ((vid) & 0xffff))
+ 
+ #define PD_IDH_PTYPE(vdo)	(((vdo) >> 27) & 0x7)
+ #define PD_IDH_VID(vdo)		((vdo) & 0xffff)
+ #define PD_IDH_MODAL_SUPP(vdo)	((vdo) & (1 << 26))
++#define PD_IDH_DFP_PTYPE(vdo)	(((vdo) >> 23) & 0x7)
++#define PD_IDH_CONN_TYPE(vdo)	(((vdo) >> 21) & 0x3)
+ 
+ /*
+  * Cert Stat VDO
+@@ -129,6 +157,7 @@
+  * <31:0>  : USB-IF assigned XID for this cable
+  */
+ #define PD_CSTAT_XID(vdo)	(vdo)
++#define VDO_CERT(xid)		((xid) & 0xffffffff)
+ 
+ /*
+  * Product VDO
+@@ -140,77 +169,270 @@
+ #define PD_PRODUCT_PID(vdo)	(((vdo) >> 16) & 0xffff)
+ 
+ /*
+- * UFP VDO1
++ * UFP VDO (PD Revision 3.0+ only)
+  * --------
+  * <31:29> :: UFP VDO version
+  * <28>    :: Reserved
+  * <27:24> :: Device capability
+- * <23:6>  :: Reserved
++ * <23:22> :: Connector type (10b == receptacle, 11b == captive plug)
++ * <21:11> :: Reserved
++ * <10:8>  :: Vconn power (AMA only)
++ * <7>     :: Vconn required (AMA only, 0b == no, 1b == yes)
++ * <6>     :: Vbus required (AMA only, 0b == yes, 1b == no)
+  * <5:3>   :: Alternate modes
+  * <2:0>   :: USB highest speed
+  */
+-#define PD_VDO1_UFP_DEVCAP(vdo)	(((vdo) & GENMASK(27, 24)) >> 24)
++#define PD_VDO_UFP_DEVCAP(vdo)	(((vdo) & GENMASK(27, 24)) >> 24)
+ 
++/* UFP VDO Version */
++#define UFP_VDO_VER1_2		2
++
++/* Device Capability */
+ #define DEV_USB2_CAPABLE	BIT(0)
+ #define DEV_USB2_BILLBOARD	BIT(1)
+ #define DEV_USB3_CAPABLE	BIT(2)
+ #define DEV_USB4_CAPABLE	BIT(3)
+ 
++/* Connector Type */
++#define UFP_RECEPTACLE		2
++#define UFP_CAPTIVE		3
++
++/* Vconn Power (AMA only, set to AMA_VCONN_NOT_REQ if Vconn is not required) */
++#define AMA_VCONN_PWR_1W	0
++#define AMA_VCONN_PWR_1W5	1
++#define AMA_VCONN_PWR_2W	2
++#define AMA_VCONN_PWR_3W	3
++#define AMA_VCONN_PWR_4W	4
++#define AMA_VCONN_PWR_5W	5
++#define AMA_VCONN_PWR_6W	6
++
++/* Vconn Required (AMA only) */
++#define AMA_VCONN_NOT_REQ	0
++#define AMA_VCONN_REQ		1
++
++/* Vbus Required (AMA only) */
++#define AMA_VBUS_REQ		0
++#define AMA_VBUS_NOT_REQ	1
++
++/* Alternate Modes */
++#define UFP_ALTMODE_NOT_SUPP	0
++#define UFP_ALTMODE_TBT3	BIT(0)
++#define UFP_ALTMODE_RECFG	BIT(1)
++#define UFP_ALTMODE_NO_RECFG	BIT(2)
++
++/* USB Highest Speed */
++#define UFP_USB2_ONLY		0
++#define UFP_USB32_GEN1		1
++#define UFP_USB32_4_GEN2	2
++#define UFP_USB4_GEN3		3
++
++#define VDO_UFP(ver, cap, conn, vcpwr, vcr, vbr, alt, spd)			\
++	(((ver) & 0x7) << 29 | ((cap) & 0xf) << 24 | ((conn) & 0x3) << 22	\
++	 | ((vcpwr) & 0x7) << 8 | (vcr) << 7 | (vbr) << 6 | ((alt) & 0x7) << 3	\
++	 | ((spd) & 0x7))
++
+ /*
+- * DFP VDO
++ * DFP VDO (PD Revision 3.0+ only)
+  * --------
+  * <31:29> :: DFP VDO version
+  * <28:27> :: Reserved
+  * <26:24> :: Host capability
+- * <23:5>  :: Reserved
++ * <23:22> :: Connector type (10b == receptacle, 11b == captive plug)
++ * <21:5>  :: Reserved
+  * <4:0>   :: Port number
+  */
+ #define PD_VDO_DFP_HOSTCAP(vdo)	(((vdo) & GENMASK(26, 24)) >> 24)
+ 
++#define DFP_VDO_VER1_1		1
+ #define HOST_USB2_CAPABLE	BIT(0)
+ #define HOST_USB3_CAPABLE	BIT(1)
+ #define HOST_USB4_CAPABLE	BIT(2)
++#define DFP_RECEPTACLE		2
++#define DFP_CAPTIVE		3
++
++#define VDO_DFP(ver, cap, conn, pnum)						\
++	(((ver) & 0x7) << 29 | ((cap) & 0x7) << 24 | ((conn) & 0x3) << 22	\
++	 | ((pnum) & 0x1f))
+ 
+ /*
+- * Cable VDO
++ * Cable VDO (for both Passive and Active Cable VDO in PD Rev2.0)
+  * ---------
+  * <31:28> :: Cable HW version
+  * <27:24> :: Cable FW version
+  * <23:20> :: Reserved, Shall be set to zero
+- * <19:18> :: type-C to Type-A/B/C (00b == A, 01 == B, 10 == C)
+- * <17>    :: Type-C to Plug/Receptacle (0b == plug, 1b == receptacle)
++ * <19:18> :: type-C to Type-A/B/C/Captive (00b == A, 01 == B, 10 == C, 11 == Captive)
++ * <17>    :: Reserved, Shall be set to zero
+  * <16:13> :: cable latency (0001 == <10ns(~1m length))
+  * <12:11> :: cable termination type (11b == both ends active VCONN req)
+  * <10>    :: SSTX1 Directionality support (0b == fixed, 1b == cfgable)
+  * <9>     :: SSTX2 Directionality support
+  * <8>     :: SSRX1 Directionality support
+  * <7>     :: SSRX2 Directionality support
+- * <6:5>   :: Vbus current handling capability
++ * <6:5>   :: Vbus current handling capability (01b == 3A, 10b == 5A)
+  * <4>     :: Vbus through cable (0b == no, 1b == yes)
+  * <3>     :: SOP" controller present? (0b == no, 1b == yes)
+  * <2:0>   :: USB SS Signaling support
++ *
++ * Passive Cable VDO (PD Rev3.0+)
++ * ---------
++ * <31:28> :: Cable HW version
++ * <27:24> :: Cable FW version
++ * <23:21> :: VDO version
++ * <20>    :: Reserved, Shall be set to zero
++ * <19:18> :: Type-C to Type-C/Captive (10b == C, 11b == Captive)
++ * <17>    :: Reserved, Shall be set to zero
++ * <16:13> :: cable latency (0001 == <10ns(~1m length))
++ * <12:11> :: cable termination type (10b == Vconn not req, 01b == Vconn req)
++ * <10:9>  :: Maximum Vbus voltage (00b == 20V, 01b == 30V, 10b == 40V, 11b == 50V)
++ * <8:7>   :: Reserved, Shall be set to zero
++ * <6:5>   :: Vbus current handling capability (01b == 3A, 10b == 5A)
++ * <4:3>   :: Reserved, Shall be set to zero
++ * <2:0>   :: USB highest speed
++ *
++ * Active Cable VDO 1 (PD Rev3.0+)
++ * ---------
++ * <31:28> :: Cable HW version
++ * <27:24> :: Cable FW version
++ * <23:21> :: VDO version
++ * <20>    :: Reserved, Shall be set to zero
++ * <19:18> :: Connector type (10b == C, 11b == Captive)
++ * <17>    :: Reserved, Shall be set to zero
++ * <16:13> :: cable latency (0001 == <10ns(~1m length))
++ * <12:11> :: cable termination type (10b == one end active, 11b == both ends active VCONN req)
++ * <10:9>  :: Maximum Vbus voltage (00b == 20V, 01b == 30V, 10b == 40V, 11b == 50V)
++ * <8>     :: SBU supported (0b == supported, 1b == not supported)
++ * <7>     :: SBU type (0b == passive, 1b == active)
++ * <6:5>   :: Vbus current handling capability (01b == 3A, 10b == 5A)
++ * <2:0>   :: USB highest speed
+  */
++/* Cable VDO Version */
++#define CABLE_VDO_VER1_0	0
++#define CABLE_VDO_VER1_3	3
++
++/* Connector Type (_ATYPE and _BTYPE are for PD Rev2.0 only) */
+ #define CABLE_ATYPE		0
+ #define CABLE_BTYPE		1
+ #define CABLE_CTYPE		2
+-#define CABLE_PLUG		0
+-#define CABLE_RECEPTACLE	1
+-#define CABLE_CURR_1A5		0
++#define CABLE_CAPTIVE		3
++
++/* Cable Latency */
++#define CABLE_LATENCY_1M	1
++#define CABLE_LATENCY_2M	2
++#define CABLE_LATENCY_3M	3
++#define CABLE_LATENCY_4M	4
++#define CABLE_LATENCY_5M	5
++#define CABLE_LATENCY_6M	6
++#define CABLE_LATENCY_7M	7
++#define CABLE_LATENCY_7M_PLUS	8
++
++/* Cable Termination Type */
++#define PCABLE_VCONN_NOT_REQ	0
++#define PCABLE_VCONN_REQ	1
++#define ACABLE_ONE_END		2
++#define ACABLE_BOTH_END		3
++
++/* Maximum Vbus Voltage */
++#define CABLE_MAX_VBUS_20V	0
++#define CABLE_MAX_VBUS_30V	1
++#define CABLE_MAX_VBUS_40V	2
++#define CABLE_MAX_VBUS_50V	3
++
++/* Active Cable SBU Supported/Type */
++#define ACABLE_SBU_SUPP		0
++#define ACABLE_SBU_NOT_SUPP	1
++#define ACABLE_SBU_PASSIVE	0
++#define ACABLE_SBU_ACTIVE	1
++
++/* Vbus Current Handling Capability */
++#define CABLE_CURR_DEF		0
+ #define CABLE_CURR_3A		1
+ #define CABLE_CURR_5A		2
++
++/* USB SuperSpeed Signaling Support (PD Rev2.0) */
+ #define CABLE_USBSS_U2_ONLY	0
+ #define CABLE_USBSS_U31_GEN1	1
+ #define CABLE_USBSS_U31_GEN2	2
+-#define VDO_CABLE(hw, fw, cbl, gdr, lat, term, tx1d, tx2d, rx1d, rx2d, cur,\
+-		  vps, sopp, usbss) \
+-	(((hw) & 0x7) << 28 | ((fw) & 0x7) << 24 | ((cbl) & 0x3) << 18	\
+-	 | (gdr) << 17 | ((lat) & 0x7) << 13 | ((term) & 0x3) << 11	\
+-	 | (tx1d) << 10 | (tx2d) << 9 | (rx1d) << 8 | (rx2d) << 7	\
+-	 | ((cur) & 0x3) << 5 | (vps) << 4 | (sopp) << 3		\
+-	 | ((usbss) & 0x7))
++
++/* USB Highest Speed */
++#define CABLE_USB2_ONLY		0
++#define CABLE_USB32_GEN1	1
++#define CABLE_USB32_4_GEN2	2
++#define CABLE_USB4_GEN3		3
++
++#define VDO_CABLE(hw, fw, cbl, lat, term, tx1d, tx2d, rx1d, rx2d, cur, vps, sopp, usbss) \
++	(((hw) & 0x7) << 28 | ((fw) & 0x7) << 24 | ((cbl) & 0x3) << 18		\
++	 | ((lat) & 0x7) << 13 | ((term) & 0x3) << 11 | (tx1d) << 10		\
++	 | (tx2d) << 9 | (rx1d) << 8 | (rx2d) << 7 | ((cur) & 0x3) << 5		\
++	 | (vps) << 4 | (sopp) << 3 | ((usbss) & 0x7))
++#define VDO_PCABLE(hw, fw, ver, conn, lat, term, vbm, cur, spd)			\
++	(((hw) & 0xf) << 28 | ((fw) & 0xf) << 24 | ((ver) & 0x7) << 21		\
++	 | ((conn) & 0x3) << 18 | ((lat) & 0xf) << 13 | ((term) & 0x3) << 11	\
++	 | ((vbm) & 0x3) << 9 | ((cur) & 0x3) << 5 | ((spd) & 0x7))
++#define VDO_ACABLE1(hw, fw, ver, conn, lat, term, vbm, sbu, sbut, cur, vbt, sopp, spd) \
++	(((hw) & 0xf) << 28 | ((fw) & 0xf) << 24 | ((ver) & 0x7) << 21		\
++	 | ((conn) & 0x3) << 18	| ((lat) & 0xf) << 13 | ((term) & 0x3) << 11	\
++	 | ((vbm) & 0x3) << 9 | (sbu) << 8 | (sbut) << 7 | ((cur) & 0x3) << 5	\
++	 | (vbt) << 4 | (sopp) << 3 | ((spd) & 0x7))
++
++#define VDO_TYPEC_CABLE_TYPE(vdo)	(((vdo) >> 18) & 0x3)
++
++/*
++ * Active Cable VDO 2
++ * ---------
++ * <31:24> :: Maximum operating temperature
++ * <23:16> :: Shutdown temperature
++ * <15>    :: Reserved, Shall be set to zero
++ * <14:12> :: U3/CLd power
++ * <11>    :: U3 to U0 transition mode (0b == direct, 1b == through U3S)
++ * <10>    :: Physical connection (0b == copper, 1b == optical)
++ * <9>     :: Active element (0b == redriver, 1b == retimer)
++ * <8>     :: USB4 supported (0b == yes, 1b == no)
++ * <7:6>   :: USB2 hub hops consumed
++ * <5>     :: USB2 supported (0b == yes, 1b == no)
++ * <4>     :: USB3.2 supported (0b == yes, 1b == no)
++ * <3>     :: USB lanes supported (0b == one lane, 1b == two lanes)
++ * <2>     :: Optically isolated active cable (0b == no, 1b == yes)
++ * <1>     :: Reserved, Shall be set to zero
++ * <0>     :: USB gen (0b == gen1, 1b == gen2+)
++ */
++
++/* U3/CLd Power*/
++#define ACAB2_U3_CLD_10MW_PLUS	0
++#define ACAB2_U3_CLD_10MW	1
++#define ACAB2_U3_CLD_5MW	2
++#define ACAB2_U3_CLD_1MW	3
++#define ACAB2_U3_CLD_500UW	4
++#define ACAB2_U3_CLD_200UW	5
++#define ACAB2_U3_CLD_50UW	6
++
++/* Other Active Cable VDO 2 Fields */
++#define ACAB2_U3U0_DIRECT	0
++#define ACAB2_U3U0_U3S		1
++#define ACAB2_PHY_COPPER	0
++#define ACAB2_PHY_OPTICAL	1
++#define ACAB2_REDRIVER		0
++#define ACAB2_RETIMER		1
++#define ACAB2_USB4_SUPP		0
++#define ACAB2_USB4_NOT_SUPP	1
++#define ACAB2_USB2_SUPP		0
++#define ACAB2_USB2_NOT_SUPP	1
++#define ACAB2_USB32_SUPP	0
++#define ACAB2_USB32_NOT_SUPP	1
++#define ACAB2_LANES_ONE		0
++#define ACAB2_LANES_TWO		1
++#define ACAB2_OPT_ISO_NO	0
++#define ACAB2_OPT_ISO_YES	1
++#define ACAB2_GEN_1		0
++#define ACAB2_GEN_2_PLUS	1
++
++#define VDO_ACABLE2(mtemp, stemp, u3p, trans, phy, ele, u4, hops, u2, u32, lane, iso, gen)	\
++	(((mtemp) & 0xff) << 24 | ((stemp) & 0xff) << 16 | ((u3p) & 0x7) << 12	\
++	 | (trans) << 11 | (phy) << 10 | (ele) << 9 | (u4) << 8			\
++	 | ((hops) & 0x3) << 6 | (u2) << 5 | (u32) << 4 | (lane) << 3		\
++	 | (iso) << 2 | (gen))
+ 
+ /*
+- * AMA VDO
++ * AMA VDO (PD Rev2.0)
+  * ---------
+  * <31:28> :: Cable HW version
+  * <27:24> :: Cable FW version
+@@ -233,18 +455,40 @@
+ #define PD_VDO_AMA_VCONN_REQ(vdo)	(((vdo) >> 4) & 1)
+ #define PD_VDO_AMA_VBUS_REQ(vdo)	(((vdo) >> 3) & 1)
+ 
+-#define AMA_VCONN_PWR_1W	0
+-#define AMA_VCONN_PWR_1W5	1
+-#define AMA_VCONN_PWR_2W	2
+-#define AMA_VCONN_PWR_3W	3
+-#define AMA_VCONN_PWR_4W	4
+-#define AMA_VCONN_PWR_5W	5
+-#define AMA_VCONN_PWR_6W	6
+ #define AMA_USBSS_U2_ONLY	0
+ #define AMA_USBSS_U31_GEN1	1
+ #define AMA_USBSS_U31_GEN2	2
+ #define AMA_USBSS_BBONLY	3
+ 
++/*
++ * VPD VDO
++ * ---------
++ * <31:28> :: HW version
++ * <27:24> :: FW version
++ * <23:21> :: VDO version
++ * <20:17> :: Reserved, Shall be set to zero
++ * <16:15> :: Maximum Vbus voltage (00b == 20V, 01b == 30V, 10b == 40V, 11b == 50V)
++ * <14>    :: Charge through current support (0b == 3A, 1b == 5A)
++ * <13>    :: Reserved, Shall be set to zero
++ * <12:7>  :: Vbus impedance
++ * <6:1>   :: Ground impedance
++ * <0>     :: Charge through support (0b == no, 1b == yes)
++ */
++#define VPD_VDO_VER1_0		0
++#define VPD_MAX_VBUS_20V	0
++#define VPD_MAX_VBUS_30V	1
++#define VPD_MAX_VBUS_40V	2
++#define VPD_MAX_VBUS_50V	3
++#define VPDCT_CURR_3A		0
++#define VPDCT_CURR_5A		1
++#define VPDCT_NOT_SUPP		0
++#define VPDCT_SUPP		1
++
++#define VDO_VPD(hw, fw, ver, vbm, curr, vbi, gi, ct)			\
++	(((hw) & 0xf) << 28 | ((fw) & 0xf) << 24 | ((ver) & 0x7) << 21	\
++	 | ((vbm) & 0x3) << 15 | (curr) << 14 | ((vbi) & 0x3f) << 7	\
++	 | ((gi) & 0x3f) << 1 | (ct))
++
+ /*
+  * SVDM Discover SVIDs request -> response
+  *
+diff --git a/include/linux/usb/quirks.h b/include/linux/usb/quirks.h
+index 5e4c497f5..6567f7445 100644
+--- a/include/linux/usb/quirks.h
++++ b/include/linux/usb/quirks.h
+@@ -72,4 +72,7 @@
+ /* device has endpoints that should be ignored */
+ #define USB_QUIRK_ENDPOINT_IGNORE		BIT(15)
+ 
++/* device can't support auto suspend function */
++#define USB_QUIRK_AUTO_SUSPEND			BIT(16)
++
+ #endif /* __LINUX_USB_QUIRKS_H */
+diff --git a/include/linux/usb/tcpm.h b/include/linux/usb/tcpm.h
+index 09762d26f..cb69546f8 100644
+--- a/include/linux/usb/tcpm.h
++++ b/include/linux/usb/tcpm.h
+@@ -19,6 +19,10 @@ enum typec_cc_status {
+ 	TYPEC_CC_RP_3_0,
+ };
+ 
++/* Collision Avoidance */
++#define SINK_TX_NG	TYPEC_CC_RP_1_5
++#define SINK_TX_OK	TYPEC_CC_RP_3_0
++
+ enum typec_cc_polarity {
+ 	TYPEC_POLARITY_CC1,
+ 	TYPEC_POLARITY_CC2,
+@@ -62,6 +66,8 @@ enum tcpm_transmit_type {
+  *		For example, some tcpcs may include BC1.2 charger detection
+  *		and use that in this case.
+  * @set_cc:	Called to set value of CC pins
++ * @apply_rc:	Optional; Needed to move TCPCI based chipset to APPLY_RC state
++ *		as stated by the TCPCI specification.
+  * @get_cc:	Called to read current CC pin values
+  * @set_polarity:
+  *		Called to set polarity
+@@ -83,6 +89,39 @@ enum tcpm_transmit_type {
+  *		Optional; Called to enable/disable PD 3.0 fast role swap.
+  *		Enabling frs is accessory dependent as not all PD3.0
+  *		accessories support fast role swap.
++ * @frs_sourcing_vbus:
++ *		Optional; Called to notify that vbus is now being sourced.
++ *		Low level drivers can perform chip specific operations, if any.
++ * @enable_auto_vbus_discharge:
++ *		Optional; TCPCI spec based TCPC implementations can optionally
++ *		support hardware to autonomously dischrge vbus upon disconnecting
++ *		as sink or source. TCPM signals TCPC to enable the mechanism upon
++ *		entering connected state and signals disabling upon disconnect.
++ * @set_auto_vbus_discharge_threshold:
++ *		Mandatory when enable_auto_vbus_discharge is implemented. TCPM
++ *		calls this function to allow lower levels drivers to program the
++ *		vbus threshold voltage below which the vbus discharge circuit
++ *		will be turned on. requested_vbus_voltage is set to 0 when vbus
++ *		is going to disappear knowingly i.e. during PR_SWAP and
++ *		HARD_RESET etc.
++ * @is_vbus_vsafe0v:
++ *		Optional; TCPCI spec based TCPC implementations are expected to
++ *		detect VSAFE0V voltage level at vbus. When detection of VSAFE0V
++ *		is supported by TCPC, set this callback for TCPM to query
++ *		whether vbus is at VSAFE0V when needed.
++ *		Returns true when vbus is at VSAFE0V, false otherwise.
++ * @set_partner_usb_comm_capable:
++ *              Optional; The USB Communications Capable bit indicates if port
++ *              partner is capable of communication over the USB data lines
++ *              (e.g. D+/- or SS Tx/Rx). Called to notify the status of the bit.
++ * @check_contaminant:
++ *		Optional; The callback is called when CC pins report open status
++ *		at the end of the toggling period. Chip level drivers are
++ *		expected to check for contaminant and re-enable toggling if
++ *		needed. When 0 is not returned, check_contaminant is expected to
++ *		restart toggling after checking the connector for contaminant.
++ *		This forces the TCPM state machine to tranistion to TOGGLING state
++ *		without calling start_toggling callback.
+  */
+ struct tcpc_dev {
+ 	struct fwnode_handle *fwnode;
+@@ -91,6 +130,8 @@ struct tcpc_dev {
+ 	int (*get_vbus)(struct tcpc_dev *dev);
+ 	int (*get_current_limit)(struct tcpc_dev *dev);
+ 	int (*set_cc)(struct tcpc_dev *dev, enum typec_cc_status cc);
++	int (*apply_rc)(struct tcpc_dev *dev, enum typec_cc_status cc,
++			enum typec_cc_polarity polarity);
+ 	int (*get_cc)(struct tcpc_dev *dev, enum typec_cc_status *cc1,
+ 		      enum typec_cc_status *cc2);
+ 	int (*set_polarity)(struct tcpc_dev *dev,
+@@ -106,9 +147,16 @@ struct tcpc_dev {
+ 			      enum typec_cc_status cc);
+ 	int (*try_role)(struct tcpc_dev *dev, int role);
+ 	int (*pd_transmit)(struct tcpc_dev *dev, enum tcpm_transmit_type type,
+-			   const struct pd_message *msg);
++			   const struct pd_message *msg, unsigned int negotiated_rev);
+ 	int (*set_bist_data)(struct tcpc_dev *dev, bool on);
+ 	int (*enable_frs)(struct tcpc_dev *dev, bool enable);
++	void (*frs_sourcing_vbus)(struct tcpc_dev *dev);
++	int (*enable_auto_vbus_discharge)(struct tcpc_dev *dev, bool enable);
++	int (*set_auto_vbus_discharge_threshold)(struct tcpc_dev *dev, enum typec_pwr_opmode mode,
++						 bool pps_active, u32 requested_vbus_voltage);
++	int (*check_contaminant)(struct tcpc_dev *dev);
++	bool (*is_vbus_vsafe0v)(struct tcpc_dev *dev);
++	void (*set_partner_usb_comm_capable)(struct tcpc_dev *dev, bool enable);
+ };
+ 
+ struct tcpm_port;
+@@ -116,6 +164,10 @@ struct tcpm_port;
+ struct tcpm_port *tcpm_register_port(struct device *dev, struct tcpc_dev *tcpc);
+ void tcpm_unregister_port(struct tcpm_port *port);
+ 
++int tcpm_update_sink_capabilities(struct tcpm_port *port, const u32 *pdo,
++				  unsigned int nr_pdo,
++				  unsigned int operating_snk_mw);
++
+ void tcpm_vbus_change(struct tcpm_port *port);
+ void tcpm_cc_change(struct tcpm_port *port);
+ void tcpm_sink_frs(struct tcpm_port *port);
+@@ -126,5 +178,7 @@ void tcpm_pd_transmit_complete(struct tcpm_port *port,
+ 			       enum tcpm_transmit_status status);
+ void tcpm_pd_hard_reset(struct tcpm_port *port);
+ void tcpm_tcpc_reset(struct tcpm_port *port);
++bool tcpm_is_debouncing(struct tcpm_port *tcpm);
++bool tcpm_is_toggling(struct tcpm_port *port);
+ 
+ #endif /* __LINUX_USB_TCPM_H */
+diff --git a/include/linux/usb/typec.h b/include/linux/usb/typec.h
+index 6be558045..91b4303ca 100644
+--- a/include/linux/usb/typec.h
++++ b/include/linux/usb/typec.h
+@@ -126,9 +126,12 @@ struct typec_altmode_desc {
+ 	enum typec_port_data	roles;
+ };
+ 
++void typec_partner_set_pd_revision(struct typec_partner *partner, u16 pd_revision);
++int typec_partner_set_num_altmodes(struct typec_partner *partner, int num_altmodes);
+ struct typec_altmode
+ *typec_partner_register_altmode(struct typec_partner *partner,
+ 				const struct typec_altmode_desc *desc);
++int typec_plug_set_num_altmodes(struct typec_plug *plug, int num_altmodes);
+ struct typec_altmode
+ *typec_plug_register_altmode(struct typec_plug *plug,
+ 			     const struct typec_altmode_desc *desc);
+@@ -162,6 +165,7 @@ struct typec_plug_desc {
+  * @type: The plug type from USB PD Cable VDO
+  * @active: Is the cable active or passive
+  * @identity: Result of Discover Identity command
++ * @pd_revision: USB Power Delivery Specification revision if supported
+  *
+  * Represents USB Type-C Cable attached to USB Type-C port.
+  */
+@@ -169,6 +173,8 @@ struct typec_cable_desc {
+ 	enum typec_plug_type	type;
+ 	unsigned int		active:1;
+ 	struct usb_pd_identity	*identity;
++	u16			pd_revision; /* 0300H = "3.0" */
++
+ };
+ 
+ /*
+@@ -176,15 +182,22 @@ struct typec_cable_desc {
+  * @usb_pd: USB Power Delivery support
+  * @accessory: Audio, Debug or none.
+  * @identity: Discover Identity command data
++ * @pd_revision: USB Power Delivery Specification Revision if supported
+  *
+  * Details about a partner that is attached to USB Type-C port. If @identity
+  * member exists when partner is registered, a directory named "identity" is
+  * created to sysfs for the partner device.
++ *
++ * @pd_revision is based on the setting of the "Specification Revision" field
++ * in the message header on the initial "Source Capabilities" message received
++ * from the partner, or a "Request" message received from the partner, depending
++ * on whether our port is a Sink or a Source.
+  */
+ struct typec_partner_desc {
+ 	unsigned int		usb_pd:1;
+ 	enum typec_accessory	accessory;
+ 	struct usb_pd_identity	*identity;
++	u16			pd_revision; /* 0300H = "3.0" */
+ };
+ 
+ /**
+@@ -204,12 +217,19 @@ struct typec_operations {
+ 			     enum typec_port_type type);
+ };
+ 
++enum usb_pd_svdm_ver {
++	SVDM_VER_1_0 = 0,
++	SVDM_VER_2_0 = 1,
++	SVDM_VER_MAX = SVDM_VER_2_0,
++};
++
+ /*
+  * struct typec_capability - USB Type-C Port Capabilities
+  * @type: Supported power role of the port
+  * @data: Supported data role of the port
+  * @revision: USB Type-C Specification release. Binary coded decimal
+  * @pd_revision: USB Power Delivery Specification revision if supported
++ * @svdm_version: USB PD Structured VDM version if supported
+  * @prefer_role: Initial role preference (DRP ports).
+  * @accessory: Supported Accessory Modes
+  * @fwnode: Optional fwnode of the port
+@@ -223,6 +243,7 @@ struct typec_capability {
+ 	enum typec_port_data	data;
+ 	u16			revision; /* 0120H = "1.2" */
+ 	u16			pd_revision; /* 0300H = "3.0" */
++	enum usb_pd_svdm_ver	svdm_version;
+ 	int			prefer_role;
+ 	enum typec_accessory	accessory[TYPEC_MAX_ACCESSORY];
+ 	unsigned int		orientation_aware:1;
+@@ -273,4 +294,8 @@ int typec_find_orientation(const char *name);
+ int typec_find_port_power_role(const char *name);
+ int typec_find_power_role(const char *name);
+ int typec_find_port_data_role(const char *name);
++
++void typec_partner_set_svdm_version(struct typec_partner *partner,
++				    enum usb_pd_svdm_ver svdm_version);
++int typec_get_negotiated_svdm_version(struct typec_port *port);
+ #endif /* __LINUX_USB_TYPEC_H */
+diff --git a/include/linux/usb/typec_altmode.h b/include/linux/usb/typec_altmode.h
+index 5e0a7b764..65933cbe9 100644
+--- a/include/linux/usb/typec_altmode.h
++++ b/include/linux/usb/typec_altmode.h
+@@ -132,6 +132,16 @@ typec_altmode_get_orientation(struct typec_altmode *altmode)
+ 	return typec_get_orientation(typec_altmode2port(altmode));
+ }
+ 
++/**
++ * typec_altmode_get_svdm_version - Get negotiated SVDM version
++ * @altmode: Handle to the alternate mode
++ */
++static inline int
++typec_altmode_get_svdm_version(struct typec_altmode *altmode)
++{
++	return typec_get_negotiated_svdm_version(typec_altmode2port(altmode));
++}
++
+ /**
+  * struct typec_altmode_driver - USB Type-C alternate mode device driver
+  * @id_table: Null terminated array of SVIDs
+diff --git a/include/linux/usb/typec_tbt.h b/include/linux/usb/typec_tbt.h
+index 47c2d501d..63dd44b72 100644
+--- a/include/linux/usb/typec_tbt.h
++++ b/include/linux/usb/typec_tbt.h
+@@ -39,12 +39,16 @@ struct typec_thunderbolt_data {
+ #define   TBT_CABLE_USB3_GEN1		1
+ #define   TBT_CABLE_USB3_PASSIVE	2
+ #define   TBT_CABLE_10_AND_20GBPS	3
+-#define TBT_CABLE_ROUNDED		BIT(19)
++#define TBT_CABLE_ROUNDED_SUPPORT(_vdo_) \
++					(((_vdo_) & GENMASK(20, 19)) >> 19)
++#define   TBT_GEN3_NON_ROUNDED                 0
++#define   TBT_GEN3_GEN4_ROUNDED_NON_ROUNDED    1
+ #define TBT_CABLE_OPTICAL		BIT(21)
+ #define TBT_CABLE_RETIMER		BIT(22)
+ #define TBT_CABLE_LINK_TRAINING		BIT(23)
+ 
+ #define TBT_SET_CABLE_SPEED(_s_)	(((_s_) & GENMASK(2, 0)) << 16)
++#define TBT_SET_CABLE_ROUNDED(_g_)	(((_g_) & GENMASK(1, 0)) << 19)
+ 
+ /* TBT3 Device Enter Mode VDO bits */
+ #define TBT_ENTER_MODE_CABLE_SPEED(s)	TBT_SET_CABLE_SPEED(s)
+diff --git a/include/linux/usb/usbnet.h b/include/linux/usb/usbnet.h
+index 8110c29fa..2e4f7721f 100644
+--- a/include/linux/usb/usbnet.h
++++ b/include/linux/usb/usbnet.h
+@@ -83,8 +83,6 @@ struct usbnet {
+ #		define EVENT_LINK_CHANGE	11
+ #		define EVENT_SET_RX_MODE	12
+ #		define EVENT_NO_IP_ALIGN	13
+-	u32			rx_speed;	/* in bps - NOT Mbps */
+-	u32			tx_speed;	/* in bps - NOT Mbps */
+ };
+ 
+ static inline struct usb_driver *driver_of(struct usb_interface *intf)
+diff --git a/include/media/v4l2-async.h b/include/media/v4l2-async.h
+index 92cd9f038..03b43b0f7 100644
+--- a/include/media/v4l2-async.h
++++ b/include/media/v4l2-async.h
+@@ -266,6 +266,21 @@ int v4l2_async_notifier_register(struct v4l2_device *v4l2_dev,
+ int v4l2_async_subdev_notifier_register(struct v4l2_subdev *sd,
+ 					struct v4l2_async_notifier *notifier);
+ 
++/**
++ * v4l2_async_notifier_clr_unready_dev - remove unready subdevice
++ *
++ * @notifier: pointer to &struct v4l2_async_notifier
++ */
++#if IS_ENABLED(CONFIG_NO_GKI)
++int v4l2_async_notifier_clr_unready_dev(struct v4l2_async_notifier *notifier);
++#else
++static inline int
++v4l2_async_notifier_clr_unready_dev(struct v4l2_async_notifier *notifier)
++{
++	return 0;
++}
++#endif
++
+ /**
+  * v4l2_async_notifier_unregister - unregisters a subdevice
+  *	asynchronous notifier
+diff --git a/include/soc/rockchip/rockchip_sip.h b/include/soc/rockchip/rockchip_sip.h
+index c46a9ae2a..4afba01c6 100644
+--- a/include/soc/rockchip/rockchip_sip.h
++++ b/include/soc/rockchip/rockchip_sip.h
+@@ -15,6 +15,12 @@
+ #define ROCKCHIP_SIP_CONFIG_DRAM_GET_RATE	0x05
+ #define ROCKCHIP_SIP_CONFIG_DRAM_CLR_IRQ	0x06
+ #define ROCKCHIP_SIP_CONFIG_DRAM_SET_PARAM	0x07
+-#define ROCKCHIP_SIP_CONFIG_DRAM_SET_ODT_PD	0x08
++#define ROCKCHIP_SIP_CONFIG_DRAM_GET_VERSION	0x08
++#define ROCKCHIP_SIP_CONFIG_DRAM_POST_SET_RATE	0x09
++#define ROCKCHIP_SIP_CONFIG_DRAM_SET_MSCH_RL	0x0a
++#define ROCKCHIP_SIP_CONFIG_DRAM_DEBUG		0x0b
++#define ROCKCHIP_SIP_CONFIG_MCU_START		0x0c
++#define ROCKCHIP_SIP_CONFIG_DRAM_GET_FREQ_INFO	0x0e
++#define ROCKCHIP_SIP_CONFIG_DRAM_ADDRMAP_GET	0x10
+ 
+ #endif
+diff --git a/include/sound/hdmi-codec.h b/include/sound/hdmi-codec.h
+index b55970859..4fc733c8c 100644
+--- a/include/sound/hdmi-codec.h
++++ b/include/sound/hdmi-codec.h
+@@ -34,6 +34,11 @@ struct hdmi_codec_daifmt {
+ 	unsigned int frame_clk_inv:1;
+ 	unsigned int bit_clk_master:1;
+ 	unsigned int frame_clk_master:1;
++	/* bit_fmt could be standard PCM format or
++	 * IEC958 encoded format. ALSA IEC958 plugin will pass
++	 * IEC958_SUBFRAME format to the underneath driver.
++	 */
++	snd_pcm_format_t bit_fmt;
+ };
+ 
+ /*
+@@ -60,12 +65,22 @@ struct hdmi_codec_ops {
+ 
+ 	/*
+ 	 * Configures HDMI-encoder for audio stream.
+-	 * Mandatory
++	 * Having either prepare or hw_params is mandatory.
+ 	 */
+ 	int (*hw_params)(struct device *dev, void *data,
+ 			 struct hdmi_codec_daifmt *fmt,
+ 			 struct hdmi_codec_params *hparms);
+ 
++	/*
++	 * Configures HDMI-encoder for audio stream. Can be called
++	 * multiple times for each setup.
++	 *
++	 * Having either prepare or hw_params is mandatory.
++	 */
++	int (*prepare)(struct device *dev, void *data,
++		       struct hdmi_codec_daifmt *fmt,
++		       struct hdmi_codec_params *hparms);
++
+ 	/*
+ 	 * Shuts down the audio stream.
+ 	 * Mandatory
+diff --git a/include/trace/events/cpuhp.h b/include/trace/events/cpuhp.h
+index ad16f7731..f302ab6db 100644
+--- a/include/trace/events/cpuhp.h
++++ b/include/trace/events/cpuhp.h
+@@ -89,6 +89,28 @@ TRACE_EVENT(cpuhp_exit,
+ 		  __entry->cpu, __entry->state, __entry->idx,  __entry->ret)
+ );
+ 
++TRACE_EVENT(cpuhp_pause,
++	TP_PROTO(struct cpumask *cpus, u64 start_time, unsigned char pause),
++
++	TP_ARGS(cpus, start_time, pause),
++
++	TP_STRUCT__entry(
++		__field( unsigned int,	cpus		)
++		__field( unsigned int,	active_cpus	)
++		__field( unsigned int,	time		)
++		__field( unsigned char,	pause		)
++	),
++
++	TP_fast_assign(
++		__entry->cpus	     = cpumask_bits(cpus)[0];
++		__entry->active_cpus = cpumask_bits(cpu_active_mask)[0];
++		__entry->time        = div64_u64(sched_clock() - start_time, 1000);
++		__entry->pause	     = pause;
++	),
++
++	TP_printk("req_cpus=0x%x act_cpus=0x%x time=%u us paused=%d",
++		  __entry->cpus, __entry->active_cpus, __entry->time, __entry->pause)
++);
+ #endif
+ 
+ /* This part must be outside protection */
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index dd5fff2bb..6c6a23b4b 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -203,6 +203,7 @@ TRACE_EVENT(sched_migrate_task,
+ 		__field(	int,	prio			)
+ 		__field(	int,	orig_cpu		)
+ 		__field(	int,	dest_cpu		)
++		__field(	int,	running			)
+ 	),
+ 
+ 	TP_fast_assign(
+@@ -211,11 +212,13 @@ TRACE_EVENT(sched_migrate_task,
+ 		__entry->prio		= p->prio; /* XXX SCHED_DEADLINE */
+ 		__entry->orig_cpu	= task_cpu(p);
+ 		__entry->dest_cpu	= dest_cpu;
++		__entry->running	= (p->state == TASK_RUNNING);
+ 	),
+ 
+-	TP_printk("comm=%s pid=%d prio=%d orig_cpu=%d dest_cpu=%d",
++	TP_printk("comm=%s pid=%d prio=%d orig_cpu=%d dest_cpu=%d running=%d",
+ 		  __entry->comm, __entry->pid, __entry->prio,
+-		  __entry->orig_cpu, __entry->dest_cpu)
++		  __entry->orig_cpu, __entry->dest_cpu,
++		  __entry->running)
+ );
+ 
+ DECLARE_EVENT_CLASS(sched_process_template,
+diff --git a/include/uapi/drm/drm_fourcc.h b/include/uapi/drm/drm_fourcc.h
+index 5498d7a65..5b5db0381 100644
+--- a/include/uapi/drm/drm_fourcc.h
++++ b/include/uapi/drm/drm_fourcc.h
+@@ -242,6 +242,8 @@ extern "C" {
+  * index 1 = Cr:Cb plane, [39:0] Cr1:Cb1:Cr0:Cb0 little endian
+  */
+ #define DRM_FORMAT_NV15		fourcc_code('N', 'V', '1', '5') /* 2x2 subsampled Cr:Cb plane */
++#define DRM_FORMAT_NV20		fourcc_code('N', 'V', '2', '0') /* 2x1 subsampled Cr:Cb plane */
++#define DRM_FORMAT_NV30		fourcc_code('N', 'V', '3', '0') /* non-subsampled Cr:Cb plane */
+ 
+ /*
+  * 2 plane YCbCr MSB aligned
+diff --git a/include/uapi/linux/media-bus-format.h b/include/uapi/linux/media-bus-format.h
+index 84fa53ffb..096f891d4 100644
+--- a/include/uapi/linux/media-bus-format.h
++++ b/include/uapi/linux/media-bus-format.h
+@@ -34,7 +34,7 @@
+ 
+ #define MEDIA_BUS_FMT_FIXED			0x0001
+ 
+-/* RGB - next is	0x101d */
++/* RGB - next is	0x1024 */
+ #define MEDIA_BUS_FMT_RGB444_1X12		0x1016
+ #define MEDIA_BUS_FMT_RGB444_2X8_PADHI_BE	0x1001
+ #define MEDIA_BUS_FMT_RGB444_2X8_PADHI_LE	0x1002
+@@ -63,6 +63,10 @@
+ #define MEDIA_BUS_FMT_RGB101010_1X30		0x1018
+ #define MEDIA_BUS_FMT_RGB121212_1X36		0x1019
+ #define MEDIA_BUS_FMT_RGB161616_1X48		0x101a
++#define MEDIA_BUS_FMT_RGB888_DUMMY_4X8		0x101f
++#define MEDIA_BUS_FMT_BGR888_DUMMY_4X8		0x1020
++#define MEDIA_BUS_FMT_RGB101010_1X7X5_SPWG	0x1022
++#define MEDIA_BUS_FMT_RGB101010_1X7X5_JEIDA	0x1023
+ 
+ /* YUV (including grey) - next is	0x202e */
+ #define MEDIA_BUS_FMT_Y8_1X8			0x2001
+diff --git a/include/uapi/linux/serial_reg.h b/include/uapi/linux/serial_reg.h
+index f51bc8f36..7e3fe68af 100644
+--- a/include/uapi/linux/serial_reg.h
++++ b/include/uapi/linux/serial_reg.h
+@@ -30,6 +30,7 @@
+  * Sleep mode for ST16650 and TI16750.  For the ST16650, EFR[4]=1
+  */
+ #define UART_IERX_SLEEP		0x10 /* Enable sleep mode */
++#define UART_IER_PTIME		0x80 /* Enable programmable transmit interrupt mode */
+ 
+ #define UART_IIR	2	/* In:  Interrupt ID Register */
+ #define UART_IIR_NO_INT		0x01 /* No interrupts pending */
+diff --git a/include/uapi/linux/usb/f_accessory.h b/include/uapi/linux/usb/f_accessory.h
+new file mode 100644
+index 000000000..0baeb7d0d
+--- /dev/null
++++ b/include/uapi/linux/usb/f_accessory.h
+@@ -0,0 +1,146 @@
++/*
++ * Gadget Function Driver for Android USB accessories
++ *
++ * Copyright (C) 2011 Google, Inc.
++ * Author: Mike Lockwood <lockwood@android.com>
++ *
++ * This software is licensed under the terms of the GNU General Public
++ * License version 2, as published by the Free Software Foundation, and
++ * may be copied, distributed, and modified under those terms.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#ifndef _UAPI_LINUX_USB_F_ACCESSORY_H
++#define _UAPI_LINUX_USB_F_ACCESSORY_H
++
++/* Use Google Vendor ID when in accessory mode */
++#define USB_ACCESSORY_VENDOR_ID 0x18D1
++
++
++/* Product ID to use when in accessory mode */
++#define USB_ACCESSORY_PRODUCT_ID 0x2D00
++
++/* Product ID to use when in accessory mode and adb is enabled */
++#define USB_ACCESSORY_ADB_PRODUCT_ID 0x2D01
++
++/* Indexes for strings sent by the host via ACCESSORY_SEND_STRING */
++#define ACCESSORY_STRING_MANUFACTURER   0
++#define ACCESSORY_STRING_MODEL          1
++#define ACCESSORY_STRING_DESCRIPTION    2
++#define ACCESSORY_STRING_VERSION        3
++#define ACCESSORY_STRING_URI            4
++#define ACCESSORY_STRING_SERIAL         5
++
++/* Control request for retrieving device's protocol version
++ *
++ *	requestType:    USB_DIR_IN | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_GET_PROTOCOL
++ *	value:          0
++ *	index:          0
++ *	data            version number (16 bits little endian)
++ *                     1 for original accessory support
++ *                     2 adds HID and device to host audio support
++ */
++#define ACCESSORY_GET_PROTOCOL  51
++
++/* Control request for host to send a string to the device
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SEND_STRING
++ *	value:          0
++ *	index:          string ID
++ *	data            zero terminated UTF8 string
++ *
++ *  The device can later retrieve these strings via the
++ *  ACCESSORY_GET_STRING_* ioctls
++ */
++#define ACCESSORY_SEND_STRING   52
++
++/* Control request for starting device in accessory mode.
++ * The host sends this after setting all its strings to the device.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_START
++ *	value:          0
++ *	index:          0
++ *	data            none
++ */
++#define ACCESSORY_START         53
++
++/* Control request for registering a HID device.
++ * Upon registering, a unique ID is sent by the accessory in the
++ * value parameter. This ID will be used for future commands for
++ * the device
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_REGISTER_HID_DEVICE
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          total length of the HID report descriptor
++ *	data            none
++ */
++#define ACCESSORY_REGISTER_HID         54
++
++/* Control request for unregistering a HID device.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_REGISTER_HID
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          0
++ *	data            none
++ */
++#define ACCESSORY_UNREGISTER_HID         55
++
++/* Control request for sending the HID report descriptor.
++ * If the HID descriptor is longer than the endpoint zero max packet size,
++ * the descriptor will be sent in multiple ACCESSORY_SET_HID_REPORT_DESC
++ * commands. The data for the descriptor must be sent sequentially
++ * if multiple packets are needed.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SET_HID_REPORT_DESC
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          offset of data in descriptor
++ *                      (needed when HID descriptor is too big for one packet)
++ *	data            the HID report descriptor
++ */
++#define ACCESSORY_SET_HID_REPORT_DESC         56
++
++/* Control request for sending HID events.
++ *
++ *	requestType:    USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SEND_HID_EVENT
++ *	value:          Accessory assigned ID for the HID device
++ *	index:          0
++ *	data            the HID report for the event
++ */
++#define ACCESSORY_SEND_HID_EVENT         57
++
++/* Control request for setting the audio mode.
++ *
++ *	requestType:	USB_DIR_OUT | USB_TYPE_VENDOR
++ *	request:        ACCESSORY_SET_AUDIO_MODE
++ *	value:          0 - no audio
++ *                     1 - device to host, 44100 16-bit stereo PCM
++ *	index:          0
++ *	data            none
++ */
++#define ACCESSORY_SET_AUDIO_MODE         58
++
++/* ioctls for retrieving strings set by the host */
++#define ACCESSORY_GET_STRING_MANUFACTURER   _IOW('M', 1, char[256])
++#define ACCESSORY_GET_STRING_MODEL          _IOW('M', 2, char[256])
++#define ACCESSORY_GET_STRING_DESCRIPTION    _IOW('M', 3, char[256])
++#define ACCESSORY_GET_STRING_VERSION        _IOW('M', 4, char[256])
++#define ACCESSORY_GET_STRING_URI            _IOW('M', 5, char[256])
++#define ACCESSORY_GET_STRING_SERIAL         _IOW('M', 6, char[256])
++/* returns 1 if there is a start request pending */
++#define ACCESSORY_IS_START_REQUESTED        _IO('M', 7)
++/* returns audio mode (set via the ACCESSORY_SET_AUDIO_MODE control request) */
++#define ACCESSORY_GET_AUDIO_MODE            _IO('M', 8)
++
++#endif /* _UAPI_LINUX_USB_F_ACCESSORY_H */
+diff --git a/include/uapi/linux/usb/g_uvc.h b/include/uapi/linux/usb/g_uvc.h
+index 652f169a0..428926e35 100644
+--- a/include/uapi/linux/usb/g_uvc.h
++++ b/include/uapi/linux/usb/g_uvc.h
+@@ -19,7 +19,9 @@
+ #define UVC_EVENT_STREAMOFF		(V4L2_EVENT_PRIVATE_START + 3)
+ #define UVC_EVENT_SETUP			(V4L2_EVENT_PRIVATE_START + 4)
+ #define UVC_EVENT_DATA			(V4L2_EVENT_PRIVATE_START + 5)
+-#define UVC_EVENT_LAST			(V4L2_EVENT_PRIVATE_START + 5)
++#define UVC_EVENT_SUSPEND		(V4L2_EVENT_PRIVATE_START + 6)
++#define UVC_EVENT_RESUME		(V4L2_EVENT_PRIVATE_START + 7)
++#define UVC_EVENT_LAST			(V4L2_EVENT_PRIVATE_START + 7)
+ 
+ struct uvc_request_data {
+ 	__s32 length;
+diff --git a/include/uapi/linux/usb/video.h b/include/uapi/linux/usb/video.h
+index bfdae12cd..b82436fd9 100644
+--- a/include/uapi/linux/usb/video.h
++++ b/include/uapi/linux/usb/video.h
+@@ -567,5 +567,63 @@ struct UVC_FRAME_MJPEG(n) {				\
+ 	__le32 dwFrameInterval[n];			\
+ } __attribute__ ((packed))
+ 
++/* Frame Based Payload - 3.1.1. Frame Based Video Format Descriptor */
++struct uvc_format_framebased {
++	__u8  bLength;
++	__u8  bDescriptorType;
++	__u8  bDescriptorSubType;
++	__u8  bFormatIndex;
++	__u8  bNumFrameDescriptors;
++	__u8  guidFormat[16];
++	__u8  bBitsPerPixel;
++	__u8  bDefaultFrameIndex;
++	__u8  bAspectRatioX;
++	__u8  bAspectRatioY;
++	__u8  bmInterfaceFlags;
++	__u8  bCopyProtect;
++	__u8  bVariableSize;
++} __attribute__((__packed__));
++
++#define UVC_DT_FORMAT_FRAMEBASED_SIZE			28
++
++/* Frame Based Payload - 3.1.2. Frame Based Video Frame Descriptor */
++struct uvc_frame_framebased {
++	__u8  bLength;
++	__u8  bDescriptorType;
++	__u8  bDescriptorSubType;
++	__u8  bFrameIndex;
++	__u8  bmCapabilities;
++	__u16 wWidth;
++	__u16 wHeight;
++	__u32 dwMinBitRate;
++	__u32 dwMaxBitRate;
++	__u32 dwDefaultFrameInterval;
++	__u8  bFrameIntervalType;
++	__u32 dwBytesPerLine;
++	__u32 dwFrameInterval[];
++} __attribute__((__packed__));
++
++#define UVC_DT_FRAME_FRAMEBASED_SIZE(n)                        (26+4*(n))
++
++#define UVC_FRAME_FRAMEBASED(n) \
++	uvc_frame_framebased_##n
++
++#define DECLARE_UVC_FRAME_FRAMEBASED(n)		\
++struct UVC_FRAME_FRAMEBASED(n) {		\
++	__u8  bLength;				\
++	__u8  bDescriptorType;			\
++	__u8  bDescriptorSubType;		\
++	__u8  bFrameIndex;			\
++	__u8  bmCapabilities;			\
++	__u16 wWidth;				\
++	__u16 wHeight;				\
++	__u32 dwMinBitRate;			\
++	__u32 dwMaxBitRate;			\
++	__u32 dwDefaultFrameInterval;		\
++	__u8  bFrameIntervalType;		\
++	__u32 dwBytesPerLine;			\
++	__u32 dwFrameInterval[n];		\
++} __attribute__ ((packed))
++
+ #endif /* __LINUX_USB_VIDEO_H */
+ 
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index a184c4939..a3eb68372 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -188,6 +188,12 @@ enum v4l2_colorfx {
+  */
+ #define V4L2_CID_USER_MAX217X_BASE		(V4L2_CID_USER_BASE + 0x1090)
+ 
++/*
++ * The base for the tc35874x driver controls.
++ * We reserve 16 controls for this driver.
++ */
++#define V4L2_CID_USER_TC35874X_BASE		(V4L2_CID_USER_BASE + 0x10a0)
++
+ /* The base for the imx driver controls.
+  * We reserve 16 controls for this driver. */
+ #define V4L2_CID_USER_IMX_BASE			(V4L2_CID_USER_BASE + 0x10b0)
+diff --git a/include/uapi/linux/videodev2.h b/include/uapi/linux/videodev2.h
+index 534eaa4d3..eb01fb549 100644
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -689,6 +689,7 @@ struct v4l2_pix_format {
+ #define V4L2_PIX_FMT_JPEG     v4l2_fourcc('J', 'P', 'E', 'G') /* JFIF JPEG     */
+ #define V4L2_PIX_FMT_DV       v4l2_fourcc('d', 'v', 's', 'd') /* 1394          */
+ #define V4L2_PIX_FMT_MPEG     v4l2_fourcc('M', 'P', 'E', 'G') /* MPEG-1/2/4 Multiplexed */
++#define V4L2_PIX_FMT_H265     v4l2_fourcc('H', '2', '6', '5') /* H265 with start codes */
+ #define V4L2_PIX_FMT_H264     v4l2_fourcc('H', '2', '6', '4') /* H264 with start codes */
+ #define V4L2_PIX_FMT_H264_NO_SC v4l2_fourcc('A', 'V', 'C', '1') /* H264 without start codes */
+ #define V4L2_PIX_FMT_H264_MVC v4l2_fourcc('M', '2', '6', '4') /* H264 MVC */
