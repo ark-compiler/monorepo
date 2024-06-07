@@ -1,0 +1,107 @@
+{
+    "name": "@arkcompiler/runtime_core",
+    "version": "",
+    "description": "方舟运行时的公共组件",
+    "homePage": "https://gitee.com/openharmony",
+    "license": "Apache License 2.0",
+    "publishAs": "code-segment",
+    "scripts": {},
+    "dirs": [],
+    "segment": {
+        "destPath": "arkcompiler/runtime_core"
+    },
+    "component": {
+        "name": "runtime_core",
+        "subsystem": "arkcompiler",
+        "syscap": [],
+        "features": [],
+        "adapted_system_type": [
+            "standard"
+        ],
+        "rom": "",
+        "ram": "",
+        "deps": {
+            "components": [
+                "hilog"
+            ],
+            "third_party": [
+                "bounds_checking_function"
+            ]
+        },
+        "build": {
+            "sub_component": [
+                "//arkcompiler/runtime_core:arkcompiler_params"
+            ],
+            "inner_kits": [
+                {
+                    "name": "//arkcompiler/runtime_core/libpandafile:arkfile_header_deps",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/libpandafile"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/libpandafile:libarkfile_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/libpandafile"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/libpandabase:libarkbase_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/libpandabase"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/assembler:libarkassembler_frontend_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/assembler"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/libpandabase:libarkbase_frontend_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/libpandabase"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/libpandafile:libarkfile_frontend_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/libpandafile"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/libziparchive:libarkziparchive_frontend_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/libziparchive"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/bytecode_optimizer:libarkbytecodeopt_frontend_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/bytecode_optimizer"
+                    }
+                },
+                {
+                    "name": "//arkcompiler/runtime_core/compiler:libarkcompiler_frontend_static",
+                    "header": {
+                        "header_files": [],
+                        "header_base": "//arkcompiler/runtime_core/compiler"
+                    }
+                }
+            ],
+            "test": [
+                "//arkcompiler/runtime_core/tests/fuzztest:fuzztest",
+                "//arkcompiler/runtime_core:runtime_core_unittest",
+                "//arkcompiler/runtime_core:runtime_core_host_unittest"
+            ]
+        }
+    }
+}
