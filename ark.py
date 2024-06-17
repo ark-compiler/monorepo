@@ -1,0 +1,1 @@
+arkcompiler/toolchain/build/compile_script/ark.py
